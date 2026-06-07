@@ -181,7 +181,6 @@
             <option value="deepseek-expert">deepseek-expert</option>
             <option value="deepseek-v4-pro">deepseek-v4-pro</option>
           </select>
-          <button class="sm toggle" id="searchToggle" title="Веб-поиск"><svg class="ic"><use href="#i-search"/></svg>Поиск</button>
           <button class="sm" id="clearChat" title="Очистить"><svg class="ic"><use href="#i-trash"/></svg></button>
         </div>
       </h2>
@@ -316,23 +315,8 @@ async function loadModels(){
 }
 document.addEventListener('click', e=>{ const c=e.target.closest('.chip[data-model]'); if(c) copyText(c.dataset.model); });
 
-// ── Web-поиск тоггл + выбор финальной модели ─────────────────────────────
-let searchOn=false;
-function syncSearchToggle(){
-  const m=$('#chatModel').value;
-  const supportsSearch = (m==='deepseek-chat' || m==='deepseek-reasoner');
-  const btn=$('#searchToggle');
-  btn.disabled=!supportsSearch;
-  if(!supportsSearch){ searchOn=false; btn.classList.remove('on'); }
-  btn.title = supportsSearch ? 'Веб-поиск' : 'Веб-поиск недоступен для этой модели';
-}
-function computeModel(){
-  let m=$('#chatModel').value;
-  if(searchOn && (m==='deepseek-chat'||m==='deepseek-reasoner')) m+='-search';
-  return m;
-}
-$('#chatModel').onchange=syncSearchToggle;
-$('#searchToggle').onclick=()=>{ if($('#searchToggle').disabled) return; searchOn=!searchOn; $('#searchToggle').classList.toggle('on',searchOn); };
+// Модель берётся напрямую из селектора (#chatModel).
+// Веб-поиск (-search) сейчас отключён: DeepSeek Web стабильно отдаёт пустой ответ.
 
 // ── Чат (история + reasoning + markdown, через /v1/chat/completions) ──────────
 let chatHistory=[], chatBusy=false, chatAbort=null;
@@ -380,7 +364,7 @@ async function sendChat(){
   const msgs=chatHistory.slice(0,-1).map(m=>({role:m.role,content:m.content}));
   try{
     const r=await fetch(apiBase+'/chat/completions',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer sk-deepseek'},signal:chatAbort.signal,
-      body:JSON.stringify({model:computeModel(),messages:msgs,stream:true,user:AGENT_ID})});
+      body:JSON.stringify({model:$('#chatModel').value,messages:msgs,stream:true,user:AGENT_ID})});
     if(!r.ok||!r.body) throw new Error('HTTP '+r.status);
     const reader=r.body.getReader(), dec=new TextDecoder(); let buf='';
     while(true){
@@ -408,7 +392,7 @@ $('#clearChat').onclick=async()=>{
 };
 
 // ── Старт ──────────────────────────────────────────────────────────────────
-syncSearchToggle(); renderChat();
+renderChat();
 showTab((location.hash||'#chat').slice(1)||'chat');
 loadHealth(); setInterval(loadHealth, 15000);
 </script>

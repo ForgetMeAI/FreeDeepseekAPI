@@ -75,14 +75,12 @@ function extractHeaders(curl) {
         process.exit(2);
     }
 
-    const out = {
-        token,
-        hif_dliq,
-        hif_leim,
-        cookie,
-        wasmUrl: 'https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm',
-    };
     const dest = process.env.DEEPSEEK_AUTH_PATH || path.join(__dirname, '..', 'deepseek-auth.json');
+    // wasmUrl в cURL обычно отсутствует — сохраняем рабочий из прошлого auth, иначе дефолт.
+    let wasmUrl = 'https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm';
+    try { const old = JSON.parse(fs.readFileSync(dest, 'utf8')); if (old.wasmUrl) wasmUrl = old.wasmUrl; } catch { /* нет прошлого файла */ }
+    const wm = curl.match(/https?:\/\/[^\s'"]*sha3[^\s'"]*\.wasm/i); if (wm) wasmUrl = wm[0]; // вдруг есть в cURL
+    const out = { token, hif_dliq, hif_leim, cookie, wasmUrl };
     fs.writeFileSync(dest, JSON.stringify(out, null, 2));
     console.log('OK -> ' + dest);
     console.log('  token:  ' + token.length + ' символов');

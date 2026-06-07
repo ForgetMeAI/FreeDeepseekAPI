@@ -60,6 +60,14 @@ for (const e of entries) {
     const u = (e.request && e.request.url) || '';
     if (/sha3.*\.wasm/i.test(u)) { wasmUrl = u; break; }
 }
+if (!wasmUrl) {
+    // не нашли в HAR — берём рабочий из прошлого auth, чтобы не подставлять устаревший дефолт
+    try {
+        const dp = process.env.DEEPSEEK_AUTH_PATH || path.join(__dirname, '..', 'deepseek-auth.json');
+        const old = JSON.parse(fs.readFileSync(dp, 'utf8'));
+        if (old.wasmUrl) wasmUrl = old.wasmUrl;
+    } catch { /* нет прошлого файла */ }
+}
 if (!wasmUrl) wasmUrl = 'https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm';
 
 if (!token || !cookie) {
