@@ -273,6 +273,35 @@ function resolveModelConfig(model) {
 function isKnownModel(model) { return Object.prototype.hasOwnProperty.call(MODEL_CONFIGS, String(model || '').toLowerCase()); }
 function isSupportedModel(model) { return resolveModelConfig(model).supported === true; }
 
+// DeepSeek отвечает HTTP 200 с code!=0 даже при ошибке авторизации, например
+//   {code:40003,msg:"Authorization Failed (invalid token)",data:null}
+// Такие коды означают невалидные креды (а не временный лимит), поэтому аккаунт
+// нужно метить invalid, а не rate-limited. Без этой проверки обращение к
+// data.biz_data падало с "Cannot read properties of null", и обёртка ошибочно
+// трактовала это как rate-limit.
+const DS_AUTH_ERROR_CODES = new Set([40003, 40300, 40301]);
+class DeepSeekAuthError extends Error {
+    constructor(code, msg) {
+        super(`DeepSeek авторизация отклонена (code ${code}${msg ? ': ' + msg : ''})`);
+        this.name = 'DeepSeekAuthError';
+        this.code = code;
+        this.isAuthError = true;
+    }
+}
+// Разбирает ответ DeepSeek и возвращает data.biz_data. Бросает DeepSeekAuthError
+// при коде авторизации и обычную ошибку при пустом/неразобранном теле — чтобы
+// askWithRotation мог отличить invalid от временного сбоя.
+function parseBizData(rawText, what) {
+    let j;
+    try { j = JSON.parse(rawText); }
+    catch { throw new Error(`Не удалось разобрать ответ DeepSeek (${what})`); }
+    if (j && DS_AUTH_ERROR_CODES.has(j.code)) throw new DeepSeekAuthError(j.code, j.msg);
+    if (!j || !j.data || !j.data.biz_data) {
+        throw new Error(`Пустой data.biz_data в ответе DeepSeek (${what}, code=${j ? j.code : 'n/a'})`);
+    }
+    return j.data.biz_data;
+}
+
 async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', account = null) {
     const modelCfg = resolveModelConfig(model);
     const session = getOrCreateAgentSession(agentId);
@@ -296,16 +325,15 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', ac
         method: 'POST', headers,
         body: JSON.stringify({ target_path: '/api/v0/chat/completion' })
     });
-    const chalJson = JSON.parse(await cr.text());
-    const challenge = chalJson.data.biz_data.challenge;
+    const challenge = parseBizData(await cr.text(), 'create_pow_challenge').challenge;
     const answer = await solvePOW(challenge, wasmUrl);
 
     if (!session.id) {
         const sr = await fetch('https://chat.deepseek.com/api/v0/chat_session/create', {
             method: 'POST', headers, body: '{}'
         });
-        const sessionData = await sr.json();
-        session.id = sessionData.data.biz_data.chat_session?.id || sessionData.data.biz_data.id;
+        const sessionBiz = parseBizData(await sr.text(), 'chat_session/create');
+        session.id = sessionBiz.chat_session?.id || sessionBiz.id;
         session.parentMessageId = null;
         session.createdAt = Date.now();
         session.messageCount = 0;
@@ -354,8 +382,8 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', ac
             const sr2 = await fetch('https://chat.deepseek.com/api/v0/chat_session/create', {
                 method: 'POST', headers, body: '{}'
             });
-            const sessionData2 = await sr2.json();
-            session.id = sessionData2.data.biz_data.chat_session?.id || sessionData2.data.biz_data.id;
+            const sessionBiz2 = parseBizData(await sr2.text(), 'chat_session/create(retry)');
+            session.id = sessionBiz2.chat_session?.id || sessionBiz2.id;
             session.parentMessageId = null;
             session.createdAt = Date.now();
             if (account) session.accountId = account.id;
@@ -399,7 +427,16 @@ async function askWithRotation(prompt, agentId, model) {
         if (session.accountId && session.accountId !== account.id) resetSession(session); // chat принадлежал другому аккаунту
         let r;
         try { r = await askDeepSeekStream(prompt, agentId, model, account); }
-        catch (e) { console.log(`[${account.id}] ошибка запроса (${e.message}) — ротация на следующий`); accounts.markRateLimited(account.id, 1); resetSession(session); last = 'error'; continue; }
+        catch (e) {
+            if (e && e.isAuthError) {
+                console.log(`[${account.id}] невалиден (${e.message}) — помечаю invalid и ротация`);
+                accounts.markInvalid(account.id); last = 'invalid';
+            } else {
+                console.log(`[${account.id}] ошибка запроса (${e.message}) — временная, ротация`);
+                accounts.markRateLimited(account.id, 1); last = 'error';
+            }
+            resetSession(session); continue;
+        }
         if (r.rateLimited) {
             console.log(`[${account.id}] HTTP 429 — лимит, ротация на следующий аккаунт`);
             accounts.markRateLimited(account.id, r.retryAfterHours);
