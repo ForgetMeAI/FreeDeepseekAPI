@@ -1,10 +1,22 @@
 {
   "manifest_version": 3,
-  "name": "DeepSeek Auth Exporter",
-  "version": "1.0",
-  "description": "Extract DeepSeek Chat credentials from cookies + localStorage for use with the web API proxy",
-  "permissions": ["cookies", "storage", "downloads"],
-  "host_permissions": ["https://chat.deepseek.com/*"],
+  "name": "DeepSeek → FreeDeepseekAPI",
+  "version": "1.1",
+  "description": "Добавляет аккаунт DeepSeek в локальный FreeDeepseekAPI одним кликом (token + cookie + hif с chat.deepseek.com).",
+  "author": "FreeDeepseekAPI",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "freedeepseek-auth@forgetmeai",
+      "strict_min_version": "121.0",
+      "data_collection_permissions": { "required": ["none"] }
+    }
+  },
+  "permissions": ["cookies", "storage"],
+  "host_permissions": [
+    "https://chat.deepseek.com/*",
+    "http://localhost:9655/*",
+    "http://127.0.0.1:9655/*"
+  ],
   "content_scripts": [
     {
       "matches": ["https://chat.deepseek.com/*"],
@@ -17,11 +29,6 @@
   },
   "action": {
     "default_popup": "popup.html",
-    "default_icon": {
-      "48": "icon.png"
-    }
-  },
-  "icons": {
-    "48": "icon.png"
+    "default_title": "DeepSeek → FreeDeepseekAPI"
   }
 }

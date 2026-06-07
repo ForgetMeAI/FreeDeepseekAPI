@@ -76,6 +76,36 @@ $('btnCollect').addEventListener('click', () => {
   });
 });
 
+const PROXY_URL = 'http://localhost:9655/api/accounts/import';
+// Главная кнопка: собрать креды и сразу отправить в локальный FreeDeepseekAPI
+$('btnAdd').addEventListener('click', () => {
+  $('status').className = 'status warn';
+  $('status').textContent = '⏳ Сбор и отправка в FreeDeepseekAPI…';
+  chrome.runtime.sendMessage({ action: 'collect' }, async (response) => {
+    if (!response || !response.success) {
+      $('status').className = 'status err';
+      $('status').textContent = '❌ ' + (response?.error || 'Откройте вкладку chat.deepseek.com');
+      return;
+    }
+    render(response.auth);
+    const auth = buildAuthJson(response.auth);
+    if (!auth.token || !auth.cookie) {
+      $('status').className = 'status err';
+      $('status').textContent = '❌ Не хватает token/cookie — войдите в DeepSeek и отправьте сообщение';
+      return;
+    }
+    try {
+      const r = await fetch(PROXY_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(auth) });
+      const j = await r.json();
+      if (j.ok) { $('status').className = 'status ok'; $('status').textContent = '✅ Добавлен в FreeDeepseekAPI как ' + j.id; }
+      else { $('status').className = 'status err'; $('status').textContent = '❌ ' + (j.error || 'Ошибка добавления'); }
+    } catch (e) {
+      $('status').className = 'status err';
+      $('status').textContent = '❌ FreeDeepseekAPI недоступен на localhost:9655 (запущен?)';
+    }
+  });
+});
+
 // Copy JSON button
 $('btnCopy').addEventListener('click', () => {
   const json = $('jsonPreview').textContent;

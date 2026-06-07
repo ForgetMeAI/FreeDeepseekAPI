@@ -25,15 +25,18 @@
   </style>
 </head>
 <body>
-  <h1>🔑 DeepSeek Auth Exporter</h1>
-  <div class="sub">Export credentials for <code>FreeDeepseekAPI</code></div>
+  <h1>🔑 DeepSeek → FreeDeepseekAPI</h1>
+  <div class="sub">Откройте <code>chat.deepseek.com</code> (залогинены) и нажмите кнопку</div>
 
   <div id="status" class="status warn">⏳ Loading...</div>
 
   <div class="btn-row">
-    <button id="btnCollect" class="btn-primary">🔄 Collect from Tab</button>
-    <button id="btnCopy" class="btn-success">📋 Copy JSON</button>
-    <button id="btnSave" class="btn-warn">💾 Download File</button>
+    <button id="btnAdd" class="btn-primary" style="font-size:13px;padding:11px">➕ Добавить в FreeDeepseekAPI</button>
+  </div>
+  <div class="btn-row">
+    <button id="btnCollect" class="btn-success">🔄 Собрать</button>
+    <button id="btnCopy" class="btn-success">📋 Копировать JSON</button>
+    <button id="btnSave" class="btn-warn">💾 Скачать файл</button>
   </div>
 
   <div class="field">
