@@ -83,6 +83,15 @@ function buildBaseHeaders(account) {
         "Content-Type": "application/json",
     };
 }
+// Получить email аккаунта по перехваченным кредам (GET users/current).
+// Возвращает '' при любой ошибке/отсутствии — добавление аккаунта не блокируется.
+async function fetchAccountEmail(creds) {
+    try {
+        const r = await fetch('https://chat.deepseek.com/api/v0/users/current', { headers: buildBaseHeaders(creds) });
+        const j = await r.json();
+        return (j && j.data && j.data.biz_data && j.data.biz_data.email) || '';
+    } catch { return ''; }
+}
 function loadDeepSeekConfig({ fatal = true } = {}) {
     try {
         const raw = fs.readFileSync(DS_CONFIG_PATH, 'utf8');
@@ -1160,7 +1169,7 @@ const server = http.createServer(async (req, res) => {
         // GET /api/accounts — список со статусами
         if (req.method === 'GET' && url.pathname === '/api/accounts') {
             const list = accounts.listAccounts().map(a => ({
-                id: a.id, status: accountStatus(a),
+                id: a.id, status: accountStatus(a), email: a.email || '',
                 exp: accounts.decodeTokenInfo(a.token).exp, resetAt: a.resetAt || null,
                 preview: String(a.token || '').slice(-6),
             }));
@@ -1171,12 +1180,14 @@ const server = http.createServer(async (req, res) => {
         if (req.method === 'POST' && url.pathname === '/api/accounts/import') {
             let body = '';
             req.on('data', c => { body += c; if (body.length > 25 * 1024 * 1024) req.destroy(); });
-            req.on('end', () => {
+            req.on('end', async () => {
                 try {
                     const parsed = finalizeAuth(parseAuthInput(body), accounts.anyWasmUrl());
                     if (parsed.error) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(parsed)); return; }
-                    const r = accounts.addAccount(parsed);
-                    res.writeHead(r.error ? 400 : 200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(r));
+                    const email = await fetchAccountEmail(parsed);
+                    const r = accounts.addAccount({ ...parsed, email });
+                    const code = r.error ? (r.existingId ? 409 : 400) : 200;
+                    res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(r));
                 } catch (e) { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Ошибка импорта: ' + e.message })); }
             });
             return;
@@ -1195,8 +1206,10 @@ const server = http.createServer(async (req, res) => {
                     else if (r.invalid) { accounts.markInvalid(id); status = 'INVALID'; }
                     else if (r.resp && r.resp.status === 200) { accounts.markValid(id); status = 'OK'; }
                     try { if (r.resp && r.resp.body) r.resp.body.cancel(); } catch { /* noop */ }
+                    if (status === 'OK' && !acc.email) { const em = await fetchAccountEmail(acc); if (em) accounts.setEmail(id, em); }
                 } catch (e) { status = 'ERROR'; }
-                res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ id, status, exp: accounts.decodeTokenInfo(acc.token).exp }));
+                const fresh = accounts.getAccountById(id);
+                res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ id, status, email: (fresh && fresh.email) || '', exp: accounts.decodeTokenInfo(acc.token).exp }));
             })();
             return;
         }

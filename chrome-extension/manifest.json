@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "DeepSeek → FreeDeepseekAPI",
-  "version": "1.2",
+  "version": "1.3",
   "description": "Добавляет аккаунт DeepSeek в локальный FreeDeepseekAPI одним кликом. Перехватывает заголовки запроса chat.deepseek.com (token + cookie + hif).",
   "author": "FreeDeepseekAPI",
   "browser_specific_settings": {

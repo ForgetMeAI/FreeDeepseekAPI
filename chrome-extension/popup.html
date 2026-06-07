@@ -22,6 +22,28 @@
     .json-display { background: #0d1117; border: 1px solid #333; border-radius: 4px; padding: 8px; font-size: 10px; font-family: 'Courier New', monospace; color: #7ee787; white-space: pre-wrap; word-break: break-all; max-height: 180px; overflow-y: auto; margin-bottom: 8px; }
     .field label { display: block; font-size: 11px; color: #999; margin-bottom: 4px; }
     .detail { font-size: 10px; color: #666; text-align: center; }
+    .pool-section { margin-top: 14px; border-top: 1px solid #333; padding-top: 10px; }
+    .pool-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .pool-header .title { font-size: 12px; color: #4fc3f7; font-weight: 600; }
+    .link-btn { background: none; border: 1px solid #444; color: #9ccc65; border-radius: 5px; padding: 4px 8px; font-size: 11px; cursor: pointer; }
+    .link-btn:hover { background: #ffffff10; }
+    .link-btn:disabled { opacity: 0.5; cursor: default; }
+    .pool-list { display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
+    .pool-row { display: flex; align-items: center; gap: 6px; padding: 6px 8px; background: #0d1117; border: 1px solid #2a2a3a; border-radius: 5px; font-size: 11px; }
+    .pool-row .id { color: #888; font-family: 'Courier New', monospace; min-width: 40px; }
+    .pool-row .email { flex: 1; color: #ccc; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .badge { padding: 2px 7px; border-radius: 10px; font-size: 10px; font-weight: 600; white-space: nowrap; }
+    .badge.ok { background: #1b5e2033; color: #66bb6a; border: 1px solid #2e7d32; }
+    .badge.invalid { background: #b71c1c33; color: #ef5350; border: 1px solid #c62828; }
+    .badge.wait { background: #e6510033; color: #ff9800; border: 1px solid #e65100; }
+    .badge.expired { background: #44444433; color: #999; border: 1px solid #555; }
+    .badge.checking { background: #1565c033; color: #4fc3f7; border: 1px solid #1565c0; }
+    .row-actions { display: flex; gap: 4px; }
+    .acc-btn { background: #ffffff0d; border: 1px solid #444; color: #ddd; border-radius: 4px; padding: 3px 7px; font-size: 11px; cursor: pointer; }
+    .acc-btn:hover { background: #ffffff1a; }
+    .acc-btn.danger:hover { background: #b71c1c44; color: #ef5350; }
+    .acc-btn.confirm { background: #b71c1c; color: #fff; border-color: #c62828; }
+    .pool-empty { color: #666; font-size: 11px; text-align: center; padding: 10px; }
   </style>
 </head>
 <body>
@@ -45,6 +67,14 @@
   </div>
 
   <div class="detail" id="detail">Open chat.deepseek.com, then click Collect</div>
+
+  <div class="pool-section">
+    <div class="pool-header">
+      <span class="title" id="poolTitle">Пул аккаунтов</span>
+      <button id="btnCheckAll" class="link-btn">↻ Проверить все</button>
+    </div>
+    <div id="pool" class="pool-list"></div>
+  </div>
 
   <script src="popup.js"></script>
 </body>

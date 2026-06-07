@@ -90,23 +90,25 @@ function markRateLimited(id, hours) {
 }
 function markInvalid(id) { return _update(id, a => { a.invalid = true; }); }
 function markValid(id) { return _update(id, a => { a.invalid = false; a.resetAt = null; }); }
+function setEmail(id, email) { return _update(id, a => { a.email = String(email || ''); }); }
 
 function addAccount(obj) {
     if (!obj || !obj.token) return { error: 'Нужен token' };
     if (!obj.cookie) return { error: 'Нужен cookie' };
     const a = loadAccounts();
-    if (a.some(x => x.token === obj.token)) return { error: 'Этот аккаунт уже добавлен' };
+    const dup = a.find(x => x.token === obj.token);
+    if (dup) return { error: 'Этот аккаунт уже добавлен', existingId: dup.id };
     let n = 1; const ids = new Set(a.map(x => x.id));
     while (ids.has('acc_' + n)) n++;
     const id = 'acc_' + n;
     a.push({
         id, token: obj.token, cookie: obj.cookie,
         hif_dliq: obj.hif_dliq || '', hif_leim: obj.hif_leim || '',
-        wasmUrl: obj.wasmUrl || '', resetAt: null, invalid: false,
+        wasmUrl: obj.wasmUrl || '', email: obj.email || '', resetAt: null, invalid: false,
     });
     saveAccounts(a);
     const { exp } = decodeTokenInfo(obj.token);
-    return { ok: true, id, exp };
+    return { ok: true, id, exp, email: obj.email || '' };
 }
 
 function deleteAccount(id) {
@@ -124,5 +126,5 @@ function anyWasmUrl() { const a = loadAccounts().find(x => x.wasmUrl); return a 
 module.exports = {
     loadAccounts, saveAccounts, listAccounts, getAvailableAccount, getAccountById,
     hasValidAccounts, hasAnyAccount, markRateLimited, markInvalid, markValid,
-    addAccount, deleteAccount, decodeTokenInfo, anyWasmUrl, COOLDOWN_HOURS,
+    addAccount, deleteAccount, setEmail, decodeTokenInfo, anyWasmUrl, COOLDOWN_HOURS,
 };
