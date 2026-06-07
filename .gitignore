@@ -10,3 +10,5 @@ deepseek-auth.json
 /tmp/deepseek_response_*
 .DS_Store
 *.pdf
+
+deepseek-accounts.json

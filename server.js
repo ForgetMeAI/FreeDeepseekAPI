@@ -16,6 +16,8 @@ const os = require('os');
 const path = require('path');
 const readline = require('readline');
 const { spawnSync } = require('child_process');
+const accounts = require('./accountManager');
+const { parseAuthInput, finalizeAuth } = require('./lib/parseAuth');
 
 const SERVER_HOST = os.hostname();  // Dynamic hostname detection
 const SERVER_PUBLIC_IP = (() => {
@@ -63,7 +65,8 @@ const SESSION_TTL_MS = 2 * 60 * 60 * 1000;  // 2 hours
 const DS_CONFIG_PATH = process.env.DEEPSEEK_AUTH_PATH || path.join(__dirname, 'deepseek-auth.json');
 let DS_CONFIG = {};
 let BASE_HEADERS = {};
-function buildBaseHeaders() {
+function buildBaseHeaders(account) {
+    const a = account || DS_CONFIG;   // account задаётся при мультиаккаунтном вызове; fallback — legacy DS_CONFIG
     return {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
         "x-client-platform": "web",
@@ -71,12 +74,12 @@ function buildBaseHeaders() {
         "x-client-locale": "ru",
         "x-client-timezone-offset": "14400",
         "x-app-version": "2.0.0",
-        "Authorization": `Bearer ${DS_CONFIG.token || ''}`,
-        "x-hif-dliq": DS_CONFIG.hif_dliq || '',
-        "x-hif-leim": DS_CONFIG.hif_leim || '',
+        "Authorization": `Bearer ${a.token || ''}`,
+        "x-hif-dliq": a.hif_dliq || '',
+        "x-hif-leim": a.hif_leim || '',
         "Origin": "https://chat.deepseek.com",
         "Referer": "https://chat.deepseek.com/",
-        "Cookie": DS_CONFIG.cookie || '',
+        "Cookie": a.cookie || '',
         "Content-Type": "application/json",
     };
 }
@@ -107,7 +110,31 @@ function createSession() {
         createdAt: null,
         messageCount: 0,
         history: [],
+        accountId: null,   // под каким аккаунтом создан chat_session (для ротации)
     };
+}
+
+// Сброс серверной session (chat принадлежит конкретному аккаунту DeepSeek).
+function resetSession(session) {
+    session.id = null;
+    session.parentMessageId = null;
+    session.createdAt = null;
+    session.messageCount = 0;
+}
+
+// Статус аккаунта для дашборда: OK / WAIT (лимит) / INVALID / EXPIRED.
+function accountStatus(a) {
+    const now = Date.now();
+    if (a.invalid) return 'INVALID';
+    const { exp } = accounts.decodeTokenInfo(a.token);
+    if (exp && exp <= now) return 'EXPIRED';
+    if (a.resetAt && Date.parse(a.resetAt) > now) return 'WAIT';
+    return 'OK';
+}
+// Управление аккаунтами разрешаем только с локальной машины.
+function isLocal(req) {
+    const ip = (req.socket && req.socket.remoteAddress) || '';
+    return ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
 }
 
 function getOrCreateAgentSession(agentId) {
@@ -117,8 +144,8 @@ function getOrCreateAgentSession(agentId) {
     return sessions.get(agentId);
 }
 
-async function solvePOW(challenge) {
-    const resp = await fetch(DS_CONFIG.wasmUrl);
+async function solvePOW(challenge, wasmUrl) {
+    const resp = await fetch(wasmUrl || DS_CONFIG.wasmUrl);
     const wasmBytes = await resp.arrayBuffer();
     const mod = await WebAssembly.instantiate(wasmBytes, { wbg: {} });
     const e = mod.instance.exports;
@@ -246,47 +273,43 @@ function resolveModelConfig(model) {
 function isKnownModel(model) { return Object.prototype.hasOwnProperty.call(MODEL_CONFIGS, String(model || '').toLowerCase()); }
 function isSupportedModel(model) { return resolveModelConfig(model).supported === true; }
 
-async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
+async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', account = null) {
     const modelCfg = resolveModelConfig(model);
     const session = getOrCreateAgentSession(agentId);
-    const agentTag = `[${agentId}]`;
+    const agentTag = `[${account ? account.id : agentId}]`;
+    const headers = buildBaseHeaders(account);   // per-account заголовки (token/cookie/hif)
+    const wasmUrl = account ? account.wasmUrl : undefined;
 
     // Auto-reset on deep message chain
     if (session.id && session.messageCount >= MAX_MESSAGE_DEPTH) {
         console.log(`${agentTag} Session ${session.id} hit ${session.messageCount} messages. Auto-resetting.`);
-        session.id = null;
-        session.parentMessageId = null;
-        session.createdAt = null;
-        session.messageCount = 0;
-        // History preserved for context injection
+        resetSession(session);
     }
 
     // Reset expired sessions (DeepSeek web sessions last ~1-2 hours)
     if (session.id && session.createdAt && (Date.now() - session.createdAt > SESSION_TTL_MS)) {
         console.log(`${agentTag} Session ${session.id} expired (age: ${Math.round((Date.now() - session.createdAt) / 60000)}min). Creating new...`);
-        session.id = null;
-        session.parentMessageId = null;
-        session.createdAt = null;
-        session.messageCount = 0;
+        resetSession(session);
     }
 
     const cr = await fetch('https://chat.deepseek.com/api/v0/chat/create_pow_challenge', {
-        method: 'POST', headers: BASE_HEADERS,
+        method: 'POST', headers,
         body: JSON.stringify({ target_path: '/api/v0/chat/completion' })
     });
     const chalJson = JSON.parse(await cr.text());
     const challenge = chalJson.data.biz_data.challenge;
-    const answer = await solvePOW(challenge);
+    const answer = await solvePOW(challenge, wasmUrl);
 
     if (!session.id) {
         const sr = await fetch('https://chat.deepseek.com/api/v0/chat_session/create', {
-            method: 'POST', headers: BASE_HEADERS, body: '{}'
+            method: 'POST', headers, body: '{}'
         });
         const sessionData = await sr.json();
         session.id = sessionData.data.biz_data.chat_session?.id || sessionData.data.biz_data.id;
         session.parentMessageId = null;
         session.createdAt = Date.now();
         session.messageCount = 0;
+        if (account) session.accountId = account.id;
         console.log(`${agentTag} Created new session: ${session.id}`);
     } else {
         console.log(`${agentTag} Reusing session: ${session.id} (parent: ${session.parentMessageId}, msg#${session.messageCount})`);
@@ -299,7 +322,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
     })).toString('base64');
     const resp = await fetch('https://chat.deepseek.com/api/v0/chat/completion', {
         method: 'POST',
-        headers: { ...BASE_HEADERS, 'X-DS-PoW-Response': powB64 },
+        headers: { ...headers, 'X-DS-PoW-Response': powB64 },
         body: JSON.stringify({
             chat_session_id: session.id,
             parent_message_id: session.parentMessageId,
@@ -310,24 +333,32 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
         })
     });
 
-    // If session expired, reset and retry once
     if (resp.status !== 200) {
         const errText = await resp.text();
-        console.log(`${agentTag} Session error (${resp.status}): ${errText.substring(0, 100)}`);
+        console.log(`${agentTag} completion error (${resp.status}): ${errText.substring(0, 120)}`);
+        // Лимит исчерпан → сигнал ротации на другой аккаунт
+        if (resp.status === 429) {
+            let hours;
+            const ra = (resp.headers && resp.headers.get) ? resp.headers.get('retry-after') : null;
+            if (ra && /^\d+$/.test(ra)) hours = Math.max(1, Math.round(Number(ra) / 3600));
+            return { resp, agentId, account, rateLimited: true, retryAfterHours: hours };
+        }
+        // Невалидный токен/cookie/PoW → пометить аккаунт невалидным
+        if (resp.status === 401 || resp.status === 403 || /"code"\s*:\s*(40003|40300|40301)/.test(errText)) {
+            return { resp, agentId, account, invalid: true };
+        }
+        // Истёкшая сессия → пересоздать и повторить один раз (тот же аккаунт)
         if (resp.status === 400 || resp.status === 404 || resp.status === 500) {
             console.log(`${agentTag} Session ${session.id} expired. Creating new session...`);
-            session.id = null;
-            session.parentMessageId = null;
-            session.createdAt = null;
-            session.messageCount = 0;
-
+            resetSession(session);
             const sr2 = await fetch('https://chat.deepseek.com/api/v0/chat_session/create', {
-                method: 'POST', headers: BASE_HEADERS, body: '{}'
+                method: 'POST', headers, body: '{}'
             });
             const sessionData2 = await sr2.json();
             session.id = sessionData2.data.biz_data.chat_session?.id || sessionData2.data.biz_data.id;
             session.parentMessageId = null;
             session.createdAt = Date.now();
+            if (account) session.accountId = account.id;
             console.log(`${agentTag} Created new session: ${session.id}`);
 
             const newPowB64 = Buffer.from(JSON.stringify({
@@ -337,7 +368,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
             })).toString('base64');
             const resp2 = await fetch('https://chat.deepseek.com/api/v0/chat/completion', {
                 method: 'POST',
-                headers: { ...BASE_HEADERS, 'X-DS-PoW-Response': newPowB64 },
+                headers: { ...headers, 'X-DS-PoW-Response': newPowB64 },
                 body: JSON.stringify({
                     chat_session_id: session.id,
                     parent_message_id: null,
@@ -347,11 +378,42 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
                     action: null, preempt: false,
                 })
             });
-            return { resp: resp2, agentId };
+            return { resp: resp2, agentId, account };
         }
     }
 
-    return { resp, agentId };
+    return { resp, agentId, account };
+}
+
+// Сколько раз пробовать сменить аккаунт при лимите/инвалиде за один запрос.
+const MAX_ACCOUNT_RETRIES = 6;
+
+// Обёртка с ротацией: берёт доступный аккаунт; при 429 помечает rate-limited,
+// при 401/403 — invalid, и переходит к следующему. Возвращает { resp, account }.
+async function askWithRotation(prompt, agentId, model) {
+    const session = getOrCreateAgentSession(agentId);
+    let last = 'none';
+    for (let i = 0; i < MAX_ACCOUNT_RETRIES; i++) {
+        const account = accounts.getAvailableAccount();
+        if (!account) return { resp: null, account: null, noAccounts: true };
+        if (session.accountId && session.accountId !== account.id) resetSession(session); // chat принадлежал другому аккаунту
+        let r;
+        try { r = await askDeepSeekStream(prompt, agentId, model, account); }
+        catch (e) { console.log(`[${account.id}] ошибка запроса (${e.message}) — ротация на следующий`); accounts.markRateLimited(account.id, 1); resetSession(session); last = 'error'; continue; }
+        if (r.rateLimited) {
+            console.log(`[${account.id}] HTTP 429 — лимит, ротация на следующий аккаунт`);
+            accounts.markRateLimited(account.id, r.retryAfterHours);
+            resetSession(session); last = 'rate'; continue;
+        }
+        if (r.invalid) {
+            console.log(`[${account.id}] невалиден (401/403) — помечаю и ротация`);
+            accounts.markInvalid(account.id);
+            resetSession(session); last = 'invalid'; continue;
+        }
+        session.accountId = account.id;
+        return { resp: r.resp, account };
+    }
+    return { resp: null, account: null, exhausted: last };
 }
 
 // === Tool Calling Support ===
@@ -958,8 +1020,9 @@ const server = http.createServer(async (req, res) => {
 
     // Health check
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
+        const _accs = accounts.listAccounts();
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'ok', service: 'FreeDeepseekAPI', watermark: FORGETMEAI_WATERMARK, models: SUPPORTED_MODEL_IDS, unsupported_models: Object.keys(MODEL_CONFIGS).filter(id => !MODEL_CONFIGS[id].supported), agents: sessions.size, config_ready: hasAuthConfig() }));
+        res.end(JSON.stringify({ status: 'ok', service: 'FreeDeepseekAPI', watermark: FORGETMEAI_WATERMARK, models: SUPPORTED_MODEL_IDS, unsupported_models: Object.keys(MODEL_CONFIGS).filter(id => !MODEL_CONFIGS[id].supported), agents: sessions.size, config_ready: _accs.some(a => accountStatus(a) === 'OK'), accounts: { total: _accs.length, online: _accs.filter(a => accountStatus(a) === 'OK').length, limited: _accs.filter(a => accountStatus(a) === 'WAIT').length } }));
         return;
     }
 
@@ -1036,20 +1099,79 @@ const server = http.createServer(async (req, res) => {
 
     // Auth status for dashboard: decode JWT exp (no signature check) + presence flags
     if (req.method === 'GET' && url.pathname === '/api/auth-status') {
-        let tokenExp = null;
-        try {
-            const payload = JSON.parse(Buffer.from(String(DS_CONFIG.token || '').split('.')[1], 'base64url').toString());
-            if (payload.exp) tokenExp = payload.exp * 1000;
-        } catch { /* token missing or not a JWT */ }
+        const list = accounts.listAccounts();
+        const ok = list.find(a => accountStatus(a) === 'OK');
+        const tokenExp = ok ? accounts.decodeTokenInfo(ok.token).exp : null;
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
-            config_ready: hasAuthConfig(),
+            config_ready: accounts.hasValidAccounts(),
+            accounts_total: list.length,
+            accounts_online: list.filter(a => accountStatus(a) === 'OK').length,
+            accounts_limited: list.filter(a => accountStatus(a) === 'WAIT').length,
             token_exp: tokenExp,
-            has_token: !!DS_CONFIG.token,
-            has_cookie: !!DS_CONFIG.cookie,
-            has_hif: !!(DS_CONFIG.hif_dliq || DS_CONFIG.hif_leim),
+            has_token: list.length > 0,
+            has_cookie: list.length > 0,
+            has_hif: list.some(a => a.hif_dliq || a.hif_leim),
         }));
         return;
+    }
+
+    // ── Управление аккаунтами DeepSeek (только localhost) ──
+    if (url.pathname === '/api/accounts' || url.pathname.startsWith('/api/accounts/')) {
+        if (!isLocal(req)) { res.writeHead(403, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Доступно только с localhost' })); return; }
+
+        // GET /api/accounts — список со статусами
+        if (req.method === 'GET' && url.pathname === '/api/accounts') {
+            const list = accounts.listAccounts().map(a => ({
+                id: a.id, status: accountStatus(a),
+                exp: accounts.decodeTokenInfo(a.token).exp, resetAt: a.resetAt || null,
+                preview: String(a.token || '').slice(-6),
+            }));
+            res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ accounts: list })); return;
+        }
+
+        // POST /api/accounts/import — добавить аккаунт из cURL/HAR (тело запроса)
+        if (req.method === 'POST' && url.pathname === '/api/accounts/import') {
+            let body = '';
+            req.on('data', c => { body += c; if (body.length > 25 * 1024 * 1024) req.destroy(); });
+            req.on('end', () => {
+                try {
+                    const parsed = finalizeAuth(parseAuthInput(body), accounts.anyWasmUrl());
+                    if (parsed.error) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(parsed)); return; }
+                    const r = accounts.addAccount(parsed);
+                    res.writeHead(r.error ? 400 : 200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(r));
+                } catch (e) { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Ошибка импорта: ' + e.message })); }
+            });
+            return;
+        }
+
+        // POST /api/accounts/:id/check — реальная проверка аккаунта
+        const mCheck = url.pathname.match(/^\/api\/accounts\/(acc_[a-zA-Z0-9]+)\/check$/);
+        if (req.method === 'POST' && mCheck) {
+            const id = mCheck[1]; const acc = accounts.getAccountById(id);
+            if (!acc) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Аккаунт не найден' })); return; }
+            (async () => {
+                let status = 'ERROR';
+                try {
+                    const r = await askDeepSeekStream('ping', 'healthcheck-' + id, 'deepseek-chat', acc);
+                    if (r.rateLimited) { accounts.markRateLimited(id, r.retryAfterHours); status = 'WAIT'; }
+                    else if (r.invalid) { accounts.markInvalid(id); status = 'INVALID'; }
+                    else if (r.resp && r.resp.status === 200) { accounts.markValid(id); status = 'OK'; }
+                    try { if (r.resp && r.resp.body) r.resp.body.cancel(); } catch { /* noop */ }
+                } catch (e) { status = 'ERROR'; }
+                res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ id, status, exp: accounts.decodeTokenInfo(acc.token).exp }));
+            })();
+            return;
+        }
+
+        // DELETE /api/accounts/:id  или  POST /api/accounts/:id/delete
+        const mDel = url.pathname.match(/^\/api\/accounts\/(acc_[a-zA-Z0-9]+)(\/delete)?$/);
+        if (mDel && (req.method === 'DELETE' || (req.method === 'POST' && mDel[2]))) {
+            const r = accounts.deleteAccount(mDel[1]);
+            res.writeHead(r.error ? 400 : 200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(r)); return;
+        }
+
+        res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Неизвестный эндпоинт аккаунтов' })); return;
     }
 
     const apiMode = url.pathname === '/v1/messages'
@@ -1107,7 +1229,13 @@ const server = http.createServer(async (req, res) => {
                 : `${historyPrefix}${prompt}`;
 
             const startTime = Date.now();
-            const { resp: dsResp } = await askDeepSeekStream(fullPrompt, agentId, requestedModel);
+            const { resp: dsResp, account: dsAccount, noAccounts } = await askWithRotation(fullPrompt, agentId, requestedModel);
+            if (noAccounts || !dsResp) {
+                res.writeHead(503, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: { message: 'Нет доступных аккаунтов DeepSeek (все в лимите или невалидны). Добавьте/обновите аккаунт в дашборде.', type: 'no_available_accounts' } }));
+                return;
+            }
+            let curAccount = dsAccount;
 
             // Process streaming response from DeepSeek — returns { content, reasoningContent, messageId, finishReason }
             async function readDeepSeekResponse(readable) {
@@ -1244,7 +1372,15 @@ const server = http.createServer(async (req, res) => {
                 session.messageCount = 0;
                 // Brief delay before retry to let DeepSeek breathe
                 await new Promise(r => setTimeout(r, Math.min(1000 * retryAttempt, 5000)));
-                const { resp: retryResp } = await askDeepSeekStream(fullPrompt, agentId, requestedModel);
+                // Пустой ответ часто = скрытый лимит: после пары попыток помечаем аккаунт и ротируем.
+                if (retryAttempt >= 3 && curAccount) { accounts.markRateLimited(curAccount.id); resetSession(session); }
+                const { resp: retryResp, account: retryAccount, noAccounts: noAcc2 } = await askWithRotation(fullPrompt, agentId, requestedModel);
+                if (noAcc2 || !retryResp) {
+                    res.writeHead(503, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: { message: 'Все аккаунты DeepSeek в лимите или невалидны.', type: 'no_available_accounts' } }));
+                    return;
+                }
+                if (retryAccount) curAccount = retryAccount;
                 const retryResult = await readDeepSeekResponse(retryResp.body);
                 const retryContent = retryResult && retryResult.content ? sanitizeContent(retryResult.content) : '';
                 const retryReasoning = retryResult && retryResult.reasoningContent ? sanitizeContent(retryResult.reasoningContent) : '';
@@ -1263,7 +1399,8 @@ const server = http.createServer(async (req, res) => {
                 continuationRounds++;
                 console.log(`${agentTag} Response ${fullContent.length} chars (finish=${finishReason}). Auto-continuing (${continuationRounds}/${MAX_CONTINUATION})...`);
                 await new Promise(r => setTimeout(r, 500));
-                const { resp: contResp } = await askDeepSeekStream('continue', agentId, requestedModel);
+                const { resp: contResp } = await askWithRotation('continue', agentId, requestedModel);
+                if (!contResp) break;
                 const contResult = await readDeepSeekResponse(contResp.body);
                 const contContent = contResult && contResult.content ? sanitizeContent(contResult.content) : '';
                 const contReasoning = contResult && contResult.reasoningContent ? sanitizeContent(contResult.reasoningContent) : '';
@@ -1289,8 +1426,8 @@ const server = http.createServer(async (req, res) => {
                 session.messageCount = 0;
                 await new Promise(r => setTimeout(r, 1000));
                 const strictPrompt = fullPrompt + '\n\n[STRICT INSTRUCTION] Your previous response had a TOOL_CALL but the arguments were too long and got cut off. Keep the arguments SHORT — no large file contents. Just use a minimal example or reference the file by name. Output ONLY: TOOL_CALL: <function>\narguments: <short JSON>';
-                const { resp: retryResp2 } = await askDeepSeekStream(strictPrompt, agentId, requestedModel);
-                const retryResult2 = await readDeepSeekResponse(retryResp2.body);
+                const { resp: retryResp2 } = await askWithRotation(strictPrompt, agentId, requestedModel);
+                const retryResult2 = retryResp2 ? await readDeepSeekResponse(retryResp2.body) : null;
                 const retryContent2 = retryResult2 && retryResult2.content ? sanitizeContent(retryResult2.content) : '';
                 if (retryContent2 && retryContent2.trim()) {
                     const retryTc = parseToolCall(retryContent2);

@@ -90,6 +90,18 @@
   .models{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:6px;max-height:280px;overflow:auto;padding-right:4px}
   .chip{font-family:var(--mono);font-size:var(--fs-xs);background:var(--card2);border:1px solid var(--border);border-radius:6px;padding:7px 10px;cursor:pointer;transition:.12s;display:flex;align-items:center;gap:6px;color:var(--text)}
   .chip:hover{border-color:var(--accent)}
+
+  /* аккаунты — прямые полосы статуса */
+  .spacer{flex:1}
+  .acc{display:flex;align-items:center;gap:var(--s3);padding:10px 12px;background:var(--card2);border:1px solid var(--border);border-left:3px solid var(--faint);border-radius:0 var(--r) var(--r) 0;margin-bottom:6px;flex-wrap:wrap}
+  .acc.OK{border-left-color:var(--ok)} .acc.WAIT{border-left-color:var(--warn)}
+  .acc.INVALID,.acc.EXPIRED,.acc.ERROR{border-left-color:var(--err)}
+  .acc .id{font-weight:600;font-size:var(--fs-sm)} .acc .meta{color:var(--muted);font-size:var(--fs-xs);font-family:var(--mono)}
+  .badge{font-size:var(--fs-xs);font-weight:700;padding:3px 9px;border-radius:4px;display:inline-flex;align-items:center;gap:5px}
+  .badge::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+  .badge.OK{background:rgba(63,185,80,.16);color:#56d364} .badge.WAIT{background:rgba(210,153,34,.18);color:#e3b341}
+  .badge.INVALID,.badge.EXPIRED,.badge.ERROR{background:rgba(248,81,73,.2);color:#ff7b72} .badge.checking{background:rgba(77,107,254,.16);color:var(--accent)}
+  .import-box{margin-top:var(--s4);border-top:1px solid var(--border);padding-top:var(--s4)}
   .chip .id{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
   .chip .caps{display:flex;gap:3px;flex-shrink:0}
   .cap{font-size:9px;font-weight:700;padding:1px 4px;border-radius:3px;letter-spacing:.02em}
@@ -157,6 +169,8 @@
   <symbol id="i-bulb" viewBox="0 0 24 24"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2Z"/></symbol>
   <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></symbol>
   <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="8" r="5"/><path d="m11.5 11.5 8.5 8.5M16 16l3-3M18 18l2-2"/></symbol>
+  <symbol id="i-accounts" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="m20 6-11 11-5-5"/></symbol>
 </svg>
 
 <div class="wrap">
@@ -167,6 +181,7 @@
 
   <nav class="tabs" role="tablist" aria-label="Разделы">
     <button class="tab" role="tab" aria-selected="true" aria-controls="tab-chat" id="t-chat" data-tab="chat"><svg class="ic"><use href="#i-chat"/></svg>Чат</button>
+    <button class="tab" role="tab" aria-selected="false" aria-controls="tab-accounts" id="t-accounts" data-tab="accounts" tabindex="-1"><svg class="ic"><use href="#i-accounts"/></svg>Аккаунты</button>
     <button class="tab" role="tab" aria-selected="false" aria-controls="tab-overview" id="t-overview" data-tab="overview" tabindex="-1"><svg class="ic"><use href="#i-overview"/></svg>Обзор</button>
   </nav>
 
@@ -192,12 +207,26 @@
     </div>
   </section>
 
+  <!-- АККАУНТЫ -->
+  <section id="tab-accounts" class="panel" role="tabpanel" aria-labelledby="t-accounts">
+    <div class="card full">
+      <h2><svg class="ic"><use href="#i-accounts"/></svg>Аккаунты DeepSeek <span class="spacer"></span>
+        <button class="sm" id="checkAllAcc"><svg class="ic"><use href="#i-check"/></svg>проверить все</button></h2>
+      <div id="accList"><span class="hint">загрузка…</span></div>
+      <div class="import-box">
+        <div class="hint" style="margin-bottom:6px">Добавить аккаунт: в браузере (где вошли в DeepSeek) F12 → Network → отправьте сообщение → правый клик на запросе к <code>chat.deepseek.com/api/...</code> → <b>Copy as cURL</b> (или <b>Save All As HAR</b>) → вставьте сюда.</div>
+        <textarea id="importText" aria-label="cURL или HAR" placeholder="Вставьте сюда cURL или содержимое HAR-файла…" style="min-height:72px;font-family:var(--mono);font-size:var(--fs-xs)"></textarea>
+        <div class="row" style="margin-top:var(--s2)"><button class="primary" id="importBtn"><svg class="ic"><use href="#i-key"/></svg>Импортировать аккаунт</button></div>
+      </div>
+    </div>
+  </section>
+
   <!-- ОБЗОР -->
   <section id="tab-overview" class="panel" role="tabpanel" aria-labelledby="t-overview">
     <div class="kpis">
       <div class="kpi"><div class="num" id="kpiStatus">—</div><div class="lbl"><svg class="ic"><use href="#i-refresh"/></svg>статус</div></div>
       <div class="kpi"><div class="num" id="kpiModels">—</div><div class="lbl"><svg class="ic"><use href="#i-overview"/></svg>моделей</div></div>
-      <div class="kpi"><div class="num" id="kpiAuth">—</div><div class="lbl"><svg class="ic"><use href="#i-key"/></svg>авторизация</div></div>
+      <div class="kpi"><div class="num" id="kpiAuth">—</div><div class="lbl"><svg class="ic"><use href="#i-accounts"/></svg>аккаунтов онлайн</div></div>
     </div>
     <div class="grid">
       <div class="card">
@@ -246,7 +275,7 @@ const apiBase = origin+'/v1';
 $('#baseUrl').textContent = apiBase;
 
 // ── Вкладки ──────────────────────────────────────────────────────────────
-const TABS=['chat','overview'];
+const TABS=['chat','accounts','overview'];
 const inited={};
 function showTab(name){
   if(!TABS.includes(name)) name='chat';
@@ -255,7 +284,7 @@ function showTab(name){
   if(location.hash.slice(1)!==name) history.replaceState(null,'','#'+name);
   if(!inited[name]){ inited[name]=true; lazyInit(name); }
 }
-function lazyInit(name){ if(name==='overview'){ loadModels(); loadAuth(); } }
+function lazyInit(name){ if(name==='overview'){ loadModels(); loadAuth(); } else if(name==='accounts'){ loadAccountsList(); } }
 document.querySelectorAll('.tab').forEach(t=> t.onclick=()=>showTab(t.dataset.tab));
 $('.tabs').addEventListener('keydown', e=>{
   const i=TABS.indexOf(document.activeElement.dataset?.tab); if(i<0) return;
@@ -280,11 +309,12 @@ async function loadHealth(){
   try{
     const j=await (await fetch(origin+'/health')).json(); healthCache=j;
     const n=(j.models||[]).length;
+    const ac=j.accounts||{};
     $('#statusDot').className='dot on';
-    $('#statusText').textContent='онлайн · '+n+' моделей · '+(j.config_ready?'auth ✓':'нет auth');
+    $('#statusText').textContent='онлайн · '+n+' моделей · '+(ac.online??0)+'/'+(ac.total??0)+' акк.';
     $('#kpiStatus').textContent='Онлайн'; $('#kpiStatus').className='num ok';
     $('#kpiModels').textContent=n;
-    $('#kpiAuth').textContent=j.config_ready?'OK':'нет'; $('#kpiAuth').className='num'+(j.config_ready?' ok':' err');
+    $('#kpiAuth').textContent=(ac.online??0)+' / '+(ac.total??0); $('#kpiAuth').className='num'+(ac.online?' ok':' err');
   }catch{ $('#statusDot').className='dot off'; $('#statusText').textContent='офлайн'; $('#kpiStatus').textContent='Офлайн'; $('#kpiStatus').className='num err'; $('#kpiAuth').textContent='—'; }
 }
 function fmtExp(ms){ if(!ms) return ''; const d=Math.round((ms-Date.now())/864e5); return 'до '+new Date(ms).toISOString().slice(0,10)+(d>=0?' ('+d+' дн)':' (истёк)'); }
@@ -299,6 +329,44 @@ async function loadAuth(){
       <div class="row"><label class="k">hif-заголовки</label><div class="val">${j.has_hif?'есть ✓':'опционально'}</div></div>${exp}`;
   }catch{ box.innerHTML='<div class="hint err-text">Не удалось получить статус авторизации</div>'; }
 }
+// ── Аккаунты ───────────────────────────────────────────────────────────────
+const accStLabel=s=>({OK:'активен',WAIT:'лимит',INVALID:'невалиден',EXPIRED:'истёк',ERROR:'ошибка'})[s]||s;
+function fmtResetAt(iso){ try{ return new Date(iso).toLocaleString('ru-RU',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}); }catch{ return ''; } }
+async function loadAccountsList(){
+  const list=$('#accList');
+  try{
+    const j=await (await fetch(origin+'/api/accounts')).json();
+    if(!j.accounts||!j.accounts.length){ list.innerHTML='<div class="onboard">Пока нет аккаунтов. Добавьте первый через импорт ниже.</div>'; return; }
+    list.innerHTML=j.accounts.map(a=>{
+      const meta=a.resetAt?('лимит до '+fmtResetAt(a.resetAt)):(a.exp?fmtExp(a.exp):'');
+      return `<div class="acc ${esc(a.status)}"><span class="id">${esc(a.id)}</span><span class="badge ${esc(a.status)}">${accStLabel(a.status)}</span><span class="meta">…${esc(a.preview||'')}</span><span class="meta">${esc(meta)}</span><span class="spacer"></span>
+        <button class="sm" data-check="${esc(a.id)}" aria-label="Проверить ${esc(a.id)}">${icon('i-check')}проверить</button>
+        <button class="sm" data-del="${esc(a.id)}" aria-label="Удалить ${esc(a.id)}">${icon('i-trash')}</button></div>`;
+    }).join('');
+  }catch{ list.innerHTML='<div class="hint err-text">Не удалось загрузить аккаунты</div>'; }
+}
+$('#checkAllAcc').onclick=async()=>{
+  const b=$('#checkAllAcc'); b.disabled=true;
+  try{ const j=await (await fetch(origin+'/api/accounts')).json();
+    for(const a of (j.accounts||[])){ try{ await fetch(origin+'/api/accounts/'+encodeURIComponent(a.id)+'/check',{method:'POST'}); }catch{} }
+    await loadAccountsList(); await loadHealth(); toast('Проверка завершена','ok');
+  }catch{ toast('Ошибка','err'); } b.disabled=false;
+};
+$('#importBtn').onclick=async()=>{
+  const text=$('#importText').value.trim(); if(!text) return toast('Вставьте cURL или HAR','err');
+  const b=$('#importBtn'); b.disabled=true;
+  try{ const j=await (await fetch(origin+'/api/accounts/import',{method:'POST',headers:{'Content-Type':'text/plain'},body:text})).json();
+    if(j.ok){ toast('Добавлен '+j.id,'ok'); $('#importText').value=''; loadAccountsList(); loadHealth(); } else toast(j.error||'Ошибка импорта','err');
+  }catch{ toast('Сеть недоступна','err'); } b.disabled=false;
+};
+document.addEventListener('click', async e=>{
+  const t=e.target.closest('button'); if(!t) return;
+  if(t.dataset.check){ const acc=t.closest('.acc'); const badge=acc&&acc.querySelector('.badge'); if(badge){ badge.className='badge checking'; badge.textContent='проверка'; } t.disabled=true;
+    try{ await fetch(origin+'/api/accounts/'+encodeURIComponent(t.dataset.check)+'/check',{method:'POST'}); }catch{} await loadAccountsList(); await loadHealth(); return; }
+  if(t.dataset.del){ if(!confirm('Удалить аккаунт '+t.dataset.del+'?')) return; t.disabled=true;
+    try{ await fetch(origin+'/api/accounts/'+encodeURIComponent(t.dataset.del),{method:'DELETE'}); toast('Удалён','ok'); }catch{ toast('Ошибка','err'); } loadAccountsList(); loadHealth(); return; }
+});
+setInterval(()=>{ if($('#tab-accounts').classList.contains('active')) loadAccountsList(); }, 20000);
 // ── Модели ─────────────────────────────────────────────────────────────────
 async function loadModels(){
   const list=$('#modelList');
