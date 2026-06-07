@@ -1,133 +1,70 @@
-// DeepSeek Auth Exporter — Popup Script
-
+// DeepSeek → FreeDeepseekAPI — Popup
 function $(id) { return document.getElementById(id); }
-
-const WASM_URL = 'https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm';
-
-function buildAuthJson(data) {
-  const cookie = [];
-  if (data.ds_session_id) cookie.push(`ds_session_id=${data.ds_session_id}`);
-  if (data.smidV2) cookie.push(`smidV2=${data.smidV2}`);
-
-  return {
-    token: data.token || '',
-    hif_dliq: data.hif_dliq || '',
-    hif_leim: data.hif_leim || '',
-    cookie: cookie.join('; '),
-    wasmUrl: WASM_URL,
-  };
-}
-
-function getStatus(auth, data) {
-  const checks = [
-    { label: 'token', ok: !!auth.token },
-    { label: 'cookie (ds_session_id / smidV2)', ok: auth.cookie.includes('=') },
-    { label: 'hif_dliq', ok: !!auth.hif_dliq },
-    { label: 'hif_leim', ok: !!auth.hif_leim },
-  ];
-  return { checks, allOk: checks.every((c) => c.ok) };
-}
-
-function render(data) {
-  const auth = buildAuthJson(data);
-  const preview = JSON.stringify(auth, null, 2);
-  $('jsonPreview').textContent = preview;
-
-  const { checks, allOk } = getStatus(auth, data);
-  const missing = checks.filter((c) => !c.ok).map((c) => c.label);
-
-  if (!data._lastUpdated) {
-    $('status').className = 'status warn';
-    $('status').textContent = '⚠️ No credentials yet. Click "Collect from Tab" while on chat.deepseek.com';
-  } else if (allOk) {
-    $('status').className = 'status ok';
-    $('status').textContent = '✅ All 4 credentials captured — ready to export';
-  } else {
-    $('status').className = 'status warn';
-    $('status').textContent = `⚠️ Missing: ${missing.join(', ')}`;
-  }
-
-  $('detail').textContent = data._lastUpdated
-    ? `Last updated: ${data._lastUpdated}`
-    : 'Open chat.deepseek.com, then click Collect';
-}
-
-function loadAuth() {
-  chrome.runtime.sendMessage({ action: 'export' }, (response) => {
-    if (response && response.success) render(response.auth);
-    else {
-      $('status').className = 'status err';
-      $('status').textContent = '❌ Failed to read stored credentials';
-    }
-  });
-}
-
-// Collect button — reads cookies + localStorage from active DeepSeek tab
-$('btnCollect').addEventListener('click', () => {
-  $('status').className = 'status warn';
-  $('status').textContent = '⏳ Collecting from chat.deepseek.com...';
-  chrome.runtime.sendMessage({ action: 'collect' }, (response) => {
-    if (response && response.success) {
-      render(response.auth);
-    } else {
-      $('status').className = 'status err';
-      $('status').textContent = '❌ ' + (response?.error || 'Unknown error');
-    }
-  });
-});
-
 const PROXY_URL = 'http://localhost:9655/api/accounts/import';
-// Главная кнопка: собрать креды и сразу отправить в локальный FreeDeepseekAPI
-$('btnAdd').addEventListener('click', () => {
-  $('status').className = 'status warn';
-  $('status').textContent = '⏳ Сбор и отправка в FreeDeepseekAPI…';
-  chrome.runtime.sendMessage({ action: 'collect' }, async (response) => {
-    if (!response || !response.success) {
-      $('status').className = 'status err';
-      $('status').textContent = '❌ ' + (response?.error || 'Откройте вкладку chat.deepseek.com');
-      return;
+
+let current = null; // перехваченный набор кредов {token,cookie,hif_*,wasmUrl}
+
+function render(cap) {
+    if (!cap || !cap.token || !cap.cookie) {
+        $('status').className = 'status warn';
+        $('status').textContent = '⚠️ Откройте chat.deepseek.com и ОТПРАВЬТЕ любое сообщение, затем нажмите кнопку.';
+        $('jsonPreview').textContent = '{ }';
+        $('detail').textContent = 'Креды появятся после запроса к DeepSeek';
+        return null;
     }
-    render(response.auth);
-    const auth = buildAuthJson(response.auth);
-    if (!auth.token || !auth.cookie) {
-      $('status').className = 'status err';
-      $('status').textContent = '❌ Не хватает token/cookie — войдите в DeepSeek и отправьте сообщение';
-      return;
+    const auth = { token: cap.token, hif_dliq: cap.hif_dliq || '', hif_leim: cap.hif_leim || '', cookie: cap.cookie, wasmUrl: cap.wasmUrl };
+    // превью с маскировкой секретов
+    $('jsonPreview').textContent = JSON.stringify({
+        token: auth.token.slice(0, 6) + '…(' + auth.token.length + ')',
+        cookie: auth.cookie.slice(0, 48) + '…',
+        hif_leim: auth.hif_leim ? ('…(' + auth.hif_leim.length + ')') : '',
+    }, null, 2);
+    $('status').className = 'status ok';
+    $('status').textContent = '✅ Перехвачено: token + cookie' + (auth.hif_leim ? ' + hif' : '') + ' — готово';
+    $('detail').textContent = cap._t ? ('Обновлено: ' + new Date(cap._t).toLocaleTimeString()) : '';
+    return auth;
+}
+
+function refresh() {
+    chrome.runtime.sendMessage({ action: 'get' }, (r) => { current = (r && r.success) ? render(r.cap) : render(null); });
+}
+
+// Главная кнопка — отправить перехваченные креды в FreeDeepseekAPI
+$('btnAdd').addEventListener('click', async () => {
+    if (!current) {
+        refresh();
+        $('status').className = 'status warn';
+        $('status').textContent = '⏳ Кредов нет. Отправьте сообщение в DeepSeek и нажмите снова.';
+        return;
     }
+    $('status').className = 'status warn';
+    $('status').textContent = '⏳ Отправка в FreeDeepseekAPI…';
     try {
-      const r = await fetch(PROXY_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(auth) });
-      const j = await r.json();
-      if (j.ok) { $('status').className = 'status ok'; $('status').textContent = '✅ Добавлен в FreeDeepseekAPI как ' + j.id; }
-      else { $('status').className = 'status err'; $('status').textContent = '❌ ' + (j.error || 'Ошибка добавления'); }
+        const r = await fetch(PROXY_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(current) });
+        const j = await r.json();
+        if (j.ok) { $('status').className = 'status ok'; $('status').textContent = '✅ Добавлен в FreeDeepseekAPI как ' + j.id; }
+        else { $('status').className = 'status err'; $('status').textContent = '❌ ' + (j.error || 'Ошибка добавления'); }
     } catch (e) {
-      $('status').className = 'status err';
-      $('status').textContent = '❌ FreeDeepseekAPI недоступен на localhost:9655 (запущен?)';
+        $('status').className = 'status err';
+        $('status').textContent = '❌ FreeDeepseekAPI недоступен на localhost:9655 (запущен?)';
     }
-  });
 });
 
-// Copy JSON button
+$('btnCollect').addEventListener('click', refresh);
+
 $('btnCopy').addEventListener('click', () => {
-  const json = $('jsonPreview').textContent;
-  navigator.clipboard.writeText(json).then(() => {
-    $('btnCopy').textContent = '✅ Copied!';
-    setTimeout(() => { $('btnCopy').textContent = '📋 Copy JSON'; }, 1500);
-  });
+    if (!current) return;
+    navigator.clipboard.writeText(JSON.stringify(current, null, 2)).then(() => {
+        $('btnCopy').textContent = '✅'; setTimeout(() => { $('btnCopy').textContent = '📋 Копировать JSON'; }, 1200);
+    });
 });
 
-// Download file button
 $('btnSave').addEventListener('click', () => {
-  const json = $('jsonPreview').textContent;
-  const blob = new Blob([json + '\n'], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = 'deepseek-auth.json';
-  a.click();
-  URL.revokeObjectURL(url);
-  $('btnSave').textContent = '✅ Saved!';
-  setTimeout(() => { $('btnSave').textContent = '💾 Download File'; }, 1500);
+    if (!current) return;
+    const blob = new Blob([JSON.stringify(current, null, 2) + '\n'], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = 'deepseek-auth.json'; a.click();
+    URL.revokeObjectURL(url);
 });
 
-// Initial load
-loadAuth();
+refresh();

@@ -1,8 +1,9 @@
 # DeepSeek → FreeDeepseekAPI (расширение)
 
-Добавляет аккаунт DeepSeek в локальный FreeDeepseekAPI **одним кликом**: собирает
-`token` + cookie (включая httpOnly) + `hif_*` с `chat.deepseek.com` и отправляет
-на `http://localhost:9655/api/accounts/import`.
+Добавляет аккаунт DeepSeek в локальный FreeDeepseekAPI **одним кликом**:
+перехватывает заголовки реального запроса к `chat.deepseek.com/api/...`
+(`token` из `Authorization`, все cookie, `hif_*`) и отправляет на
+`http://localhost:9655/api/accounts/import`.
 
 Работает в Firefox и Chrome/Edge (Manifest V3).
 
@@ -21,7 +22,8 @@
 ## Использование
 1. Запустите FreeDeepseekAPI (порт 9655).
 2. Откройте `chat.deepseek.com` и войдите в нужный аккаунт.
-3. Клик по иконке расширения → **«➕ Добавить в FreeDeepseekAPI»**.
+3. **Отправьте любое сообщение** (например `ok`) — чтобы прошёл запрос, из которого берутся креды.
+4. Клик по иконке расширения → **«➕ Добавить в FreeDeepseekAPI»**.
 
 Для нескольких аккаунтов повторите из разных профилей/логинов браузера.
 
