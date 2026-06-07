@@ -1021,6 +1021,37 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
+    // Dashboard (web UI) — single static file
+    if (req.method === 'GET' && url.pathname === '/dashboard') {
+        try {
+            const html = fs.readFileSync(path.join(__dirname, 'public', 'dashboard.html'));
+            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+            res.end(html);
+        } catch {
+            res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+            res.end('Dashboard not built (public/dashboard.html missing)');
+        }
+        return;
+    }
+
+    // Auth status for dashboard: decode JWT exp (no signature check) + presence flags
+    if (req.method === 'GET' && url.pathname === '/api/auth-status') {
+        let tokenExp = null;
+        try {
+            const payload = JSON.parse(Buffer.from(String(DS_CONFIG.token || '').split('.')[1], 'base64url').toString());
+            if (payload.exp) tokenExp = payload.exp * 1000;
+        } catch { /* token missing or not a JWT */ }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            config_ready: hasAuthConfig(),
+            token_exp: tokenExp,
+            has_token: !!DS_CONFIG.token,
+            has_cookie: !!DS_CONFIG.cookie,
+            has_hif: !!(DS_CONFIG.hif_dliq || DS_CONFIG.hif_leim),
+        }));
+        return;
+    }
+
     const apiMode = url.pathname === '/v1/messages'
         ? 'anthropic'
         : (url.pathname === '/v1/responses' ? 'responses' : 'openai');

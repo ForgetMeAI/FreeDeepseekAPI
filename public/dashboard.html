@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FreeDeepseekAPI — Дашборд</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%234d6bfe' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M3 8c3-3.5 6-3.5 9 0s6 3.5 9 0'/%3E%3Cpath d='M3 13c3-3.5 6-3.5 9 0s6 3.5 9 0'/%3E%3Cpath d='M3 18c3-3.5 6-3.5 9 0s6 3.5 9 0'/%3E%3C/svg%3E">
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js" integrity="sha384-/TQbtLCAerC3jgaim+N78RZSDYV7ryeoBCVqTuzRrFec2akfBkHS7ACQ3PQhvMVi" crossorigin="anonymous" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.7/dist/purify.min.js" integrity="sha384-XQqX/4yiUGu+oyr87jvWzRuqBUK/adrY0DunhL+tID9m/9dwSpV8h9Fk/Sg6ifVQ" crossorigin="anonymous" defer></script>
+<style>
+  :root{
+    --bg:#0d1117; --bg2:#010409; --card:#161b22; --card2:#1c2230; --elev:#21262d;
+    --border:#2a2f37; --border2:#3d444d;
+    --text:#e6edf3; --muted:#9198a1; --faint:#6e7681;
+    --accent:#4d6bfe; --accent-press:#3b54d4; --accent-deep:#2d3fa0;
+    --ok:#3fb950; --warn:#d29922; --err:#f85149;
+    --mono:ui-monospace,SFMono-Regular,Consolas,monospace;
+    --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s5:22px; --s6:30px;
+    --r:8px; --r2:12px;
+    --fs-xs:12px; --fs-sm:13px; --fs-md:14px; --fs-lg:16px; --fs-xl:20px; --fs-hero:28px;
+    --shadow:0 1px 2px rgba(0,0,0,.3);
+  }
+  *{box-sizing:border-box}
+  html{scrollbar-color:var(--border2) transparent}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;line-height:1.5;font-size:var(--fs-sm)}
+  .wrap{max-width:1080px;margin:0 auto;padding:var(--s4) var(--s5) var(--s6)}
+  a{color:var(--accent);text-decoration:none}
+  svg.ic{width:1em;height:1em;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}
+
+  header{position:sticky;top:0;z-index:20;background:rgba(13,17,23,.85);backdrop-filter:blur(10px);
+    display:flex;align-items:center;justify-content:space-between;gap:var(--s4);flex-wrap:wrap;padding:var(--s3) 0;border-bottom:1px solid var(--border)}
+  h1{font-size:var(--fs-xl);margin:0;display:flex;align-items:center;gap:var(--s2);font-weight:700;letter-spacing:-.01em}
+  h1 .logo{width:24px;height:24px;color:var(--accent)}
+  .status-pill{display:inline-flex;align-items:center;gap:var(--s2);padding:6px 13px;border-radius:6px;border:1px solid var(--border);background:var(--card);font-size:var(--fs-sm);font-weight:600}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--faint)}
+  .dot.on{background:var(--ok);box-shadow:0 0 0 3px rgba(63,185,80,.16)}
+  .dot.off{background:var(--err);box-shadow:0 0 0 3px rgba(248,81,73,.16)}
+
+  .tabs{display:flex;gap:2px;overflow-x:auto;margin:var(--s4) 0 var(--s5);border-bottom:1px solid var(--border)}
+  .tab{font-family:inherit;cursor:pointer;background:none;border:none;border-bottom:2px solid transparent;color:var(--muted);
+    padding:10px 15px;font-size:var(--fs-md);font-weight:600;white-space:nowrap;display:inline-flex;align-items:center;gap:7px;transition:color .15s,border-color .15s}
+  .tab svg.ic{font-size:16px}
+  .tab:hover{color:var(--text)}
+  .tab[aria-selected="true"]{color:var(--text);border-bottom-color:var(--accent)}
+  .panel{display:none}
+  .panel.active{display:block;animation:fade .18s ease}
+  @keyframes fade{from{opacity:0}to{opacity:1}}
+
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:var(--s4)}
+  @media(max-width:760px){.grid{grid-template-columns:1fr}}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:var(--r2);padding:var(--s5);box-shadow:var(--shadow)}
+  .full{grid-column:1/-1}
+  .card h2{font-size:var(--fs-md);color:var(--text);margin:0 0 var(--s4);display:flex;align-items:center;gap:var(--s2);font-weight:600}
+  .card h2 svg.ic{font-size:17px;color:var(--accent)}
+  .card h2 .spacer{flex:1}
+
+  .kpis{display:grid;grid-template-columns:repeat(3,1fr);gap:var(--s3);margin-bottom:var(--s4)}
+  @media(max-width:760px){.kpis{grid-template-columns:1fr}}
+  .kpi{background:var(--card);border:1px solid var(--border);border-radius:var(--r2);padding:var(--s4);box-shadow:var(--shadow)}
+  .kpi .num{font-size:var(--fs-hero);font-weight:700;letter-spacing:-.02em;line-height:1.1}
+  .kpi .lbl{color:var(--muted);font-size:var(--fs-xs);margin-top:2px;display:flex;align-items:center;gap:6px}
+  .kpi .num.ok{color:var(--ok)} .kpi .num.warn{color:var(--warn)} .kpi .num.err{color:var(--err)}
+
+  .row{display:flex;align-items:center;gap:var(--s2);margin-bottom:var(--s2)}
+  .row:last-child{margin-bottom:0}
+  label.k{width:92px;color:var(--muted);font-size:var(--fs-sm);flex-shrink:0}
+  .val{flex:1;font-family:var(--mono);font-size:var(--fs-sm);background:var(--elev);border:1px solid var(--border2);border-radius:6px;padding:8px 10px;overflow:auto;white-space:nowrap;color:var(--text)}
+
+  button{font-family:inherit;cursor:pointer;border-radius:6px;border:1px solid var(--border2);background:var(--elev);color:var(--text);padding:8px 12px;font-size:var(--fs-sm);font-weight:500;display:inline-flex;align-items:center;gap:6px;transition:background .15s,border-color .15s,color .15s}
+  button:hover{border-color:var(--accent);color:var(--accent)}
+  button:active{transform:translateY(1px)}
+  button:disabled{opacity:.4;cursor:default;transform:none}
+  button.primary{background:var(--accent-press);border-color:var(--accent-deep);color:#fff;font-weight:600}
+  button.primary:hover{background:var(--accent);color:#fff}
+  button.sm{padding:5px 9px;font-size:var(--fs-xs)}
+  button svg.ic{font-size:15px}
+  button.toggle.on{background:rgba(77,107,254,.16);border-color:var(--accent);color:var(--accent)}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
+  .tab:focus-visible{outline:2px solid var(--accent);outline-offset:-3px;border-radius:0}
+
+  .hint{color:var(--muted);font-size:var(--fs-xs);margin-top:var(--s3);line-height:1.55}
+  .hint code{font-family:var(--mono);background:var(--bg2);padding:1px 5px;border-radius:4px;color:var(--accent)}
+  .onboard{background:rgba(77,107,254,.07);border:1px solid var(--accent-deep);border-radius:var(--r);padding:var(--s4);margin-bottom:var(--s3);line-height:1.6}
+  .onboard b{color:var(--text)}
+
+  textarea,input[type=text]{width:100%;font-family:inherit;font-size:var(--fs-md);background:var(--elev);border:1px solid var(--border2);border-radius:6px;padding:9px 11px;color:var(--text);resize:vertical}
+  textarea:focus,input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(77,107,254,.16)}
+  select{font-family:inherit;font-size:var(--fs-sm);background:var(--elev);border:1px solid var(--border2);border-radius:6px;padding:8px 10px;color:var(--text);cursor:pointer}
+
+  .models{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:6px;max-height:280px;overflow:auto;padding-right:4px}
+  .chip{font-family:var(--mono);font-size:var(--fs-xs);background:var(--card2);border:1px solid var(--border);border-radius:6px;padding:7px 10px;cursor:pointer;transition:.12s;display:flex;align-items:center;gap:6px;color:var(--text)}
+  .chip:hover{border-color:var(--accent)}
+  .chip .id{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+  .chip .caps{display:flex;gap:3px;flex-shrink:0}
+  .cap{font-size:9px;font-weight:700;padding:1px 4px;border-radius:3px;letter-spacing:.02em}
+  .cap.r{background:rgba(210,153,34,.2);color:#e3b341}
+  .cap.s{background:rgba(63,185,80,.18);color:#56d364}
+
+  /* chat */
+  .chatbox{display:flex;flex-direction:column;height:66vh;min-height:440px}
+  .msgs{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:var(--s3);padding:var(--s1) var(--s1) var(--s3)}
+  .bubble{max-width:84%;padding:9px 13px;border-radius:12px;font-size:var(--fs-md);word-break:break-word}
+  .bubble.user{align-self:flex-end;background:var(--accent-press);color:#fff;border-bottom-right-radius:3px;white-space:pre-wrap}
+  .bubble.assistant{align-self:flex-start;background:var(--elev);border:1px solid var(--border);border-bottom-left-radius:3px;width:fit-content;max-width:84%}
+  .bubble.assistant.plain .body{white-space:pre-wrap}
+  .bubble.err{border-color:var(--err);color:#ff7b72;white-space:pre-wrap}
+  .bubble .role{font-size:10px;text-transform:uppercase;letter-spacing:.06em;opacity:.65;margin-bottom:4px;font-weight:700}
+  .bubble.streaming .body::after{content:"▍";animation:blink 1s steps(2) infinite;color:var(--accent)}
+  @keyframes blink{50%{opacity:0}}
+  /* панель размышлений */
+  .think{margin-bottom:8px;border:1px solid var(--border);border-radius:8px;background:var(--bg2);overflow:hidden}
+  .think summary{cursor:pointer;padding:6px 10px;color:var(--muted);font-weight:600;font-size:var(--fs-xs);display:flex;align-items:center;gap:6px;user-select:none;list-style:none}
+  .think summary::-webkit-details-marker{display:none}
+  .think summary svg.ic{font-size:14px;color:var(--warn)}
+  .think[open] summary{border-bottom:1px solid var(--border)}
+  .think .think-body{padding:8px 10px;color:var(--muted);white-space:pre-wrap;font-size:var(--fs-sm);max-height:280px;overflow:auto}
+  /* markdown */
+  .md>*:first-child{margin-top:0}.md>*:last-child{margin-bottom:0}
+  .md p{margin:.5em 0}.md ul,.md ol{margin:.5em 0;padding-left:1.4em}.md li{margin:.2em 0}
+  .md code{font-family:var(--mono);font-size:.9em;background:var(--bg2);padding:1px 5px;border-radius:4px}
+  .md pre{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;overflow:auto;margin:.6em 0}
+  .md pre code{background:none;padding:0}
+  .md a{color:var(--accent);text-decoration:underline}
+  .md blockquote{border-left:3px solid var(--border2);margin:.5em 0;padding:.1em 0 .1em 12px;color:var(--muted)}
+  .md table{border-collapse:collapse;margin:.6em 0}.md th,.md td{border:1px solid var(--border);padding:5px 9px}
+  .md h1,.md h2,.md h3{margin:.7em 0 .3em;line-height:1.25}
+
+  .chat-ctrl{display:flex;gap:var(--s2);flex-wrap:wrap;align-items:center}
+  .chat-input{display:flex;gap:var(--s2);margin-top:var(--s3);align-items:flex-end}
+  .chat-input textarea{min-height:48px;max-height:170px;font-size:16px}
+  .empty{color:var(--muted);font-size:var(--fs-sm);text-align:center;margin:auto;padding:var(--s6);max-width:440px}
+  .empty svg.ic{font-size:28px;color:var(--faint);display:block;margin:0 auto var(--s3)}
+  .spinner{width:16px;height:16px;border:2px solid var(--border2);border-top-color:var(--accent);border-radius:50%;display:inline-block;animation:spin .7s linear infinite;vertical-align:middle}
+  @keyframes spin{to{transform:rotate(360deg)}}
+
+  .toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%) translateY(8px);background:var(--elev);border:1px solid var(--border2);color:var(--text);font-weight:600;padding:11px 18px;border-radius:8px;opacity:0;transition:.25s;pointer-events:none;font-size:var(--fs-sm);z-index:50;box-shadow:0 6px 22px rgba(0,0,0,.4);display:flex;align-items:center;gap:8px}
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  .toast.ok{border-color:var(--ok)} .toast.ok svg{color:var(--ok)}
+  .toast.err{border-color:var(--err)} .toast.err svg{color:var(--err)}
+  .err-text{color:#ff7b72}
+  footer{margin-top:var(--s6);text-align:center;color:var(--faint);font-size:var(--fs-xs)}
+  @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-logo" viewBox="0 0 24 24"><path d="M3 8c3-3.5 6-3.5 9 0s6 3.5 9 0"/><path d="M3 13c3-3.5 6-3.5 9 0s6 3.5 9 0"/><path d="M3 18c3-3.5 6-3.5 9 0s6 3.5 9 0"/></symbol>
+  <symbol id="i-chat" viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-11.5 7.2L4 21l1.8-5.5A8 8 0 1 1 21 12Z"/></symbol>
+  <symbol id="i-overview" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol>
+  <symbol id="i-plug" viewBox="0 0 24 24"><path d="M9 2v6M15 2v6"/><path d="M7 8h10v3a5 5 0 0 1-10 0Z"/><path d="M12 16v6"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="m20 6-11 11-5-5"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m2 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></symbol>
+  <symbol id="i-send" viewBox="0 0 24 24"><path d="M22 2 11 13M22 2l-7 20-4-9-9-4Z"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v5h-5"/></symbol>
+  <symbol id="i-warn" viewBox="0 0 24 24"><path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></symbol>
+  <symbol id="i-bulb" viewBox="0 0 24 24"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2Z"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></symbol>
+  <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="8" r="5"/><path d="m11.5 11.5 8.5 8.5M16 16l3-3M18 18l2-2"/></symbol>
+</svg>
+
+<div class="wrap">
+  <header>
+    <h1><svg class="ic logo"><use href="#i-logo"/></svg> FreeDeepseekAPI</h1>
+    <span class="status-pill"><span class="dot" id="statusDot"></span><span id="statusText" role="status" aria-live="polite">проверка…</span></span>
+  </header>
+
+  <nav class="tabs" role="tablist" aria-label="Разделы">
+    <button class="tab" role="tab" aria-selected="true" aria-controls="tab-chat" id="t-chat" data-tab="chat"><svg class="ic"><use href="#i-chat"/></svg>Чат</button>
+    <button class="tab" role="tab" aria-selected="false" aria-controls="tab-overview" id="t-overview" data-tab="overview" tabindex="-1"><svg class="ic"><use href="#i-overview"/></svg>Обзор</button>
+  </nav>
+
+  <!-- ЧАТ -->
+  <section id="tab-chat" class="panel active" role="tabpanel" aria-labelledby="t-chat">
+    <div class="card full chatbox">
+      <h2><svg class="ic"><use href="#i-chat"/></svg>Плейграунд чата <span class="spacer"></span>
+        <div class="chat-ctrl">
+          <select id="chatModel" aria-label="Модель">
+            <option value="deepseek-chat">deepseek-chat</option>
+            <option value="deepseek-reasoner">deepseek-reasoner</option>
+            <option value="deepseek-expert">deepseek-expert</option>
+            <option value="deepseek-v4-pro">deepseek-v4-pro</option>
+          </select>
+          <button class="sm toggle" id="searchToggle" title="Веб-поиск"><svg class="ic"><use href="#i-search"/></svg>Поиск</button>
+          <button class="sm" id="clearChat" title="Очистить"><svg class="ic"><use href="#i-trash"/></svg></button>
+        </div>
+      </h2>
+      <div class="msgs" id="msgs" role="log" aria-live="polite" aria-label="История чата"></div>
+      <div class="chat-input">
+        <textarea id="chatInput" aria-label="Сообщение" placeholder="Сообщение… (Enter — отправить, Shift+Enter — перенос)"></textarea>
+        <button class="primary" id="sendChat"><svg class="ic"><use href="#i-send"/></svg>Отправить</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ОБЗОР -->
+  <section id="tab-overview" class="panel" role="tabpanel" aria-labelledby="t-overview">
+    <div class="kpis">
+      <div class="kpi"><div class="num" id="kpiStatus">—</div><div class="lbl"><svg class="ic"><use href="#i-refresh"/></svg>статус</div></div>
+      <div class="kpi"><div class="num" id="kpiModels">—</div><div class="lbl"><svg class="ic"><use href="#i-overview"/></svg>моделей</div></div>
+      <div class="kpi"><div class="num" id="kpiAuth">—</div><div class="lbl"><svg class="ic"><use href="#i-key"/></svg>авторизация</div></div>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <h2><svg class="ic"><use href="#i-plug"/></svg>Как подключить</h2>
+        <div class="row"><label class="k">Base URL</label><div class="val" id="baseUrl">—</div><button class="sm" data-copy="baseUrl" aria-label="Копировать"><svg class="ic"><use href="#i-copy"/></svg></button></div>
+        <div class="row"><label class="k">API Key</label><div class="val">любой непустой (<b>sk-deepseek</b>)</div><button class="sm" data-copy-text="sk-deepseek" aria-label="Копировать"><svg class="ic"><use href="#i-copy"/></svg></button></div>
+        <div class="row"><label class="k">Модель</label><div class="val">deepseek-chat</div><button class="sm" data-copy-text="deepseek-chat" aria-label="Копировать"><svg class="ic"><use href="#i-copy"/></svg></button></div>
+        <div class="row" style="margin-top:var(--s3)">
+          <button class="sm" id="copyCurl"><svg class="ic"><use href="#i-copy"/></svg>cURL</button>
+          <button class="sm" id="copyPy"><svg class="ic"><use href="#i-copy"/></svg>Python</button>
+        </div>
+        <div class="hint">OpenAI-совместимо. Также есть Anthropic-шим <code>/v1/messages</code> и Responses <code>/v1/responses</code>.</div>
+      </div>
+      <div class="card">
+        <h2><svg class="ic"><use href="#i-key"/></svg>Авторизация DeepSeek</h2>
+        <div id="authBox"><span class="hint">загрузка…</span></div>
+        <div class="hint" style="margin-top:var(--s4)">Обновить логин: запустите <code>Авторизация DeepSeek.bat</code>, войдите в DeepSeek в открывшемся окне, отправьте <code>ok</code> и нажмите Enter в терминале.</div>
+      </div>
+      <div class="card full">
+        <h2><svg class="ic"><use href="#i-overview"/></svg>Модели (<span id="modelCount">0</span>) <span class="spacer"></span>
+          <span class="hint" style="margin:0"><span class="cap r">R</span> reasoning · <span class="cap s">S</span> web-поиск · клик копирует</span></h2>
+        <div class="models" id="modelList"><span class="hint">загрузка…</span></div>
+      </div>
+    </div>
+  </section>
+
+  <footer>FreeDeepseekAPI · дашборд · <a href="https://t.me/forgetmeai" target="_blank" rel="noopener noreferrer">t.me/forgetmeai</a></footer>
+</div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const origin = location.origin;
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const icon = id => `<svg class="ic"><use href="#${id}"/></svg>`;
+function toast(m, kind){ const t=$('#toast'); t.innerHTML=(kind==='err'?icon('i-warn'):kind==='ok'?icon('i-check'):'')+'<span>'+esc(m)+'</span>'; t.className='toast show'+(kind?' '+kind:''); clearTimeout(toast._t); toast._t=setTimeout(()=>t.className='toast',1900); }
+async function copyText(t){
+  try{ if(navigator.clipboard && isSecureContext){ await navigator.clipboard.writeText(t); return toast('Скопировано','ok'); } throw 0; }
+  catch{ try{ const a=document.createElement('textarea'); a.value=t; a.style.position='fixed'; a.style.opacity='0'; document.body.appendChild(a); a.select(); document.execCommand('copy'); a.remove(); toast('Скопировано','ok'); }catch{ toast('Не удалось скопировать','err'); } }
+}
+function mdRender(text){ try{ if(window.marked&&window.DOMPurify){ const html=window.marked.parse(text,{breaks:true}); return window.DOMPurify.sanitize(html,{ADD_ATTR:['target']}); } }catch{} return null; }
+// стабильный agent-id для серверной сессии DeepSeek (многоходовость)
+const AGENT_ID = (()=>{ let v=localStorage.getItem('ds_agent'); if(!v){ v='dash-'+Math.abs(Date.now()^(performance.now()*1000|0)).toString(36); localStorage.setItem('ds_agent',v); } return v; })();
+
+const apiBase = origin+'/v1';
+$('#baseUrl').textContent = apiBase;
+
+// ── Вкладки ──────────────────────────────────────────────────────────────
+const TABS=['chat','overview'];
+const inited={};
+function showTab(name){
+  if(!TABS.includes(name)) name='chat';
+  document.querySelectorAll('.tab').forEach(t=>{ const on=t.dataset.tab===name; t.setAttribute('aria-selected',on); t.tabIndex=on?0:-1; });
+  document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active', p.id==='tab-'+name));
+  if(location.hash.slice(1)!==name) history.replaceState(null,'','#'+name);
+  if(!inited[name]){ inited[name]=true; lazyInit(name); }
+}
+function lazyInit(name){ if(name==='overview'){ loadModels(); loadAuth(); } }
+document.querySelectorAll('.tab').forEach(t=> t.onclick=()=>showTab(t.dataset.tab));
+$('.tabs').addEventListener('keydown', e=>{
+  const i=TABS.indexOf(document.activeElement.dataset?.tab); if(i<0) return;
+  let j=null;
+  if(e.key==='ArrowRight') j=(i+1)%TABS.length; else if(e.key==='ArrowLeft') j=(i-1+TABS.length)%TABS.length;
+  else if(e.key==='Home') j=0; else if(e.key==='End') j=TABS.length-1;
+  if(j!==null){ e.preventDefault(); document.getElementById('t-'+TABS[j]).focus(); showTab(TABS[j]); }
+});
+window.addEventListener('hashchange', ()=>showTab((location.hash||'#chat').slice(1)));
+
+document.addEventListener('click', e=>{
+  const b=e.target.closest('[data-copy],[data-copy-text]'); if(!b) return;
+  if(b.dataset.copyText!==undefined) return copyText(b.dataset.copyText);
+  if(b.dataset.copy) return copyText($('#'+b.dataset.copy).textContent.trim());
+});
+$('#copyCurl').onclick=()=>copyText(`curl ${apiBase}/chat/completions \\\n  -H "Authorization: Bearer sk-deepseek" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"Привет"}]}'`);
+$('#copyPy').onclick=()=>copyText(`from openai import OpenAI\nclient = OpenAI(base_url="${apiBase}", api_key="sk-deepseek")\nr = client.chat.completions.create(model="deepseek-chat",\n    messages=[{"role":"user","content":"Привет"}])\nprint(r.choices[0].message.content)`);
+
+// ── Статус / KPI / авторизация ───────────────────────────────────────────
+let healthCache=null;
+async function loadHealth(){
+  try{
+    const j=await (await fetch(origin+'/health')).json(); healthCache=j;
+    const n=(j.models||[]).length;
+    $('#statusDot').className='dot on';
+    $('#statusText').textContent='онлайн · '+n+' моделей · '+(j.config_ready?'auth ✓':'нет auth');
+    $('#kpiStatus').textContent='Онлайн'; $('#kpiStatus').className='num ok';
+    $('#kpiModels').textContent=n;
+    $('#kpiAuth').textContent=j.config_ready?'OK':'нет'; $('#kpiAuth').className='num'+(j.config_ready?' ok':' err');
+  }catch{ $('#statusDot').className='dot off'; $('#statusText').textContent='офлайн'; $('#kpiStatus').textContent='Офлайн'; $('#kpiStatus').className='num err'; $('#kpiAuth').textContent='—'; }
+}
+function fmtExp(ms){ if(!ms) return ''; const d=Math.round((ms-Date.now())/864e5); return 'до '+new Date(ms).toISOString().slice(0,10)+(d>=0?' ('+d+' дн)':' (истёк)'); }
+async function loadAuth(){
+  const box=$('#authBox');
+  try{
+    const j=await (await fetch(origin+'/api/auth-status')).json();
+    if(!j.config_ready){ box.innerHTML='<div class="onboard">Авторизация не настроена. Запустите <b>Авторизация DeepSeek.bat</b> и войдите в свой аккаунт DeepSeek.</div>'; return; }
+    const exp=j.token_exp?('<div class="row"><label class="k">Срок токена</label><div class="val">'+esc(fmtExp(j.token_exp))+'</div></div>'):'';
+    box.innerHTML=`<div class="row"><label class="k">Токен</label><div class="val">${j.has_token?'есть ✓':'нет'}</div></div>
+      <div class="row"><label class="k">Cookie</label><div class="val">${j.has_cookie?'есть ✓':'нет'}</div></div>
+      <div class="row"><label class="k">hif-заголовки</label><div class="val">${j.has_hif?'есть ✓':'опционально'}</div></div>${exp}`;
+  }catch{ box.innerHTML='<div class="hint err-text">Не удалось получить статус авторизации</div>'; }
+}
+// ── Модели ─────────────────────────────────────────────────────────────────
+async function loadModels(){
+  const list=$('#modelList');
+  try{
+    const j=await (await fetch(apiBase+'/models')).json();
+    const data=j.data||[];
+    $('#modelCount').textContent=data.length;
+    list.innerHTML=data.map(m=>{
+      const c=m.capabilities||{};
+      const caps=(c.reasoning?'<span class="cap r" title="reasoning">R</span>':'')+(c.search?'<span class="cap s" title="web-поиск">S</span>':'');
+      return `<span class="chip" data-model="${esc(m.id)}" title="клик — копировать"><span class="id">${esc(m.id)}</span><span class="caps">${caps}</span></span>`;
+    }).join('')||'<span class="hint err-text">не удалось загрузить</span>';
+  }catch{ list.innerHTML='<span class="hint err-text">не удалось загрузить</span>'; }
+}
+document.addEventListener('click', e=>{ const c=e.target.closest('.chip[data-model]'); if(c) copyText(c.dataset.model); });
+
+// ── Web-поиск тоггл + выбор финальной модели ─────────────────────────────
+let searchOn=false;
+function syncSearchToggle(){
+  const m=$('#chatModel').value;
+  const supportsSearch = (m==='deepseek-chat' || m==='deepseek-reasoner');
+  const btn=$('#searchToggle');
+  btn.disabled=!supportsSearch;
+  if(!supportsSearch){ searchOn=false; btn.classList.remove('on'); }
+  btn.title = supportsSearch ? 'Веб-поиск' : 'Веб-поиск недоступен для этой модели';
+}
+function computeModel(){
+  let m=$('#chatModel').value;
+  if(searchOn && (m==='deepseek-chat'||m==='deepseek-reasoner')) m+='-search';
+  return m;
+}
+$('#chatModel').onchange=syncSearchToggle;
+$('#searchToggle').onclick=()=>{ if($('#searchToggle').disabled) return; searchOn=!searchOn; $('#searchToggle').classList.toggle('on',searchOn); };
+
+// ── Чат (история + reasoning + markdown, через /v1/chat/completions) ──────────
+let chatHistory=[], chatBusy=false, chatAbort=null;
+function bubbleEl(m){
+  const d=document.createElement('div'); d.className='bubble '+m.role+(m.err?' err':'');
+  d.innerHTML='<div class="role">'+(m.role==='user'?'Вы':'AI')+'</div>';
+  if(m.role==='assistant' && m.reasoning){
+    const det=document.createElement('details'); det.className='think';
+    det.innerHTML='<summary>'+icon('i-bulb')+'Размышления</summary><div class="think-body"></div>';
+    det.querySelector('.think-body').textContent=m.reasoning;
+    d.appendChild(det); d._think=det;
+  }
+  const c=document.createElement('div'); c.className='body';
+  if(m.role==='assistant' && !m.err && m.done){ const html=mdRender(m.content); if(html){ c.className='body md'; c.innerHTML=html; } else { c.textContent=m.content; d.classList.add('plain'); } }
+  else { c.textContent=m.content; if(m.role!=='user') d.classList.add('plain'); }
+  d.appendChild(c); d._c=c; return d;
+}
+function renderChat(){
+  const box=$('#msgs');
+  if(!chatHistory.length){ box.innerHTML='<div class="empty">'+icon('i-chat')+'Начните диалог. Ответ — стримингом с markdown; у reasoner-моделей появится панель «Размышления».</div>'; return; }
+  box.innerHTML=''; chatHistory.forEach(m=>box.appendChild(bubbleEl(m))); box.scrollTop=box.scrollHeight;
+}
+function atBottom(){ const b=$('#msgs'); return b.scrollHeight-b.scrollTop-b.clientHeight<60; }
+function setBusy(b){ chatBusy=b; const btn=$('#sendChat'); btn.innerHTML=b?'Стоп':icon('i-send')+'Отправить'; btn.classList.toggle('danger',b); }
+function ensureThink(node, asst){
+  if(node._think) return node._think.querySelector('.think-body');
+  const det=document.createElement('details'); det.className='think'; det.open=true;
+  det.innerHTML='<summary>'+icon('i-bulb')+'Размышления</summary><div class="think-body"></div>';
+  node.insertBefore(det, node._c); node._think=det;
+  return det.querySelector('.think-body');
+}
+
+async function sendChat(){
+  if(chatBusy){ chatAbort?.abort(); return; }
+  const text=$('#chatInput').value.trim();
+  if(!text) return;
+  const userMsg={role:'user',content:text};
+  chatHistory.push(userMsg); $('#chatInput').value='';
+  const asst={role:'assistant',content:'',reasoning:''}; chatHistory.push(asst);
+  const box=$('#msgs'); if(chatHistory.length===2) box.innerHTML='';
+  box.appendChild(bubbleEl(userMsg));
+  const node=bubbleEl(asst); node.classList.add('streaming','plain'); box.appendChild(node); box.scrollTop=box.scrollHeight;
+  setBusy(true); chatAbort=new AbortController();
+
+  const msgs=chatHistory.slice(0,-1).map(m=>({role:m.role,content:m.content}));
+  try{
+    const r=await fetch(apiBase+'/chat/completions',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer sk-deepseek'},signal:chatAbort.signal,
+      body:JSON.stringify({model:computeModel(),messages:msgs,stream:true,user:AGENT_ID})});
+    if(!r.ok||!r.body) throw new Error('HTTP '+r.status);
+    const reader=r.body.getReader(), dec=new TextDecoder(); let buf='';
+    while(true){
+      const {value,done}=await reader.read(); if(done) break;
+      buf+=dec.decode(value,{stream:true}); const lines=buf.split('\n'); buf=lines.pop()||'';
+      for(const line of lines){ const s=line.trim(); if(!s.startsWith('data:')) continue; const p=s.slice(5).trim(); if(p==='[DONE]'){ buf=''; break; }
+        try{ const delta=JSON.parse(p).choices?.[0]?.delta||{};
+          if(delta.reasoning_content){ asst.reasoning+=delta.reasoning_content; ensureThink(node,asst).textContent=asst.reasoning; if(atBottom()) box.scrollTop=box.scrollHeight; }
+          if(delta.content){ asst.content+=delta.content; node._c.textContent=asst.content; if(atBottom()) box.scrollTop=box.scrollHeight; }
+        }catch{} }
+    }
+    if(!asst.content && !asst.reasoning){ chatHistory.pop(); node.remove(); toast('Пустой ответ','err'); }
+    else { asst.done=true; if(node._think) node._think.open=false; const html=mdRender(asst.content); if(html){ node.classList.remove('plain'); node._c.className='body md'; node._c.innerHTML=html; } if(atBottom()) box.scrollTop=box.scrollHeight; }
+  }catch(e){
+    if(e.name==='AbortError'){ if(!asst.content&&!asst.reasoning){ chatHistory.pop(); node.remove(); } else asst.done=true; }
+    else { asst.content='⚠ '+e.message; node._c.textContent=asst.content; node.classList.add('err'); asst.err=true; }
+  }finally{ node.classList.remove('streaming'); setBusy(false); chatAbort=null; }
+}
+$('#sendChat').onclick=sendChat;
+$('#chatInput').addEventListener('keydown', e=>{ if(e.key==='Enter'&&!e.shiftKey){ e.preventDefault(); sendChat(); } });
+$('#clearChat').onclick=async()=>{
+  if(chatBusy) chatAbort?.abort();
+  chatHistory=[]; renderChat();
+  try{ await fetch(origin+'/reset-session?agent='+encodeURIComponent(AGENT_ID),{method:'POST'}); }catch{}
+};
+
+// ── Старт ──────────────────────────────────────────────────────────────────
+syncSearchToggle(); renderChat();
+showTab((location.hash||'#chat').slice(1)||'chat');
+loadHealth(); setInterval(loadHealth, 15000);
+</script>
+</body>
+</html>
