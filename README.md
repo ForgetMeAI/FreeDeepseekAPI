@@ -35,6 +35,7 @@ ForgetMeAI: https://t.me/forgetmeai
 - [Что это даёт](#-что-это-даёт)
 - [Возможности](#-возможности)
 - [Быстрый старт](#-быстрый-старт)
+- [Фоновый запуск (PM2)](#-фоновый-запуск-pm2)
 - [Проверка работы](#-проверка-работы)
 - [Примеры запросов](#-примеры-запросов)
   - [Chat Completions](#chat-completions)
@@ -113,6 +114,78 @@ SKIP_ACCOUNT_MENU=1 npm start
 ```text
 http://localhost:9655
 ```
+
+---
+
+## 🔄 Фоновый запуск (PM2)
+
+Для VPS/сервера без открытого терминала удобно запускать proxy через [PM2](https://pm2.keymetrics.io/). Сначала авторизуйтесь (`npm run auth`), затем поднимите сервер в фоне.
+
+При запуске через pm2 меню **пропускается автоматически** (нет интерактивного TTY). Явно можно задать `NON_INTERACTIVE=1` или `SKIP_ACCOUNT_MENU=1`.
+
+> **Важно:** флаг pm2 `--env` — это имя блока из `ecosystem.config.cjs` (`production`, `development`), а **не** `KEY=VALUE`. Запись `--env NON_INTERACTIVE=1` **не работает**.
+
+### Установка и быстрый старт
+
+```bash
+npm install -g pm2
+cd FreeDeepseekAPI
+npm run auth   # deepseek-auth.json должен существовать
+
+pm2 delete deepseek-api 2>/dev/null || true
+pm2 start server.js --name deepseek-api
+pm2 save
+```
+
+С явной переменной окружения (если нужно):
+
+```bash
+NON_INTERACTIVE=1 pm2 start server.js --name deepseek-api --update-env
+```
+
+Проверка:
+
+```bash
+pm2 status
+curl http://127.0.0.1:9655/health
+```
+
+### Конфиг ecosystem (рекомендуется)
+
+В репозитории есть готовый `ecosystem.config.cjs`:
+
+```bash
+pm2 delete deepseek-api 2>/dev/null || true
+pm2 start ecosystem.config.cjs
+pm2 save
+pm2 startup   # автозапуск после перезагрузки сервера
+```
+
+### Логи
+
+```bash
+pm2 logs deepseek-api              # live-лог (Ctrl+C не останавливает процесс)
+pm2 logs deepseek-api --lines 100 # последние 100 строк
+pm2 flush deepseek-api             # очистить логи
+```
+
+Файлы логов по умолчанию:
+
+```text
+~/.pm2/logs/deepseek-api-out.log
+~/.pm2/logs/deepseek-api-error.log
+```
+
+### Управление процессом
+
+```bash
+pm2 restart deepseek-api
+pm2 stop deepseek-api
+pm2 delete deepseek-api
+pm2 monit   # CPU/RAM в терминале
+```
+
+После обновления auth (`npm run auth`) перезапустите proxy: `pm2 restart deepseek-api`.
 
 ---
 

@@ -12,7 +12,7 @@
     "auth": "node scripts/auth.js",
     "deepseek:auth": "node scripts/deepseek_chrome_auth.js",
     "client": "node client.js",
-    "test": "node --check server.js && node --check scripts/auth.js && node --check scripts/deepseek_chrome_auth.js && node --check scripts/probe_deepseek_models.js && node --check client.js && node --check scripts/live_agentic_smoke_tests.mjs",
+    "test": "node --check server.js && node --check scripts/auth.js && node --check scripts/deepseek_console_auth.js && node --check scripts/deepseek_chrome_auth.js && node --check scripts/probe_deepseek_models.js && node --check client.js && node --check scripts/live_agentic_smoke_tests.mjs",
     "test:live": "node scripts/live_agentic_smoke_tests.mjs"
   },
   "keywords": [

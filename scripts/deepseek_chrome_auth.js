@@ -30,6 +30,9 @@ const outPath = process.env.DEEPSEEK_AUTH_PATH || path.join(repoRoot, 'deepseek-
 const url = 'https://chat.deepseek.com/';
 const reuseChrome = /^(1|true|yes|on)$/i.test(process.env.DEEPSEEK_REUSE_CHROME || '');
 const keepProfile = /^(1|true|yes|on)$/i.test(process.env.DEEPSEEK_KEEP_CHROME_PROFILE || '');
+const consoleLogin = (process.env.DEEPSEEK_LOGIN || '').trim();
+const consolePassword = (process.env.DEEPSEEK_PASSWORD || '').trim();
+const autoLoginEnabled = /^(1|true|yes|on)$/i.test(process.env.DEEPSEEK_AUTO_LOGIN || '') || (!!consoleLogin && !!consolePassword);
 
 function shellPatternSafe(s) {
   return String(s).replace(/[\\"']/g, '.');
@@ -40,13 +43,13 @@ function sleepSync(ms) {
 }
 
 function killExistingTestingChrome() {
-  if (process.platform !== 'darwin') return;
+  if (process.platform !== 'darwin' && process.platform !== 'linux') return;
   const patterns = [
     `--remote-debugging-port=${port}`,
     profileDir,
   ].map(shellPatternSafe);
   for (const pattern of patterns) {
-    try { execFileSync('/usr/bin/pkill', ['-f', pattern], { stdio: 'ignore' }); } catch {}
+    try { execFileSync('pkill', ['-f', pattern], { stdio: 'ignore' }); } catch {}
   }
   sleepSync(800);
 }
@@ -70,11 +73,62 @@ function removeProfileSafely(dir) {
   }
 }
 
+function platformChromeDefaults() {
+  if (process.platform === 'darwin') {
+    return [
+      '/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing',
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    ];
+  }
+  if (process.platform === 'linux') {
+    return [
+      '/usr/bin/google-chrome-stable',
+      '/usr/bin/google-chrome',
+      '/usr/bin/chromium-browser',
+      '/usr/bin/chromium',
+      '/snap/bin/chromium',
+    ];
+  }
+  if (process.platform === 'win32') {
+    const localAppData = process.env.LOCALAPPDATA || '';
+    const programFiles = process.env.ProgramFiles || 'C:\\Program Files';
+    const programFilesX86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
+    return [
+      path.join(programFiles, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      path.join(programFilesX86, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      path.join(localAppData, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    ];
+  }
+  return [];
+}
+
+function puppeteerCacheCandidates(cacheRoot) {
+  const candidates = [];
+  let versions = [];
+  try { versions = fs.readdirSync(cacheRoot); } catch { return candidates; }
+
+  for (const version of versions) {
+    const base = path.join(cacheRoot, version);
+    if (process.platform === 'darwin') {
+      for (const sub of ['chrome-mac-arm64', 'chrome-mac-x64']) {
+        candidates.push(path.join(
+          base, sub, 'Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing'
+        ));
+      }
+    } else if (process.platform === 'linux') {
+      candidates.push(path.join(base, 'chrome-linux64', 'chrome'));
+    } else if (process.platform === 'win32') {
+      candidates.push(path.join(base, 'chrome-win64', 'chrome.exe'));
+    }
+  }
+  return candidates;
+}
+
 function resolveChromePath() {
   if (process.env.CHROME_PATH) return process.env.CHROME_PATH;
 
   // Match FreeQwenApi: prefer Puppeteer's bundled "Google Chrome for Testing"
-  // instead of the user's normal /Applications/Google Chrome.app.
+  // when puppeteer is installed locally or in a sibling repo.
   for (const base of [repoRoot, qwenRepoRoot]) {
     try {
       const puppeteerPath = require.resolve('puppeteer', { paths: [base] });
@@ -86,17 +140,20 @@ function resolveChromePath() {
     } catch {}
   }
 
-  const cacheRoot = path.join(process.env.HOME || '', '.cache', 'puppeteer', 'chrome');
-  try {
-    const candidates = fs.readdirSync(cacheRoot)
-      .map(dir => path.join(cacheRoot, dir, 'chrome-mac-arm64', 'Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing'))
-      .filter(p => fs.existsSync(p))
-      .sort()
-      .reverse();
-    if (candidates[0]) return candidates[0];
-  } catch {}
+  const home = process.env.HOME || process.env.USERPROFILE || '';
+  const cacheRoot = path.join(home, '.cache', 'puppeteer', 'chrome');
+  const fromCache = puppeteerCacheCandidates(cacheRoot)
+    .filter(p => fs.existsSync(p))
+    .sort()
+    .reverse();
+  if (fromCache[0]) return fromCache[0];
 
-  return '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+  for (const p of platformChromeDefaults()) {
+    if (fs.existsSync(p)) return p;
+  }
+
+  const defaults = platformChromeDefaults();
+  return defaults[0] || 'google-chrome';
 }
 
 const chromePath = resolveChromePath();
@@ -106,6 +163,156 @@ function ask(q) {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   return new Promise(resolve => rl.question(q, ans => { rl.close(); resolve(ans); }));
 }
+
+async function autoLoginWithCredentials(cdp, login, password) {
+  // Best-effort "fill & submit" using DOM heuristics.
+  // If DeepSeek uses SSO/captcha, this may fail and user will need to complete login manually.
+  const loginJson = JSON.stringify(String(login));
+  const passwordJson = JSON.stringify(String(password));
+  const expression = `(async () => {
+    const loginValue = ${loginJson};
+    const passwordValue = ${passwordJson};
+
+    const isVisible = (el) => {
+      if (!el) return false;
+      const r = el.getBoundingClientRect && el.getBoundingClientRect();
+      if (!r) return false;
+      const style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+      const disp = style ? style.display : '';
+      const vis = style ? style.visibility : '';
+      return r.width > 0 && r.height > 0 && disp !== 'none' && vis !== 'hidden';
+    };
+
+    const norm = (s) => String(s || '').toLowerCase().trim();
+    const inputKeywords = {
+      login: ['email', 'e-mail', 'login', 'username', 'phone', 'телефон', 'почта', 'user', 'e-mail'],
+      password: ['password', 'пароль', 'pass', 'pwd']
+    };
+
+    const scoreInput = (el, kind) => {
+      const type = norm(el.type);
+      const name = norm(el.getAttribute && el.getAttribute('name'));
+      const id = norm(el.getAttribute && el.getAttribute('id'));
+      const placeholder = norm(el.getAttribute && el.getAttribute('placeholder'));
+      const aria = norm(el.getAttribute && (el.getAttribute('aria-label') || el.getAttribute('aria-labelledby')));
+      const autocomplete = norm(el.getAttribute && el.getAttribute('autocomplete'));
+      const blob = [type, name, id, placeholder, aria, autocomplete].filter(Boolean).join(' ');
+      const kws = inputKeywords[kind] || [];
+      let score = 0;
+      for (const kw of kws) if (blob.includes(kw)) score += 2;
+      // Strong hints
+      if (kind === 'password' && type === 'password') score += 10;
+      if (kind === 'login' && (type === 'email' || type === 'tel')) score += 8;
+      if (kind === 'login' && (autocomplete.includes('username') || autocomplete.includes('email'))) score += 6;
+      return score;
+    };
+
+    const visibleInputs = Array.from(document.querySelectorAll('input')).filter(isVisible);
+    let loginInput = null;
+    let passwordInput = null;
+
+    const pickBest = (kind) => {
+      let best = null;
+      let bestScore = -1;
+      for (const el of visibleInputs) {
+        const s = scoreInput(el, kind);
+        if (s > bestScore) { bestScore = s; best = el; }
+      }
+      // Require at least some hint unless there is an exact match for password.
+      if (kind === 'password') return bestScore >= 5 ? best : null;
+      return bestScore >= 3 ? best : null;
+    };
+
+    loginInput = pickBest('login');
+    passwordInput = pickBest('password');
+
+    // If we are not on the login form yet, try to open it by clicking "Log in"/"Войти"/"Sign in".
+    const clickLoginButton = async () => {
+      const buttons = Array.from(document.querySelectorAll('button, a, input[type="submit"], input[type="button"]')).filter(isVisible);
+      const btnKeywords = ['log in', 'sign in', 'login', 'войти', 'продолжить', 'continue', 'next'];
+      for (const b of buttons) {
+        const text = norm(b.innerText || b.value || b.getAttribute('aria-label') || b.getAttribute('title'));
+        if (btnKeywords.some(k => text.includes(k))) {
+          b.click();
+          await new Promise(r => setTimeout(r, 1200));
+          return true;
+        }
+      }
+      return false;
+    };
+
+    if ((!loginInput || !passwordInput) && loginValue && passwordValue) {
+      await clickLoginButton();
+    }
+
+    // Recompute after possible navigation/modal.
+    const visibleInputs2 = Array.from(document.querySelectorAll('input')).filter(isVisible);
+    const visibleInputsRef = visibleInputs2.length ? visibleInputs2 : visibleInputs;
+    const pickBest2 = (kind) => {
+      let best = null;
+      let bestScore = -1;
+      for (const el of visibleInputsRef) {
+        const s = scoreInput(el, kind);
+        if (s > bestScore) { bestScore = s; best = el; }
+      }
+      if (kind === 'password') return bestScore >= 5 ? best : null;
+      return bestScore >= 3 ? best : null;
+    };
+    loginInput = pickBest2('login');
+    passwordInput = pickBest2('password');
+
+    const fill = (el, val) => {
+      if (!el) return false;
+      el.focus && el.focus();
+      el.value = val;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    };
+
+    const didLoginFill = fill(loginInput, loginValue);
+    const didPasswordFill = fill(passwordInput, passwordValue);
+
+    const trySubmit = () => {
+      const submitKeywords = ['log in', 'sign in', 'login', 'войти', 'продолжить', 'continue', 'next'];
+      const submitters = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"]')).filter(isVisible);
+      for (const s of submitters) {
+        const text = norm(s.innerText || s.value || s.getAttribute('aria-label') || s.getAttribute('title'));
+        if (submitKeywords.some(k => text.includes(k))) {
+          s.click();
+          return true;
+        }
+      }
+      const form = (passwordInput && passwordInput.form) || (loginInput && loginInput.form);
+      if (form) {
+        try {
+          form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+          form.submit();
+          return true;
+        } catch {}
+      }
+      return false;
+    };
+
+    const submitClicked = trySubmit();
+    return {
+      loginFound: !!loginInput,
+      passwordFound: !!passwordInput,
+      didLoginFill,
+      didPasswordFill,
+      submitClicked,
+      locationHref: String(location.href || '')
+    };
+  })()`;
+
+  const evalRes = await cdp.send('Runtime.evaluate', {
+    expression,
+    returnByValue: true,
+    awaitPromise: true,
+  });
+  return evalRes.result && evalRes.result.value ? evalRes.result.value : {};
+}
+
 async function fetchJson(u, opts) {
   const r = await fetch(u, opts);
   if (!r.ok) throw new Error(`${u} -> HTTP ${r.status}`);
@@ -235,18 +442,22 @@ async function main() {
   } else {
     console.log(`[auth] Starting clean Chrome for Testing profile: ${profileDir}`);
     console.log(`[auth] Browser executable: ${chromePath}`);
-    const chrome = spawn(chromePath, [
+    const chromeArgs = [
       `--user-data-dir=${profileDir}`,
       `--remote-debugging-port=${port}`,
-      '--use-mock-keychain',
       '--password-store=basic',
       '--disable-sync',
       '--disable-extensions',
       '--disable-component-extensions-with-background-pages',
       '--disable-features=AutofillServerCommunication,OptimizationHints,MediaRouter,InterestFeedContentSuggestions,Translate',
       '--no-first-run', '--no-default-browser-check', '--disable-infobars',
-      url,
-    ], { stdio: 'ignore', detached: true });
+    ];
+    if (process.platform === 'darwin') chromeArgs.push('--use-mock-keychain');
+    if (process.platform === 'linux') {
+      chromeArgs.push('--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage');
+    }
+    chromeArgs.push(url);
+    const chrome = spawn(chromePath, chromeArgs, { stdio: 'ignore', detached: true });
     chrome.unref();
   }
 
@@ -257,16 +468,43 @@ async function main() {
   await cdp.send('Runtime.enable');
   await cdp.send('Network.enable');
 
-  console.log('\n[auth] Chrome открыт. Войди в DeepSeek в ЭТОМ отдельном окне.');
-  console.log('[auth] После логина отправь в DeepSeek короткое сообщение, например: ok');
-  await ask('[auth] Когда залогинился и отправил тестовое сообщение — нажми ENTER здесь: ');
+  console.log('\n[auth] Chrome открыт в браузере для входа в DeepSeek.');
+  const canAutoLogin = autoLoginEnabled && consoleLogin && consolePassword;
+  if (canAutoLogin) {
+    console.log('[auth] Автовход включен: пытаемся заполнить логин/пароль из консоли...');
+    try {
+      const autoRes = await autoLoginWithCredentials(cdp, consoleLogin, consolePassword);
+      console.log(`[auth] Auto-fill: login=${autoRes.loginFound ? 'OK' : 'MISS'}, password=${autoRes.passwordFound ? 'OK' : 'MISS'}, submit=${autoRes.submitClicked ? 'OK' : 'MISS'}`);
+      if (autoRes.locationHref) console.log(`[auth] page: ${autoRes.locationHref}`);
+    } catch (e) {
+      console.log('[auth] Auto-login attempt failed: ' + e.message);
+    }
+  } else {
+    console.log('[auth] Войди в DeepSeek в ЭТОМ отдельном окне.');
+    console.log('[auth] После логина отправь в DeepSeek короткое сообщение, например: ok');
+    await ask('[auth] Когда залогинился и отправил тестовое сообщение — нажми ENTER здесь: ');
+  }
 
   let auth = null;
-  for (let i = 0; i < 20; i++) {
+  const preAttempts = canAutoLogin ? 40 : 20;
+  for (let i = 0; i < preAttempts; i++) {
     auth = await readPageAuth(cdp);
     if (auth.token && auth.cookie) break;
     await sleep(500);
   }
+
+  if ((!auth || !auth.token || !auth.cookie) && canAutoLogin) {
+    console.log('[auth] token/cookie не появились после автозаполнения.');
+    console.log('[auth] Возможно нужна ручная проверка (captcha/2FA). Заверши вход в окне Chrome и нажми ENTER здесь:');
+    await ask('[auth] Продолжить получение auth (после завершения логина) — нажми ENTER: ');
+    for (let i = 0; i < 20; i++) {
+      auth = await readPageAuth(cdp);
+      if (auth.token && auth.cookie) break;
+      await sleep(500);
+    }
+  }
+
+  auth = auth || await readPageAuth(cdp);
   const { href, cookiesCount, ...persisted } = auth;
   fs.writeFileSync(outPath, JSON.stringify(persisted, null, 2));
   console.log(`[auth] Saved: ${outPath}`);
