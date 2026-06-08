@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/ForgetMeAI/FreeDeepseekAPI/blob/main/LICENSE"><img alt="License MIT" src="https://img.shields.io/badge/license-MIT-green.svg" /></a>
+  <a href="https://github.com/operatorpuar/FreeDeepseekAPI/blob/main/LICENSE"><img alt="License MIT" src="https://img.shields.io/badge/license-MIT-green.svg" /></a>
   <img alt="Node.js 18 plus" src="https://img.shields.io/badge/node-18%2B-339933.svg" />
   <img alt="No npm dependencies" src="https://img.shields.io/badge/dependencies-0-blue.svg" />
   <img alt="OpenAI compatible" src="https://img.shields.io/badge/OpenAI-compatible-111111.svg" />
@@ -25,8 +25,6 @@ FreeDeepseekAPI поднимает локальный API-сервер для **
 Проект работает через ваш обычный залогиненный аккаунт DeepSeek в отдельном Chrome-профиле. Локальный сервер принимает API-запросы, а дальше сам ходит в DeepSeek Web через сохранённую browser-сессию.
 
 > ⚠️ Это экспериментальный web-chat proxy. DeepSeek может менять внутренний Web API без предупреждения. Для production-кейсов надёжнее официальный платный API DeepSeek.
-
-ForgetMeAI: https://t.me/forgetmeai
 
 ---
 
@@ -80,7 +78,7 @@ ForgetMeAI: https://t.me/forgetmeai
 ## ⚡ Быстрый старт
 
 ```bash
-git clone https://github.com/ForgetMeAI/FreeDeepseekAPI.git
+git clone https://github.com/operatorpuar/FreeDeepseekAPI.git
 cd FreeDeepseekAPI
 npm run auth
 npm start
@@ -355,7 +353,3 @@ FreeDeepseekAPI — экспериментальный web-chat proxy для л�
 4. если проблема сохраняется — вероятно, DeepSeek изменил внутренний Web API.
 
 ---
-
-<p align="center">
-  <strong>ForgetMeAI</strong> · <a href="https://t.me/forgetmeai">Telegram</a>
-</p>

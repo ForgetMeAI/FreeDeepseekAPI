@@ -7,14 +7,11 @@ const { spawnSync } = require('child_process');
 const ROOT = path.resolve(__dirname, '..');
 const AUTH_PATH = process.env.DEEPSEEK_AUTH_PATH || path.join(ROOT, 'deepseek-auth.json');
 const PROFILE_DIR = process.env.DEEPSEEK_CHROME_PROFILE || path.join(ROOT, '.chrome-for-testing-profile-deepseek');
-const WATERMARK = 't.me/forgetmeai';
-
 function prompt(question) {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   return new Promise(resolve => rl.question(question, ans => { rl.close(); resolve(ans); }));
 }
 function divider() { console.log('======================================================'); }
-function watermark(prefix = 'ForgetMeAI') { return `${prefix}: ${WATERMARK}`; }
 function loadAuth() {
   try { return JSON.parse(fs.readFileSync(AUTH_PATH, 'utf8')); }
   catch { return null; }
@@ -42,7 +39,6 @@ function removeLocalAuth() {
 function printHelp() {
   divider();
   console.log('FreeDeepseekAPI — управление DeepSeek Web login');
-  console.log(watermark());
   divider();
   console.log('Опции:');
   console.log('  --login     Открыть Chrome и обновить auth');
@@ -55,7 +51,6 @@ function printHelp() {
 async function menu() {
   while (true) {
     divider();
-    console.log(watermark());
     status();
     divider();
     console.log('Меню:');

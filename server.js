@@ -30,10 +30,8 @@ const SERVER_PUBLIC_IP = (() => {
     return 'localhost';
 })();
 
-const FORGETMEAI_WATERMARK = 't.me/forgetmeai';
 const PORT = Number(process.env.PORT || 9655);
 const HOST = process.env.HOST || '0.0.0.0';
-function formatWatermark(prefix = 'ForgetMeAI') { return `${prefix}: ${FORGETMEAI_WATERMARK}`; }
 function printBanner() {
     console.log(`
 ███████ ██████  ███████ ███████ ██████  ███████ ███████ ███████ ██   ██
@@ -43,7 +41,6 @@ function printBanner() {
 ██      ██   ██ ███████ ███████ ██████  ███████ ███████ ███████ ██   ██
 
    FreeDeepseekAPI — API-прокси для DeepSeek Web Chat
-   ${formatWatermark()}
 `);
 }
 function prompt(question) {
@@ -545,7 +542,6 @@ function buildToolCallResponse(toolCall, model = 'deepseek-default', prompt = ''
             finish_reason: 'tool_calls'
         }],
         usage: buildUsage(prompt, '', reasoningContent),
-        watermark: FORGETMEAI_WATERMARK
     };
 }
 
@@ -563,7 +559,6 @@ function buildTextResponse(content, prompt, model = 'deepseek-default', reasonin
             finish_reason: 'stop'
         }],
         usage: buildUsage(prompt, content, reasoningContent),
-        watermark: FORGETMEAI_WATERMARK
     };
 }
 
@@ -701,7 +696,6 @@ function toAnthropicResponse(openaiResp) {
             input_tokens: openaiResp.usage?.prompt_tokens || 0,
             output_tokens: openaiResp.usage?.completion_tokens || 0,
         },
-        watermark: FORGETMEAI_WATERMARK,
     };
     if (!hasToolCalls && msg.reasoning_content) response.reasoning_content = msg.reasoning_content;
     return response;
@@ -779,7 +773,6 @@ function toResponsesResponse(openaiResp) {
             total_tokens: openaiResp.usage?.total_tokens || 0,
             output_tokens_details: { reasoning_tokens: openaiResp.usage?.completion_tokens_details?.reasoning_tokens || 0 },
         },
-        watermark: FORGETMEAI_WATERMARK,
     };
 }
 
@@ -959,7 +952,7 @@ const server = http.createServer(async (req, res) => {
     // Health check
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'ok', service: 'FreeDeepseekAPI', watermark: FORGETMEAI_WATERMARK, models: SUPPORTED_MODEL_IDS, unsupported_models: Object.keys(MODEL_CONFIGS).filter(id => !MODEL_CONFIGS[id].supported), agents: sessions.size, config_ready: hasAuthConfig() }));
+        res.end(JSON.stringify({ status: 'ok', service: 'FreeDeepseekAPI', models: SUPPORTED_MODEL_IDS, unsupported_models: Object.keys(MODEL_CONFIGS).filter(id => !MODEL_CONFIGS[id].supported), agents: sessions.size, config_ready: hasAuthConfig() }));
         return;
     }
 
@@ -973,7 +966,7 @@ const server = http.createServer(async (req, res) => {
     // Full mapping, including Web models observed but not currently usable through the direct API.
     if (req.method === 'GET' && (url.pathname === '/v1/model-capabilities' || url.pathname === '/api/model-capabilities')) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ object: 'model_capabilities', watermark: FORGETMEAI_WATERMARK, data: ALL_MODEL_CAPABILITIES }));
+        res.end(JSON.stringify({ object: 'model_capabilities', data: ALL_MODEL_CAPABILITIES }));
         return;
     }
 
@@ -1328,7 +1321,7 @@ async function runAuthScript() {
 }
 
 function printStatus() {
-    console.log(`\n${formatWatermark()}`);
+    console.log(`\nFreeDeepseekAPI`);
     console.log(`Auth: ${hasAuthConfig() ? '✅ OK' : '❌ не найден deepseek-auth.json'}`);
     console.log(`Auth file: ${DS_CONFIG_PATH}`);
     console.log(`Рабочие модели: ${SUPPORTED_MODEL_IDS.join(', ')}`);
@@ -1344,7 +1337,6 @@ async function showStartupMenu() {
     while (true) {
         printStatus();
         console.log('\n=== Меню ===');
-        console.log(`ForgetMeAI: ${FORGETMEAI_WATERMARK}`);
         console.log('1 - Авторизоваться / обновить DeepSeek login');
         console.log('2 - Показать модели и статусы');
         console.log('3 - Запустить прокси (по умолчанию)');
@@ -1374,7 +1366,6 @@ async function main() {
     if (!shouldStart) process.exit(0);
     server.listen(PORT, HOST, () => {
         console.log(`[DS-API] Server on http://${HOST}:${PORT} (multi-agent sessions enabled)`);
-        console.log(`[DS-API] ${formatWatermark()}`);
         console.log('[DS-API] POST /v1/chat/completions (OpenAI Chat Completions, stream=true|false)');
         console.log('[DS-API] POST /v1/messages — Anthropic Messages shim for Claude Code');
         console.log('[DS-API] POST /v1/responses — OpenAI Responses API shim');
