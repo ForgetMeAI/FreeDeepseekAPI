@@ -146,6 +146,16 @@ function isLocal(req) {
     return ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
 }
 
+// CSRF-защита для управления аккаунтами: блокируем межсайтовые запросы.
+// Браузер всегда шлёт Origin (и Referer) при cross-origin запросе — отклоняем,
+// если источник не совпадает с хостом сервера. Не-браузерные клиенты (curl/скрипты)
+// не шлют ни Origin, ни Referer и CSRF-вектором не являются, поэтому пропускаются.
+function isCrossOrigin(req) {
+    const src = req.headers.origin || req.headers.referer;
+    if (!src) return false;
+    try { return new URL(src).host !== req.headers.host; } catch { return true; }
+}
+
 function getOrCreateAgentSession(agentId) {
     if (!sessions.has(agentId)) {
         sessions.set(agentId, createSession());
@@ -1165,6 +1175,7 @@ const server = http.createServer(async (req, res) => {
     // ── Управление аккаунтами DeepSeek (только localhost) ──
     if (url.pathname === '/api/accounts' || url.pathname.startsWith('/api/accounts/')) {
         if (!isLocal(req)) { res.writeHead(403, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Доступно только с localhost' })); return; }
+        if (isCrossOrigin(req)) { res.writeHead(403, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Cross-origin запрос отклонён' })); return; }
 
         // GET /api/accounts — список со статусами
         if (req.method === 'GET' && url.pathname === '/api/accounts') {
