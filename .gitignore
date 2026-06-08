@@ -3,6 +3,9 @@ node_modules/
 *.log
 auth.json
 deepseek-auth.json
+accounts.json
+accounts/*.json
+!accounts/.gitkeep
 .chrome-profile-deepseek/
 .chrome-for-testing-profile-deepseek/
 .chrome-for-testing-profile-deepseek.stale-*/

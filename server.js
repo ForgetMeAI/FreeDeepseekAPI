@@ -56,11 +56,23 @@ const MAX_HISTORY_CHARS = 10000;
 const MAX_MESSAGE_DEPTH = 100;  // auto-reset after this many messages
 const SESSION_TTL_MS = 2 * 60 * 60 * 1000;  // 2 hours
 
-// === DeepSeek Web API Config — loaded from external config file ===
+// === Multi-Account Pool ===
+// Accounts are loaded from:
+//   1. accounts/ directory (each .json file = one account)
+//   2. accounts.json (array of account objects)
+//   3. deepseek-auth.json (legacy single account, fallback)
+const ACCOUNTS_DIR = process.env.DEEPSEEK_ACCOUNTS_DIR || path.join(__dirname, 'accounts');
+const ACCOUNTS_JSON_PATH = process.env.DEEPSEEK_ACCOUNTS_PATH || path.join(__dirname, 'accounts.json');
 const DS_CONFIG_PATH = process.env.DEEPSEEK_AUTH_PATH || path.join(__dirname, 'deepseek-auth.json');
-let DS_CONFIG = {};
-let BASE_HEADERS = {};
-function buildBaseHeaders() {
+const ACCOUNT_COOLDOWN_MS = 60 * 1000;  // 1 minute cooldown on error
+const ACCOUNT_RATE_LIMIT_WINDOW = 60 * 1000;  // rate limit window (ms)
+const ACCOUNT_MAX_REQUESTS_PER_WINDOW = Number(process.env.ACCOUNT_RATE_LIMIT || 30);
+
+// Account pool: each entry has { config, headers, name, stats }
+const accountPool = [];
+let roundRobinIndex = 0;
+
+function buildHeadersForAccount(config) {
     return {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
         "x-client-platform": "web",
@@ -68,33 +80,157 @@ function buildBaseHeaders() {
         "x-client-locale": "ru",
         "x-client-timezone-offset": "14400",
         "x-app-version": "2.0.0",
-        "Authorization": `Bearer ${DS_CONFIG.token || ''}`,
-        "x-hif-dliq": DS_CONFIG.hif_dliq || '',
-        "x-hif-leim": DS_CONFIG.hif_leim || '',
+        "Authorization": `Bearer ${config.token || ''}`,
+        "x-hif-dliq": config.hif_dliq || '',
+        "x-hif-leim": config.hif_leim || '',
         "Origin": "https://chat.deepseek.com",
         "Referer": "https://chat.deepseek.com/",
-        "Cookie": DS_CONFIG.cookie || '',
+        "Cookie": config.cookie || '',
         "Content-Type": "application/json",
     };
 }
-function loadDeepSeekConfig({ fatal = true } = {}) {
-    try {
-        const raw = fs.readFileSync(DS_CONFIG_PATH, 'utf8');
-        DS_CONFIG = JSON.parse(raw);
-        BASE_HEADERS = buildBaseHeaders();
-        console.log(`[DS-API] Loaded auth config from ${DS_CONFIG_PATH}`);
-        return true;
-    } catch (e) {
-        DS_CONFIG = {};
-        BASE_HEADERS = buildBaseHeaders();
-        if (fatal) {
-            console.error(`[DS-API] FATAL: Could not load auth config: ${e.message}`);
-            process.exit(1);
+
+function createAccountEntry(config, name) {
+    return {
+        config,
+        headers: buildHeadersForAccount(config),
+        name: name || config.name || `account-${accountPool.length + 1}`,
+        stats: {
+            totalRequests: 0,
+            successCount: 0,
+            errorCount: 0,
+            lastUsed: null,
+            lastError: null,
+            cooldownUntil: null,
+            requestTimestamps: [],  // for rate limiting
+        },
+    };
+}
+
+function loadAccountsFromDir() {
+    if (!fs.existsSync(ACCOUNTS_DIR)) return [];
+    const files = fs.readdirSync(ACCOUNTS_DIR).filter(f => f.endsWith('.json')).sort();
+    const accounts = [];
+    for (const file of files) {
+        try {
+            const raw = fs.readFileSync(path.join(ACCOUNTS_DIR, file), 'utf8');
+            const config = JSON.parse(raw);
+            if (config.token && config.cookie) {
+                accounts.push(createAccountEntry(config, path.basename(file, '.json')));
+            }
+        } catch (e) {
+            console.log(`[DS-API] Warning: failed to load account from ${file}: ${e.message}`);
         }
-        return false;
+    }
+    return accounts;
+}
+
+function loadAccountsFromJson() {
+    if (!fs.existsSync(ACCOUNTS_JSON_PATH)) return [];
+    try {
+        const raw = fs.readFileSync(ACCOUNTS_JSON_PATH, 'utf8');
+        const data = JSON.parse(raw);
+        const arr = Array.isArray(data) ? data : (data.accounts || []);
+        return arr
+            .filter(c => c && c.token && c.cookie)
+            .map((c, i) => createAccountEntry(c, c.name || `account-${i + 1}`));
+    } catch (e) {
+        console.log(`[DS-API] Warning: failed to load accounts.json: ${e.message}`);
+        return [];
     }
 }
-function hasAuthConfig() { return !!(DS_CONFIG.token && DS_CONFIG.cookie); }
+
+function loadLegacySingleConfig() {
+    try {
+        const raw = fs.readFileSync(DS_CONFIG_PATH, 'utf8');
+        const config = JSON.parse(raw);
+        if (config.token && config.cookie) {
+            return [createAccountEntry(config, 'default')];
+        }
+    } catch (e) {}
+    return [];
+}
+
+function loadAllAccounts() {
+    accountPool.length = 0;
+    // Priority: accounts/ dir > accounts.json > legacy single file
+    const fromDir = loadAccountsFromDir();
+    const fromJson = loadAccountsFromJson();
+    const fromLegacy = loadLegacySingleConfig();
+
+    // Deduplicate by token
+    const seen = new Set();
+    for (const acc of [...fromDir, ...fromJson, ...fromLegacy]) {
+        const key = acc.config.token;
+        if (!seen.has(key)) {
+            seen.add(key);
+            accountPool.push(acc);
+        }
+    }
+    if (accountPool.length > 0) {
+        console.log(`[DS-API] Loaded ${accountPool.length} account(s): ${accountPool.map(a => a.name).join(', ')}`);
+    }
+    return accountPool.length > 0;
+}
+
+function hasAuthConfig() { return accountPool.length > 0; }
+
+function isAccountAvailable(account) {
+    const now = Date.now();
+    // Check cooldown
+    if (account.stats.cooldownUntil && now < account.stats.cooldownUntil) return false;
+    // Check rate limit
+    account.stats.requestTimestamps = account.stats.requestTimestamps.filter(t => now - t < ACCOUNT_RATE_LIMIT_WINDOW);
+    if (account.stats.requestTimestamps.length >= ACCOUNT_MAX_REQUESTS_PER_WINDOW) return false;
+    return true;
+}
+
+function selectAccount() {
+    const available = accountPool.filter(isAccountAvailable);
+    if (available.length === 0) {
+        // All accounts on cooldown/rate-limited — pick the one with earliest cooldown expiry
+        const sorted = [...accountPool].sort((a, b) => (a.stats.cooldownUntil || 0) - (b.stats.cooldownUntil || 0));
+        return sorted[0] || null;
+    }
+    // Round-robin among available accounts
+    roundRobinIndex = roundRobinIndex % available.length;
+    const selected = available[roundRobinIndex];
+    roundRobinIndex = (roundRobinIndex + 1) % available.length;
+    return selected;
+}
+
+function markAccountUsed(account) {
+    account.stats.totalRequests++;
+    account.stats.lastUsed = Date.now();
+    account.stats.requestTimestamps.push(Date.now());
+}
+
+function markAccountSuccess(account) {
+    account.stats.successCount++;
+    account.stats.cooldownUntil = null;
+}
+
+function markAccountError(account, error) {
+    account.stats.errorCount++;
+    account.stats.lastError = { message: error, time: Date.now() };
+    account.stats.cooldownUntil = Date.now() + ACCOUNT_COOLDOWN_MS;
+    console.log(`[DS-API] Account "${account.name}" error: ${error}. Cooldown ${ACCOUNT_COOLDOWN_MS / 1000}s`);
+}
+
+// Legacy compatibility aliases
+let DS_CONFIG = {};
+let BASE_HEADERS = {};
+function loadDeepSeekConfig({ fatal = true } = {}) {
+    const loaded = loadAllAccounts();
+    if (loaded) {
+        DS_CONFIG = accountPool[0].config;
+        BASE_HEADERS = accountPool[0].headers;
+    } else if (fatal) {
+        console.error('[DS-API] FATAL: No valid account configs found');
+        process.exit(1);
+    }
+    return loaded;
+}
 loadDeepSeekConfig({ fatal: false });
 
 function createSession() {
@@ -114,8 +250,9 @@ function getOrCreateAgentSession(agentId) {
     return sessions.get(agentId);
 }
 
-async function solvePOW(challenge) {
-    const resp = await fetch(DS_CONFIG.wasmUrl);
+async function solvePOW(challenge, account) {
+    const wasmUrl = account.config.wasmUrl || 'https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm';
+    const resp = await fetch(wasmUrl);
     const wasmBytes = await resp.arrayBuffer();
     const mod = await WebAssembly.instantiate(wasmBytes, { wbg: {} });
     const e = mod.instance.exports;
@@ -248,6 +385,15 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
     const session = getOrCreateAgentSession(agentId);
     const agentTag = `[${agentId}]`;
 
+    // Select an account from the pool
+    const account = selectAccount();
+    if (!account) {
+        throw new Error('No accounts available (all on cooldown or rate-limited)');
+    }
+    const accountHeaders = account.headers;
+    markAccountUsed(account);
+    console.log(`${agentTag} Using account: ${account.name}`);
+
     // Auto-reset on deep message chain
     if (session.id && session.messageCount >= MAX_MESSAGE_DEPTH) {
         console.log(`${agentTag} Session ${session.id} hit ${session.messageCount} messages. Auto-resetting.`);
@@ -268,16 +414,16 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
     }
 
     const cr = await fetch('https://chat.deepseek.com/api/v0/chat/create_pow_challenge', {
-        method: 'POST', headers: BASE_HEADERS,
+        method: 'POST', headers: accountHeaders,
         body: JSON.stringify({ target_path: '/api/v0/chat/completion' })
     });
     const chalJson = JSON.parse(await cr.text());
     const challenge = chalJson.data.biz_data.challenge;
-    const answer = await solvePOW(challenge);
+    const answer = await solvePOW(challenge, account);
 
     if (!session.id) {
         const sr = await fetch('https://chat.deepseek.com/api/v0/chat_session/create', {
-            method: 'POST', headers: BASE_HEADERS, body: '{}'
+            method: 'POST', headers: accountHeaders, body: '{}'
         });
         const sessionData = await sr.json();
         session.id = sessionData.data.biz_data.chat_session?.id || sessionData.data.biz_data.id;
@@ -296,7 +442,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
     })).toString('base64');
     const resp = await fetch('https://chat.deepseek.com/api/v0/chat/completion', {
         method: 'POST',
-        headers: { ...BASE_HEADERS, 'X-DS-PoW-Response': powB64 },
+        headers: { ...accountHeaders, 'X-DS-PoW-Response': powB64 },
         body: JSON.stringify({
             chat_session_id: session.id,
             parent_message_id: session.parentMessageId,
@@ -319,7 +465,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
             session.messageCount = 0;
 
             const sr2 = await fetch('https://chat.deepseek.com/api/v0/chat_session/create', {
-                method: 'POST', headers: BASE_HEADERS, body: '{}'
+                method: 'POST', headers: accountHeaders, body: '{}'
             });
             const sessionData2 = await sr2.json();
             session.id = sessionData2.data.biz_data.chat_session?.id || sessionData2.data.biz_data.id;
@@ -334,7 +480,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
             })).toString('base64');
             const resp2 = await fetch('https://chat.deepseek.com/api/v0/chat/completion', {
                 method: 'POST',
-                headers: { ...BASE_HEADERS, 'X-DS-PoW-Response': newPowB64 },
+                headers: { ...accountHeaders, 'X-DS-PoW-Response': newPowB64 },
                 body: JSON.stringify({
                     chat_session_id: session.id,
                     parent_message_id: null,
@@ -344,11 +490,19 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
                     action: null, preempt: false,
                 })
             });
-            return { resp: resp2, agentId };
+            if (resp2.status !== 200) {
+                markAccountError(account, `HTTP ${resp2.status} on retry`);
+            } else {
+                markAccountSuccess(account);
+            }
+            return { resp: resp2, agentId, account };
         }
+        markAccountError(account, `HTTP ${resp.status}`);
+    } else {
+        markAccountSuccess(account);
     }
 
-    return { resp, agentId };
+    return { resp, agentId, account };
 }
 
 // === Tool Calling Support ===
@@ -952,7 +1106,7 @@ const server = http.createServer(async (req, res) => {
     // Health check
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'ok', service: 'FreeDeepseekAPI', models: SUPPORTED_MODEL_IDS, unsupported_models: Object.keys(MODEL_CONFIGS).filter(id => !MODEL_CONFIGS[id].supported), agents: sessions.size, config_ready: hasAuthConfig() }));
+        res.end(JSON.stringify({ status: 'ok', service: 'FreeDeepseekAPI', models: SUPPORTED_MODEL_IDS, unsupported_models: Object.keys(MODEL_CONFIGS).filter(id => !MODEL_CONFIGS[id].supported), agents: sessions.size, accounts: accountPool.length, accounts_available: accountPool.filter(isAccountAvailable).length, config_ready: hasAuthConfig() }));
         return;
     }
 
@@ -984,6 +1138,35 @@ const server = http.createServer(async (req, res) => {
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ agents: agentList, total: agentList.length }));
+        return;
+    }
+
+    // Account pool status
+    if (req.method === 'GET' && url.pathname === '/v1/accounts') {
+        const now = Date.now();
+        const accountList = accountPool.map(acc => ({
+            name: acc.name,
+            available: isAccountAvailable(acc),
+            total_requests: acc.stats.totalRequests,
+            success_count: acc.stats.successCount,
+            error_count: acc.stats.errorCount,
+            last_used: acc.stats.lastUsed ? new Date(acc.stats.lastUsed).toISOString() : null,
+            last_error: acc.stats.lastError ? { message: acc.stats.lastError.message, time: new Date(acc.stats.lastError.time).toISOString() } : null,
+            cooldown_remaining_sec: acc.stats.cooldownUntil && acc.stats.cooldownUntil > now ? Math.round((acc.stats.cooldownUntil - now) / 1000) : 0,
+            requests_in_window: acc.stats.requestTimestamps.filter(t => now - t < ACCOUNT_RATE_LIMIT_WINDOW).length,
+            rate_limit: ACCOUNT_MAX_REQUESTS_PER_WINDOW,
+        }));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ accounts: accountList, total: accountList.length, available: accountList.filter(a => a.available).length }));
+        return;
+    }
+
+    // Reload accounts (hot-reload without restart)
+    if (req.method === 'POST' && url.pathname === '/v1/accounts/reload') {
+        const prevCount = accountPool.length;
+        loadAllAccounts();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'reloaded', previous_count: prevCount, current_count: accountPool.length, accounts: accountPool.map(a => a.name) }));
         return;
     }
 
@@ -1322,16 +1505,20 @@ async function runAuthScript() {
 
 function printStatus() {
     console.log(`\nFreeDeepseekAPI`);
-    console.log(`Auth: ${hasAuthConfig() ? '✅ OK' : '❌ не найден deepseek-auth.json'}`);
-    console.log(`Auth file: ${DS_CONFIG_PATH}`);
+    console.log(`Аккаунты: ${accountPool.length > 0 ? '✅ ' + accountPool.length + ' шт. (' + accountPool.map(a => a.name).join(', ') + ')' : '❌ нет аккаунтов'}`);
+    console.log(`Источники: accounts/ dir, accounts.json, deepseek-auth.json`);
     console.log(`Рабочие модели: ${SUPPORTED_MODEL_IDS.join(', ')}`);
     console.log('Нерабочие/скрытые aliases: ' + Object.keys(MODEL_CONFIGS).filter(id => !MODEL_CONFIGS[id].supported).join(', '));
     console.log('Capabilities: GET /v1/model-capabilities');
+    console.log('Account status: GET /v1/accounts');
 }
 
 async function showStartupMenu() {
     if (isTruthy(process.env.SKIP_ACCOUNT_MENU) || isTruthy(process.env.NON_INTERACTIVE)) {
-        if (!hasAuthConfig()) loadDeepSeekConfig({ fatal: true });
+        if (!hasAuthConfig()) {
+            console.error('[DS-API] FATAL: No valid account configs found');
+            process.exit(1);
+        }
         return true;
     }
     while (true) {
@@ -1350,7 +1537,7 @@ async function showStartupMenu() {
             await prompt('\nНажмите Enter, чтобы вернуться в меню...');
         } else if (choice === '3') {
             if (!hasAuthConfig()) {
-                console.log('Нужен deepseek-auth.json. Запустите пункт 1.');
+                console.log('Нет аккаунтов. Положите auth-файлы в accounts/ или запустите пункт 1.');
                 continue;
             }
             return true;
@@ -1365,12 +1552,15 @@ async function main() {
     const shouldStart = await showStartupMenu();
     if (!shouldStart) process.exit(0);
     server.listen(PORT, HOST, () => {
-        console.log(`[DS-API] Server on http://${HOST}:${PORT} (multi-agent sessions enabled)`);
+        console.log(`[DS-API] Server on http://${HOST}:${PORT} (multi-account, multi-agent sessions)`);
+        console.log(`[DS-API] Accounts: ${accountPool.length} loaded (${accountPool.map(a => a.name).join(', ')})`);
         console.log('[DS-API] POST /v1/chat/completions (OpenAI Chat Completions, stream=true|false)');
         console.log('[DS-API] POST /v1/messages — Anthropic Messages shim for Claude Code');
         console.log('[DS-API] POST /v1/responses — OpenAI Responses API shim');
         console.log('[DS-API] GET  /v1/models — supported OpenAI-compatible models');
         console.log('[DS-API] GET  /v1/model-capabilities — real model mapping and capabilities');
+        console.log('[DS-API] GET  /v1/accounts — account pool status and health');
+        console.log('[DS-API] POST /v1/accounts/reload — hot-reload accounts without restart');
         console.log('[DS-API] GET  /v1/sessions — list active agent sessions');
         console.log('[DS-API] POST /reset-session?agent=<id> — reset agent session');
         console.log('[DS-API] POST /reset-session?agent=all — reset ALL sessions');

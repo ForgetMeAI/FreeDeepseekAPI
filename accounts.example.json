@@ -1,0 +1,18 @@
+[
+  {
+    "name": "account-1",
+    "token": "YOUR_DEEPSEEK_TOKEN_1",
+    "hif_dliq": "",
+    "hif_leim": "",
+    "cookie": "ds_session_id=YOUR_SESSION_ID_1; smidV2=YOUR_SMIDV2_1",
+    "wasmUrl": "https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm"
+  },
+  {
+    "name": "account-2",
+    "token": "YOUR_DEEPSEEK_TOKEN_2",
+    "hif_dliq": "",
+    "hif_leim": "",
+    "cookie": "ds_session_id=YOUR_SESSION_ID_2; smidV2=YOUR_SMIDV2_2",
+    "wasmUrl": "https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm"
+  }
+]

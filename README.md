@@ -279,12 +279,103 @@ Search для Expert по remote config недоступен, поэтому `de
 | `GET` | `/` или `/health` | статус proxy |
 | `GET` | `/v1/models` | список рабочих OpenAI-compatible aliases |
 | `GET` | `/v1/model-capabilities` | полный маппинг aliases, real model, capabilities |
+| `GET` | `/v1/accounts` | статус пула аккаунтов (health, rate limits) |
+| `POST` | `/v1/accounts/reload` | горячая перезагрузка аккаунтов без рестарта |
 | `POST` | `/v1/chat/completions` | OpenAI-compatible Chat Completions |
 | `POST` | `/v1/messages` | Anthropic Messages API shim |
 | `POST` | `/v1/responses` | OpenAI Responses API shim |
 | `GET` | `/v1/sessions` | активные локальные agent sessions |
 | `POST` | `/reset-session?agent=<id>` | сбросить одну session |
 | `POST` | `/reset-session?agent=all` | сбросить все sessions |
+
+---
+
+## 👥 Мульти-аккаунт
+
+Прокси поддерживает работу с несколькими DeepSeek-аккаунтами одновременно с round-robin балансировкой.
+
+### Добавление аккаунтов
+
+**Способ 1: через меню (рекомендуется)**
+
+```bash
+npm run auth
+# Выбрать пункт 2 — «Добавить новый аккаунт»
+# Ввести имя аккаунта (например: work, personal, bot1)
+# Залогиниться в открывшемся Chrome
+```
+
+**Способ 2: через CLI**
+
+```bash
+# Добавить именованный аккаунт
+npm run auth -- --add work
+npm run auth -- --add personal
+npm run auth -- --add bot1
+```
+
+**Способ 3: вручную**
+
+Положите JSON-файлы в директорию `accounts/`:
+
+```bash
+accounts/
+├── work.json
+├── personal.json
+└── bot1.json
+```
+
+Каждый файл — стандартный формат auth:
+
+```json
+{
+  "name": "work",
+  "token": "YOUR_TOKEN",
+  "hif_dliq": "",
+  "hif_leim": "",
+  "cookie": "ds_session_id=...; smidV2=...",
+  "wasmUrl": "https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm"
+}
+```
+
+**Способ 4: accounts.json**
+
+Массив аккаунтов в одном файле (см. `accounts.example.json`).
+
+### Приоритет загрузки
+
+1. `accounts/*.json` — отдельные файлы (наивысший приоритет)
+2. `accounts.json` — массив аккаунтов
+3. `deepseek-auth.json` — legacy одиночный аккаунт (fallback)
+
+Дубликаты (по token) автоматически исключаются.
+
+### Балансировка
+
+- **Round-robin** между доступными аккаунтами
+- **Rate limit**: до 30 запросов/мин на аккаунт (настраивается через `ACCOUNT_RATE_LIMIT`)
+- **Cooldown**: 60 сек при ошибке (401/403/500) — аккаунт временно исключается
+- **Автовосстановление**: после cooldown аккаунт возвращается в пул
+
+### Мониторинг
+
+```bash
+# Статус всех аккаунтов
+curl http://localhost:9655/v1/accounts
+
+# Горячая перезагрузка (добавили новый аккаунт без рестарта)
+curl -X POST http://localhost:9655/v1/accounts/reload
+```
+
+### Переменные окружения
+
+| Переменная | По умолчанию | Описание |
+| --- | --- | --- |
+| `DEEPSEEK_ACCOUNTS_DIR` | `./accounts` | Директория с JSON-файлами аккаунтов |
+| `DEEPSEEK_ACCOUNTS_PATH` | `./accounts.json` | Путь к массиву аккаунтов |
+| `DEEPSEEK_AUTH_PATH` | `./deepseek-auth.json` | Legacy одиночный аккаунт |
+| `ACCOUNT_RATE_LIMIT` | `30` | Макс. запросов на аккаунт в минуту |
+| `DEEPSEEK_ACCOUNT_NAME` | — | Имя аккаунта при авторизации (для `npm run deepseek:auth`) |
 
 ---
 

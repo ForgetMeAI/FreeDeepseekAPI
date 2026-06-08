@@ -26,7 +26,11 @@ const qwenRepoRoot = path.resolve(repoRoot, '..', 'FreeQwenApi');
 const profileDir = process.env.DEEPSEEK_CHROME_PROFILE || path.join(repoRoot, '.chrome-for-testing-profile-deepseek');
 // Use a dedicated default port so an older normal-Chrome auth window on 9333 is not reused.
 const port = Number(process.env.DEEPSEEK_CHROME_PORT || 9334);
-const outPath = process.env.DEEPSEEK_AUTH_PATH || path.join(repoRoot, 'deepseek-auth.json');
+// If DEEPSEEK_ACCOUNT_NAME is set, save to accounts/<name>.json for multi-account mode
+const accountName = process.env.DEEPSEEK_ACCOUNT_NAME || '';
+const outPath = process.env.DEEPSEEK_AUTH_PATH || (accountName
+    ? path.join(repoRoot, 'accounts', `${accountName}.json`)
+    : path.join(repoRoot, 'deepseek-auth.json'));
 const url = 'https://chat.deepseek.com/';
 const reuseChrome = /^(1|true|yes|on)$/i.test(process.env.DEEPSEEK_REUSE_CHROME || '');
 const keepProfile = /^(1|true|yes|on)$/i.test(process.env.DEEPSEEK_KEEP_CHROME_PROFILE || '');
@@ -268,6 +272,8 @@ async function main() {
     await sleep(500);
   }
   const { href, cookiesCount, ...persisted } = auth;
+  if (accountName) persisted.name = accountName;
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
   fs.writeFileSync(outPath, JSON.stringify(persisted, null, 2));
   console.log(`[auth] Saved: ${outPath}`);
   console.log(`[auth] page: ${href || 'unknown'}`);
