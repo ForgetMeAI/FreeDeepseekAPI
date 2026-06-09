@@ -1,0 +1,1 @@
+NON_INTERACTIVE=1 npm start

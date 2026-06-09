@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 const BASE = process.env.BASE_URL || 'http://127.0.0.1:9665';
 const MODEL = process.env.MODEL || 'deepseek-chat';
+const REASONING_MODEL = process.env.REASONING_MODEL || '';
 
 async function post(path, body, timeoutMs = 120000) {
   const ctrl = new AbortController();
@@ -21,6 +22,7 @@ async function post(path, body, timeoutMs = 120000) {
 
 function assert(cond, msg) { if (!cond) throw new Error(msg); }
 function summarizeText(s) { return String(s || '').replace(/\s+/g, ' ').slice(0, 160); }
+function hasAnthropicThinkingBlock(json) { return (json?.content || []).some(b => b?.type === 'thinking'); }
 
 const tools = [{
   type: 'function',
@@ -60,6 +62,7 @@ test('2 /v1/messages plain', async () => {
   assert(r.ok, `HTTP ${r.status}: ${r.text}`);
   const text = (r.json?.content || []).map(b => b.text || '').join('');
   assert(/OK_MESSAGES/i.test(text), `unexpected content: ${text}`);
+  assert(!/\[reasoning\]/.test(r.text), `legacy reasoning wrapper leaked into /v1/messages: ${r.text}`);
   return summarizeText(text);
 });
 
@@ -106,6 +109,37 @@ test('7 Anthropic streaming tool calling stays tool-only', async () => {
   assert(!/reasoning_content|\[reasoning\]|reasoning_summary/.test(r.text), `tool stream leaked reasoning payload: ${summarizeText(r.text)}`);
   return 'tool_use block without reasoning/text deltas';
 });
+
+if (REASONING_MODEL) {
+  test('8 Anthropic reasoning uses thinking blocks', async () => {
+    const userId = `smoke-thinking-${Date.now()}`;
+    const r = await post('/v1/messages', {
+      model: REASONING_MODEL,
+      max_tokens: 256,
+      metadata: { user_id: userId },
+      messages: [{ role: 'user', content: 'Think briefly, then answer exactly: OK_THINKING' }],
+      stream: false
+    }, 180000);
+    assert(r.ok, `HTTP ${r.status}: ${r.text}`);
+    const text = (r.json?.content || []).filter(b => b?.type === 'text').map(b => b.text || '').join('');
+    assert(/OK_THINKING/i.test(text) || hasAnthropicThinkingBlock(r.json), `no text/thinking blocks returned: ${r.text}`);
+    assert(!/\[reasoning\]/.test(r.text), `legacy reasoning wrapper leaked into non-stream anthropic response: ${r.text}`);
+
+    const s = await post('/v1/messages', {
+      model: REASONING_MODEL,
+      max_tokens: 256,
+      metadata: { user_id: `${userId}-stream` },
+      messages: [{ role: 'user', content: 'Think briefly, then answer exactly: OK_THINKING_STREAM' }],
+      stream: true
+    }, 180000);
+    assert(s.ok, `HTTP ${s.status}: ${s.text}`);
+    assert(!/\[reasoning\]/.test(s.text), `legacy reasoning wrapper leaked into stream: ${summarizeText(s.text)}`);
+    if (/"type":"thinking"/.test(s.text) || /"type":"thinking_delta"/.test(s.text)) {
+      return 'thinking/thinking_delta blocks detected';
+    }
+    return 'reasoning model returned no visible thinking blocks this run';
+  });
+}
 
 let failed = 0;
 for (const t of tests) {

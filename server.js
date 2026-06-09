@@ -11,6 +11,7 @@
  */
 
 const http = require('http');
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -58,6 +59,8 @@ const MAX_HISTORY_LENGTH = 15;
 const MAX_HISTORY_CHARS = 10000;
 const MAX_MESSAGE_DEPTH = 100;  // auto-reset after this many messages
 const SESSION_TTL_MS = 2 * 60 * 60 * 1000;  // 2 hours
+const EMPTY_RESPONSE_RETRY_DELAY_MS = Number(process.env.EMPTY_RESPONSE_RETRY_DELAY_MS || 20000);
+const MAX_REASONING_ONLY_CONTINUATIONS = Number(process.env.MAX_REASONING_ONLY_CONTINUATIONS || 2);
 
 // === DeepSeek Web API Config — loaded from external config file ===
 const DS_CONFIG_PATH = process.env.DEEPSEEK_AUTH_PATH || path.join(__dirname, 'deepseek-auth.json');
@@ -485,6 +488,7 @@ function formatToolDefinitions(tools) {
     text += '4. After the tool executes, the result will be sent to you as a new user/tool message\n';
     text += '5. Never add explanation before or after the tool request when requesting a tool\n';
     text += '6. Keep arguments compact. Do not include large file contents unless the tool schema requires it.\n\n';
+    text += '7. Never write action narration like "Read file", "Open file", "Search for", "I will inspect", or a checklist of files. Those are invalid. Output the tool request itself.\n\n';
     text += 'Available functions:\n';
     for (const tool of tools) {
         if (tool.type === 'function' && tool.function) {
@@ -494,10 +498,14 @@ function formatToolDefinitions(tools) {
             if (fn.parameters) {
                 text += `Parameters: ${JSON.stringify(fn.parameters)}\n`;
             }
+            const props = fn.parameters && fn.parameters.properties ? fn.parameters.properties : {};
+            if (props.file_path) text += `Example: {"tool_call":{"name":"${fn.name}","arguments":{"file_path":"README.md"}}}\n`;
+            else if (props.path) text += `Example: {"tool_call":{"name":"${fn.name}","arguments":{"path":"README.md"}}}\n`;
+            else if (props.pattern) text += `Example: {"tool_call":{"name":"${fn.name}","arguments":{"pattern":"TODO"}}}\n`;
         }
     }
     text += '\n--- END TOOL REQUEST SYSTEM ---\n';
-    text += '\nREMEMBER: Request tools only with strict JSON or TOOL_CALL legacy format. Never simulate results.';
+    text += '\nREMEMBER: Request tools only with strict JSON or TOOL_CALL legacy format. Never simulate results. Natural-language actions like "Read foo" are invalid.';
     return text;
 }
 
@@ -551,7 +559,88 @@ function parseJsonToolCandidate(raw, label = 'json') {
     return null;
 }
 
-function parseToolCall(text) {
+function inferNarratedToolCall(text, tools = []) {
+    if (!text || typeof text !== 'string' || !Array.isArray(tools) || tools.length === 0) return null;
+    const toolMap = new Map();
+    for (const tool of tools) {
+        const fn = tool && tool.type === 'function' ? tool.function : null;
+        if (fn && fn.name) toolMap.set(String(fn.name).toLowerCase(), fn);
+    }
+    if (toolMap.size === 0) return null;
+
+    const lines = text.split('\n').map(line => line.trim()).filter(Boolean);
+    for (const line of lines) {
+        const cleaned = line.replace(/^[-*]\s*/, '').trim();
+        const direct = cleaned.match(/^([A-Za-z][\w-]*)\s+(.+)$/);
+        if (direct) {
+            const fn = toolMap.get(direct[1].toLowerCase());
+            const tc = buildNarratedToolCall(fn, direct[2]);
+            if (tc) {
+                console.log(`[parseToolCall] SUCCESS narrated-direct: ${tc.name} (${summarizeForLog(direct[2])})`);
+                return tc;
+            }
+        }
+        const narrated = cleaned.match(/^(?:I(?:'ll| will)\s+)?(?:inspect|read|open|view|search|grep|find|list)\s+(.+)$/i);
+        if (!narrated) continue;
+        for (const fn of toolMap.values()) {
+            const tc = buildNarratedToolCall(fn, narrated[1], cleaned);
+            if (tc) {
+                console.log(`[parseToolCall] SUCCESS narrated-heuristic: ${tc.name} (${summarizeForLog(narrated[1])})`);
+                return tc;
+            }
+        }
+    }
+    return null;
+}
+
+function buildNarratedToolCall(fn, rawTarget, fullLine = '') {
+    if (!fn || !rawTarget) return null;
+    const params = fn.parameters || {};
+    const props = params.properties || {};
+    const required = Array.isArray(params.required) ? params.required : [];
+    const stringKeys = Object.entries(props)
+        .filter(([, schema]) => schema && schema.type === 'string')
+        .map(([key]) => key);
+    const preferredKey = [
+        'file_path', 'path', 'filepath', 'filename', 'pattern', 'query', 'input'
+    ].find(key => stringKeys.includes(key)) || stringKeys[0];
+    if (!preferredKey) return null;
+
+    let value = String(rawTarget).trim();
+    value = value.replace(/^the\s+/i, '').replace(/^file\s+/i, '').trim();
+    value = value.replace(/[.:,;]+$/g, '').trim();
+    value = value.replace(/^["']|["']$/g, '');
+    if (!value) return null;
+
+    const lowerName = String(fn.name).toLowerCase();
+    if ((lowerName.includes('read') || lowerName === 'cat') && !looksLikePath(value)) return null;
+    if ((lowerName.includes('search') || lowerName.includes('grep') || lowerName.includes('find')) && !value) return null;
+    if (required.length > 1) {
+        const remainingRequired = required.filter(key => key !== preferredKey);
+        if (remainingRequired.length > 0) return null;
+    }
+
+    const args = { [preferredKey]: value };
+    return { name: fn.name, arguments: JSON.stringify(args) };
+}
+
+function looksLikePath(value) {
+    return /[./\\]/.test(value) || /\.[A-Za-z0-9]{1,10}$/.test(value) || /^[A-Za-z0-9_-]+$/.test(value);
+}
+
+function summarizeForLog(value) {
+    return String(value || '').replace(/\s+/g, ' ').slice(0, 80);
+}
+
+function isBlank(value) {
+    return !value || !String(value).trim();
+}
+
+function shouldContinueReasoningOnly(content, reasoningContent) {
+    return isBlank(content) && !isBlank(reasoningContent);
+}
+
+function parseToolCall(text, tools = []) {
     if (!text || typeof text !== 'string') return null;
 
     // XML-ish wrappers used by some agent prompts.
@@ -603,6 +692,9 @@ function parseToolCall(text) {
         const tc = parseJsonToolCandidate(rawJson, 'inline');
         if (tc) return tc;
     }
+
+    const narrated = inferNarratedToolCall(text, tools);
+    if (narrated) return narrated;
 
     console.log(`[parseToolCall] No tool call match in ${text.length} chars`);
     return null;
@@ -688,6 +780,7 @@ function normalizeMessageContent(content) {
         return content.map(part => {
             if (typeof part === 'string') return part;
             if (!part || typeof part !== 'object') return '';
+            if (part.type === 'thinking' || part.type === 'redacted_thinking') return '';
             if (part.type === 'text' || part.type === 'input_text' || part.type === 'output_text') return part.text || '';
             if (part.type === 'tool_result') return `[Tool Result ${part.tool_use_id || ''}]\n${normalizeMessageContent(part.content)}`;
             if (part.type === 'image_url') return `[Image: ${part.image_url?.url || ''}]`;
@@ -744,7 +837,7 @@ function normalizeApiParams(params, apiMode) {
         for (const msg of params.messages || []) {
             if (msg.role === 'assistant' && Array.isArray(msg.content)) {
                 const toolUses = msg.content.filter(part => part && part.type === 'tool_use');
-                const text = normalizeMessageContent(msg.content.filter(part => !part || part.type !== 'tool_use'));
+                const text = normalizeMessageContent(msg.content.filter(part => !part || (part.type !== 'tool_use' && part.type !== 'thinking' && part.type !== 'redacted_thinking')));
                 if (text) messages.push({ role: 'assistant', content: text });
                 for (const tu of toolUses) {
                     messages.push({ role: 'assistant', content: null, tool_calls: [{ id: tu.id, type: 'function', function: { name: tu.name, arguments: JSON.stringify(tu.input || {}) } }] });
@@ -801,7 +894,16 @@ function toAnthropicResponse(openaiResp) {
             content.push({ type: 'tool_use', id: tc.id, name: tc.function.name, input: safeJsonParseObject(tc.function.arguments) });
         }
     } else {
-        content.push({ type: 'text', text: msg.content || '' });
+        if (msg.reasoning_content) {
+            content.push({
+                type: 'thinking',
+                thinking: msg.reasoning_content,
+                signature: makeAnthropicThinkingSignature(msg.reasoning_content),
+            });
+        }
+        if (msg.content || !content.length) {
+            content.push({ type: 'text', text: msg.content || '' });
+        }
     }
     const response = {
         id: 'msg_' + openaiResp.id,
@@ -817,8 +919,11 @@ function toAnthropicResponse(openaiResp) {
         },
         watermark: FORGETMEAI_WATERMARK,
     };
-    if (!hasToolCalls && msg.reasoning_content) response.reasoning_content = msg.reasoning_content;
     return response;
+}
+
+function makeAnthropicThinkingSignature(reasoning) {
+    return 'sig_' + crypto.createHash('sha256').update(String(reasoning || '')).digest('base64url');
 }
 
 function writeSse(res, event, data) {
@@ -846,18 +951,35 @@ function sendAnthropicStream(res, openaiResp) {
         });
         writeSse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: 'tool_use', stop_sequence: null }, usage: message.usage });
     } else {
+        let index = 0;
         if (msg.reasoning_content) {
-            writeSse(res, 'content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
-            writeSse(res, 'content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: `[reasoning]\n${msg.reasoning_content}\n[/reasoning]\n` } });
-            writeSse(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
+            writeSse(res, 'content_block_start', {
+                type: 'content_block_start',
+                index,
+                content_block: {
+                    type: 'thinking',
+                    thinking: '',
+                    signature: makeAnthropicThinkingSignature(msg.reasoning_content),
+                }
+            });
+            for (let i = 0; i < msg.reasoning_content.length; i += 80) {
+                writeSse(res, 'content_block_delta', {
+                    type: 'content_block_delta',
+                    index,
+                    delta: { type: 'thinking_delta', thinking: msg.reasoning_content.substring(i, i + 80) }
+                });
+            }
+            writeSse(res, 'content_block_stop', { type: 'content_block_stop', index });
+            index++;
         }
-        const offset = msg.reasoning_content ? 1 : 0;
-        writeSse(res, 'content_block_start', { type: 'content_block_start', index: offset, content_block: { type: 'text', text: '' } });
         const text = msg.content || '';
-        for (let i = 0; i < text.length; i += 80) {
-            writeSse(res, 'content_block_delta', { type: 'content_block_delta', index: offset, delta: { type: 'text_delta', text: text.substring(i, i + 80) } });
+        if (text || !msg.reasoning_content) {
+            writeSse(res, 'content_block_start', { type: 'content_block_start', index, content_block: { type: 'text', text: '' } });
+            for (let i = 0; i < text.length; i += 80) {
+                writeSse(res, 'content_block_delta', { type: 'content_block_delta', index, delta: { type: 'text_delta', text: text.substring(i, i + 80) } });
+            }
+            writeSse(res, 'content_block_stop', { type: 'content_block_stop', index });
         }
-        writeSse(res, 'content_block_stop', { type: 'content_block_stop', index: offset });
         writeSse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: message.usage });
     }
     writeSse(res, 'message_stop', { type: 'message_stop' });
@@ -1054,7 +1176,7 @@ function formatMessages(messages, tools) {
             const truncated = msg.content.length > 8000
                 ? msg.content.substring(0, 8000) + '\n...[truncated]'
                 : msg.content;
-            conversation += `[Tool Result]\n${truncated}\n\n`;
+            conversation += `[Tool Result]\n${truncated}\n\nAssistant: Continue from the real tool result above. If more local data is needed, output exactly one tool request.\n\n`;
         }
     }
     // The last user message + full conversation context
@@ -1303,7 +1425,7 @@ const server = http.createServer(async (req, res) => {
             // Empty response — retry loop with fresh sessions
             let retryAttempt = 0;
             const MAX_RETRIES = 10;
-            while (!fullContent || fullContent.trim().length === 0) {
+            while ((!fullContent || fullContent.trim().length === 0) && (!reasoningContent || reasoningContent.trim().length === 0)) {
                 retryAttempt++;
                 if (retryAttempt > MAX_RETRIES) {
                     console.log(`${agentTag} Empty after ${MAX_RETRIES} retries. Giving up.`);
@@ -1326,17 +1448,43 @@ const server = http.createServer(async (req, res) => {
                 session.parentMessageId = null;
                 session.createdAt = null;
                 session.messageCount = 0;
-                // Brief delay before retry to let DeepSeek breathe
-                await new Promise(r => setTimeout(r, Math.min(1000 * retryAttempt, 5000)));
+                console.log(`${agentTag} Waiting ${EMPTY_RESPONSE_RETRY_DELAY_MS}ms before retrying with a fresh session...`);
+                await new Promise(r => setTimeout(r, EMPTY_RESPONSE_RETRY_DELAY_MS));
                 const { resp: retryResp } = await askDeepSeekStream(fullPrompt, agentId, requestedModel);
                 const retryResult = await readDeepSeekResponse(retryResp.body);
                 const retryContent = retryResult && retryResult.content ? sanitizeContent(retryResult.content) : '';
                 const retryReasoning = retryResult && retryResult.reasoningContent ? sanitizeContent(retryResult.reasoningContent) : '';
-                if (retryContent && retryContent.trim().length > 0) {
+                if ((retryContent && retryContent.trim().length > 0) || (retryReasoning && retryReasoning.trim().length > 0)) {
                     console.log(`${agentTag} Retry ${retryAttempt} succeeded`);
                     fullContent = retryContent;
                     reasoningContent = retryReasoning;
                 }
+            }
+
+            // DeepSeek sometimes returns only reasoning after a tool result and stops before
+            // emitting the actual next text/tool request. Ask it to continue in-session.
+            let reasoningOnlyContinuationRounds = 0;
+            while (shouldContinueReasoningOnly(fullContent, reasoningContent) && reasoningOnlyContinuationRounds < MAX_REASONING_ONLY_CONTINUATIONS) {
+                reasoningOnlyContinuationRounds++;
+                console.log(`${agentTag} Reasoning-only response detected (${reasoningContent.length} chars). Auto-continuing (${reasoningOnlyContinuationRounds}/${MAX_REASONING_ONLY_CONTINUATIONS})...`);
+                await new Promise(r => setTimeout(r, 750));
+                const continuationPrompt = reasoningOnlyContinuationRounds === 1
+                    ? 'continue'
+                    : 'Continue from your previous reasoning and output either the final answer text or exactly one tool request. Do not output only reasoning.';
+                const { resp: contResp } = await askDeepSeekStream(continuationPrompt, agentId, requestedModel);
+                const contResult = await readDeepSeekResponse(contResp.body);
+                const contContent = contResult && contResult.content ? sanitizeContent(contResult.content) : '';
+                const contReasoning = contResult && contResult.reasoningContent ? sanitizeContent(contResult.reasoningContent) : '';
+                if (!isBlank(contReasoning)) {
+                    reasoningContent += (reasoningContent ? '\n' : '') + contReasoning;
+                }
+                if (!isBlank(contContent)) {
+                    fullContent = contContent;
+                    finishReason = contResult.finishReason;
+                    console.log(`${agentTag} Reasoning-only continuation produced ${contContent.length} chars`);
+                    break;
+                }
+                finishReason = contResult.finishReason;
             }
 
             // Auto-continuation: if finish_reason is 'length' or content is very long (>25000 chars),
@@ -1362,7 +1510,7 @@ const server = http.createServer(async (req, res) => {
                 }
             }
 
-            let toolCall = parseToolCall(fullContent);
+            let toolCall = parseToolCall(fullContent, tools);
             
             // Retry if TOOL_CALL was found but JSON was truncated/invalid
             if (!toolCall && /TOOL_CALL:\s*\w/i.test(fullContent)) {
@@ -1377,7 +1525,7 @@ const server = http.createServer(async (req, res) => {
                 const retryResult2 = await readDeepSeekResponse(retryResp2.body);
                 const retryContent2 = retryResult2 && retryResult2.content ? sanitizeContent(retryResult2.content) : '';
                 if (retryContent2 && retryContent2.trim()) {
-                    const retryTc = parseToolCall(retryContent2);
+                    const retryTc = parseToolCall(retryContent2, tools);
                     if (retryTc) {
                         console.log(`${agentTag} Retry with strict prompt succeeded: ${retryTc.name}`);
                         fullContent = retryContent2;
@@ -1506,4 +1654,14 @@ async function main() {
     });
 }
 
-main().catch(err => { console.error('[DS-API] FATAL:', err); process.exit(1); });
+if (require.main === module) {
+    main().catch(err => { console.error('[DS-API] FATAL:', err); process.exit(1); });
+} else {
+    module.exports = {
+        parseToolCall,
+        inferNarratedToolCall,
+        buildNarratedToolCall,
+        formatToolDefinitions,
+        shouldContinueReasoningOnly,
+    };
+}
