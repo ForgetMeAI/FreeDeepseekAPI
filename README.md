@@ -12,19 +12,19 @@
 </p>
 
 <p align="center">
-  <a href="#-быстрый-старт">Быстрый старт</a> •
-  <a href="#-возможности">Возможности</a> •
-  <a href="#-примеры-запросов">Примеры</a> •
-  <a href="#-модели">Модели</a> •
-  <a href="#-endpoints">Endpoints</a> •
-  <a href="#-open-webui">Open WebUI</a>
+  <a href="#быстрый-старт">Быстрый старт</a> •
+  <a href="#возможности">Возможности</a> •
+  <a href="#примеры-запросов">Примеры</a> •
+  <a href="#модели">Модели</a> •
+  <a href="#endpoints">Endpoints</a> •
+  <a href="#open-webui">Open WebUI</a>
 </p>
 
 FreeDeepseekAPI поднимает локальный API-сервер для **DeepSeek Web Chat** (`chat.deepseek.com`) и позволяет подключать DeepSeek Web к Open WebUI, LiteLLM, Hermes, Claude Code, OpenAI SDK-style клиентам и другим OpenAI-compatible инструментам.
 
 Проект работает через ваш обычный залогиненный аккаунт DeepSeek в отдельном Chrome-профиле. Локальный сервер принимает API-запросы, а дальше сам ходит в DeepSeek Web через сохранённую browser-сессию.
 
-> ⚠️ Это экспериментальный web-chat proxy. DeepSeek может менять внутренний Web API без предупреждения. Для production-кейсов надёжнее официальный платный API DeepSeek.
+> Это экспериментальный web-chat proxy. DeepSeek может менять внутренний Web API без предупреждения. Для production-кейсов надёжнее официальный платный API DeepSeek.
 
 ForgetMeAI: https://t.me/forgetmeai
 
@@ -32,18 +32,18 @@ ForgetMeAI: https://t.me/forgetmeai
 
 ## Навигация
 
-- [Что это даёт](#-что-это-даёт)
-- [Возможности](#-возможности)
-- [Быстрый старт](#-быстрый-старт)
-- [Windows запуск](#-windows-запуск)
-- [Linux / Chromium запуск](#-linux--chromium-запуск)
-- [VPS / headless запуск](#-vps--headless-запуск)
-- [Diagnostics / doctor](#-diagnostics--doctor)
-- [Session reuse и сброс чатов](#-session-reuse-и-сброс-чатов)
-- [Multi-account pool](#-multi-account-pool)
-- [Идеи для консольной авторизации](#-идеи-для-консольной-авторизации)
-- [Проверка работы](#-проверка-работы)
-- [Примеры запросов](#-примеры-запросов)
+- [Что это даёт](#что-это-даёт)
+- [Возможности](#возможности)
+- [Быстрый старт](#быстрый-старт)
+- [Windows запуск](#windows-запуск)
+- [Linux / Chromium запуск](#linux--chromium-запуск)
+- [VPS / headless запуск](#vps--headless-запуск)
+- [Diagnostics / doctor](#diagnostics--doctor)
+- [Session reuse и сброс чатов](#session-reuse-и-сброс-чатов)
+- [Multi-account pool](#multi-account-pool)
+- [Идеи для консольной авторизации](#идеи-для-консольной-авторизации)
+- [Проверка работы](#проверка-работы)
+- [Примеры запросов](#примеры-запросов)
   - [Chat Completions](#chat-completions)
   - [Reasoning](#reasoning)
   - [Web search](#web-search)
@@ -51,15 +51,15 @@ ForgetMeAI: https://t.me/forgetmeai
   - [Anthropic Messages API](#anthropic-messages-api)
   - [OpenAI Responses API](#openai-responses-api)
   - [Tool calling](#tool-calling)
-- [Модели](#-модели)
-- [Endpoints](#-endpoints)
-- [Open WebUI](#-open-webui)
-- [Обновить логин](#-обновить-логин)
-- [Статус проекта](#-статус-проекта)
+- [Модели](#модели)
+- [Endpoints](#endpoints)
+- [Open WebUI](#open-webui)
+- [Обновить логин](#обновить-логин)
+- [Статус проекта](#статус-проекта)
 
 ---
 
-## ✨ Что это даёт
+## Что это даёт
 
 - Использовать DeepSeek Web как локальный API endpoint.
 - Подключать DeepSeek к Open WebUI и другим OpenAI-compatible клиентам.
@@ -69,7 +69,7 @@ ForgetMeAI: https://t.me/forgetmeai
 - Использовать OpenAI Responses API shim для новых OpenAI/Codex-style клиентов.
 - Держать отдельные web-сессии для разных агентов/users.
 
-## 🚀 Возможности
+## Возможности
 
 - **OpenAI-compatible API:** `POST /v1/chat/completions`
 - **Anthropic-compatible shim:** `POST /v1/messages`
@@ -84,7 +84,7 @@ ForgetMeAI: https://t.me/forgetmeai
 
 ---
 
-## ⚡ Быстрый старт
+## Быстрый старт
 
 ```bash
 git clone https://github.com/ForgetMeAI/FreeDeepseekAPI.git
@@ -123,7 +123,7 @@ http://localhost:9655
 
 ---
 
-## 🪟 Windows запуск
+## Windows запуск
 
 ```powershell
 git clone https://github.com/ForgetMeAI/FreeDeepseekAPI.git
@@ -143,7 +143,7 @@ npm run auth
 
 ---
 
-## 🐧 Linux / Chromium запуск
+## Linux / Chromium запуск
 
 ```bash
 git clone https://github.com/ForgetMeAI/FreeDeepseekAPI.git
@@ -162,7 +162,7 @@ CHROME_PATH=$(which google-chrome) npm run auth
 
 ---
 
-## 🖥 VPS / headless запуск
+## VPS / headless запуск
 
 Самый надёжный flow без Chrome на сервере:
 
@@ -202,7 +202,7 @@ DEEPSEEK_TOKEN="<token>" npm run auth:import -- --input ./cookies.json
 
 ---
 
-## 🩺 Diagnostics / doctor
+## Diagnostics / doctor
 
 ```bash
 npm run doctor
@@ -222,7 +222,7 @@ npm run doctor -- --offline
 
 ---
 
-## ♻️ Session reuse и сброс чатов
+## Session reuse и сброс чатов
 
 FreeDeepseekAPI не создаёт новый DeepSeek чат на каждый HTTP-запрос без причины. Логика такая:
 
@@ -262,7 +262,7 @@ curl -X POST "http://localhost:9655/reset-session?agent=all"
 
 ---
 
-## 👥 Multi-account pool
+## Multi-account pool
 
 Можно подключить несколько auth-файлов. Правильная модель: sticky account per agent/session — proxy не переключает аккаунт внутри живой DeepSeek-сессии. Если аккаунт получил `401/403/429` и ушёл в cooldown, session безопасно сбрасывается и новый запрос может перейти на другой доступный аккаунт.
 
@@ -299,7 +299,7 @@ DEEPSEEK_ACCOUNT_COOLDOWN_MS=600000 npm start
 
 ---
 
-## 🔑 Идеи для консольной авторизации
+## Идеи для консольной авторизации
 
 Парольный flow из PR #3 можно делать, но безопаснее не хранить пароль и не делать это дефолтом. Нормальная реализация:
 
@@ -314,7 +314,7 @@ DEEPSEEK_ACCOUNT_COOLDOWN_MS=600000 npm start
 
 ---
 
-## ✅ Проверка работы
+## Проверка работы
 
 ```bash
 curl http://localhost:9655/
@@ -326,7 +326,7 @@ curl http://localhost:9655/v1/model-capabilities
 
 ---
 
-## 🧪 Примеры запросов
+## Примеры запросов
 
 ### Chat Completions
 
@@ -434,7 +434,7 @@ FreeDeepseekAPI принимает:
 
 ---
 
-## 🧠 Модели
+## Модели
 
 `GET /v1/models` возвращает только aliases, которые сейчас проверены и работают через этот proxy.
 
@@ -472,7 +472,7 @@ Search для Expert по remote config недоступен, поэтому `de
 
 ---
 
-## 🔌 Endpoints
+## Endpoints
 
 | Method | Path | Назначение |
 | --- | --- | --- |
@@ -488,7 +488,7 @@ Search для Expert по remote config недоступен, поэтому `de
 
 ---
 
-## 🖥 Open WebUI
+## Open WebUI
 
 Base URL для Open WebUI в Docker:
 
@@ -506,7 +506,7 @@ API key можно указать любой: proxy сам ходит в DeepSee
 
 ---
 
-## 🔐 Обновить логин
+## Обновить логин
 
 ```bash
 npm run auth
@@ -525,7 +525,7 @@ npm start
 
 ---
 
-## 🧪 Тесты
+## Тесты
 
 Синтаксическая проверка проекта:
 
@@ -541,7 +541,7 @@ BASE_URL=http://127.0.0.1:9655 MODEL=deepseek-chat npm run test:live
 
 ---
 
-## 📌 Статус проекта
+## Статус проекта
 
 FreeDeepseekAPI — экспериментальный web-chat proxy для локального использования и интеграций. Он зависит от текущего контракта DeepSeek Web Chat, поэтому при изменениях на стороне DeepSeek может потребоваться обновление auth/session logic или model mapping.
 
