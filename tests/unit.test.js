@@ -109,3 +109,47 @@ test('chrome auth prints actionable OS instructions when Chrome is missing', () 
   assert.match(out, /Linux/i);
   assert.match(out, /CHROME_PATH/i);
 });
+
+test('messagesMatch correctly matches role, content, and tool_calls', () => {
+  const { messagesMatch } = require('../server.js');
+  const a = [{ role: 'user', content: 'hello', tool_calls: undefined }];
+  const b = [{ role: 'user', content: 'hello', tool_calls: undefined }];
+  assert.ok(messagesMatch(a, b));
+
+  const c = [{ role: 'user', content: 'hello', tool_calls: [{ id: 'call_1' }] }];
+  assert.ok(!messagesMatch(a, c));
+
+  const d = [{ role: 'assistant', content: 'hello' }];
+  assert.ok(!messagesMatch(a, d));
+});
+
+test('createSession and resetSession initialize and clear delta fields', () => {
+  const { createSession, resetSession } = require('../server.js');
+  const session = createSession();
+  assert.equal(session.processedMessageCount, 0);
+  assert.deepEqual(session.lastProcessedMessages, []);
+
+  session.processedMessageCount = 5;
+  session.lastProcessedMessages = [{ role: 'user', content: 'hi' }];
+  resetSession(session);
+  assert.equal(session.processedMessageCount, 0);
+  assert.deepEqual(session.lastProcessedMessages, []);
+});
+
+test('maskAgentId correctly hashes IPs and preserves user strings', () => {
+  const { maskAgentId } = require('../server.js');
+  
+  // Check IPv4
+  const v4 = maskAgentId('192.168.1.1');
+  assert.match(v4, /^ip_[0-9a-f]{8}$/);
+  assert.notEqual(v4, '192.168.1.1');
+
+  // Check IPv6
+  const v6 = maskAgentId('2001:db8::1');
+  assert.match(v6, /^ip_[0-9a-f]{8}$/);
+  assert.notEqual(v6, '2001:db8::1');
+
+  // Check custom agent strings
+  assert.equal(maskAgentId('my-custom-agent'), 'my-custom-agent');
+  assert.equal(maskAgentId('dev-agent'), 'dev-agent');
+});

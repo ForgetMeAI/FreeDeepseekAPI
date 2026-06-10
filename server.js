@@ -32,7 +32,7 @@ const SERVER_PUBLIC_IP = (() => {
 
 const FORGETMEAI_WATERMARK = 't.me/forgetmeai';
 const PORT = Number(process.env.PORT || 9655);
-const HOST = process.env.HOST || '0.0.0.0';
+const HOST = process.env.HOST || '127.0.0.1';
 function formatWatermark(prefix = 'ForgetMeAI') { return `${prefix}: ${FORGETMEAI_WATERMARK}`; }
 function printBanner() {
     console.log(`
@@ -145,10 +145,7 @@ function selectAccountForSession(session) {
             // A DeepSeek chat_session belongs to the auth account that created it.
             // If that account is rate-limited/expired, do not keep hammering it;
             // reset the web session and let a healthy account take over.
-            session.id = null;
-            session.parentMessageId = null;
-            session.createdAt = null;
-            session.messageCount = 0;
+            resetSession(session);
         }
         session.accountId = null;
     }
@@ -197,7 +194,40 @@ function createSession() {
         messageCount: 0,
         accountId: null,
         history: [],
+        processedMessageCount: 0,
+        lastProcessedMessages: [],
     };
+}
+
+function resetSession(session) {
+    session.id = null;
+    session.parentMessageId = null;
+    session.createdAt = null;
+    session.messageCount = 0;
+    session.processedMessageCount = 0;
+    session.lastProcessedMessages = [];
+}
+
+function messagesMatch(a, b) {
+    if (!a || !b) return false;
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+        if (a[i].role !== b[i].role) return false;
+        if (JSON.stringify(a[i].content) !== JSON.stringify(b[i].content)) return false;
+        if (JSON.stringify(a[i].tool_calls) !== JSON.stringify(b[i].tool_calls)) return false;
+    }
+    return true;
+}
+
+function maskAgentId(agentId) {
+    if (!agentId) return 'unknown';
+    // Check if agentId is an IPv4 or IPv6 address
+    const isIp = /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(agentId) || agentId.includes(':');
+    if (isIp) {
+        const hash = require('crypto').createHash('sha256').update(agentId).digest('hex');
+        return `ip_${hash.substring(0, 8)}`;
+    }
+    return agentId; // Keep custom user-supplied session names visible
 }
 
 function getOrCreateAgentSession(agentId) {
@@ -347,20 +377,14 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
     // Auto-reset on deep message chain
     if (session.id && session.messageCount >= MAX_MESSAGE_DEPTH) {
         console.log(`${agentTag} Session ${session.id} hit ${session.messageCount} messages. Auto-resetting.`);
-        session.id = null;
-        session.parentMessageId = null;
-        session.createdAt = null;
-        session.messageCount = 0;
+        resetSession(session);
         // History preserved for context injection
     }
 
     // Reset expired sessions (DeepSeek web sessions last ~1-2 hours)
     if (session.id && session.createdAt && (Date.now() - session.createdAt > SESSION_TTL_MS)) {
         console.log(`${agentTag} Session ${session.id} expired (age: ${Math.round((Date.now() - session.createdAt) / 60000)}min). Creating new...`);
-        session.id = null;
-        session.parentMessageId = null;
-        session.createdAt = null;
-        session.messageCount = 0;
+        resetSession(session);
     }
 
     const cr = await fetch('https://chat.deepseek.com/api/v0/chat/create_pow_challenge', {
@@ -425,10 +449,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
         console.log(`${agentTag} Session error (${resp.status}): ${errText.substring(0, 100)}`);
         if (resp.status === 400 || resp.status === 404 || resp.status === 500) {
             console.log(`${agentTag} Session ${session.id} expired. Creating new session...`);
-            session.id = null;
-            session.parentMessageId = null;
-            session.createdAt = null;
-            session.messageCount = 0;
+            resetSession(session);
 
             const sr2 = await fetch('https://chat.deepseek.com/api/v0/chat_session/create', {
                 method: 'POST', headers: dsHeaders, body: '{}'
@@ -1070,6 +1091,24 @@ const server = http.createServer(async (req, res) => {
 
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
 
+    // Verify API Key if PROXY_API_KEY is configured
+    if (process.env.PROXY_API_KEY) {
+        if (url.pathname !== '/' && url.pathname !== '/health') {
+            const authHeader = req.headers.authorization || '';
+            const expectedAuth = `Bearer ${process.env.PROXY_API_KEY}`;
+            if (authHeader !== expectedAuth) {
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    error: {
+                        message: "Unauthorized: Invalid or missing API Key (Authorization: Bearer <key>)",
+                        type: "invalid_request_error"
+                    }
+                }));
+                return;
+            }
+        }
+    }
+
     // Health check
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1096,7 +1135,7 @@ const server = http.createServer(async (req, res) => {
         const agentList = [];
         for (const [agentId, session] of sessions) {
             agentList.push({
-                agent: agentId,
+                agent: maskAgentId(agentId),
                 session_id: session.id,
                 message_count: session.messageCount,
                 account: session.accountId,
@@ -1127,10 +1166,7 @@ const server = http.createServer(async (req, res) => {
         }
         const historyCount = session.history.length;
         const historyPreview = session.history.map(e => e.user.substring(0, 40)).join(' | ');
-        session.id = null;
-        session.parentMessageId = null;
-        session.createdAt = null;
-        session.messageCount = 0;
+        resetSession(session);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status: 'session_reset', agent: agentId, history_preserved: historyCount, history: historyPreview }));
         return;
@@ -1172,9 +1208,35 @@ const server = http.createServer(async (req, res) => {
                 ? String(requestedSession)
                 : ((remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1') ? 'dev-agent' : remoteAddr);
             const agentTag = `[${agentId}]`;
-            const { prompt, systemPrompt } = formatMessages(messages, tools);
-
             const session = getOrCreateAgentSession(agentId);
+
+            // Check if we can reuse the session and only send the delta
+            let newMessages = messages;
+            let isDelta = false;
+
+            if (session.id) {
+                const count = session.processedMessageCount || 0;
+                const prefix = messages.slice(0, count);
+                if (count > 0 && count <= messages.length && messagesMatch(prefix, session.lastProcessedMessages)) {
+                    // Filter out any assistant messages from the new message slice
+                    newMessages = messages.slice(count).filter(m => m.role !== 'assistant');
+                    isDelta = true;
+                    console.log(`${agentTag} Sending delta of ${newMessages.length} messages (reusing session ${session.id})`);
+                } else {
+                    // Client restarted or history diverged, reset session
+                    console.log(`${agentTag} History diverged or client restarted. Resetting session ${session.id}`);
+                    resetSession(session);
+                }
+            }
+
+            if (isDelta && newMessages.length === 0) {
+                console.log(`${agentTag} Warning: Delta has 0 new messages after filtering. Resetting session.`);
+                resetSession(session);
+                isDelta = false;
+                newMessages = messages;
+            }
+
+            const { prompt, systemPrompt } = formatMessages(newMessages, tools);
 
             // Build history prefix if starting fresh
             let historyPrefix = '';
@@ -1186,9 +1248,14 @@ const server = http.createServer(async (req, res) => {
                 historyPrefix += '[Continue from here]\n\n';
             }
 
-            const fullPrompt = systemPrompt
-                ? `${systemPrompt}\n\n${historyPrefix}${prompt}`
-                : `${historyPrefix}${prompt}`;
+            let fullPrompt;
+            if (isDelta) {
+                fullPrompt = prompt;
+            } else {
+                fullPrompt = systemPrompt
+                    ? `${systemPrompt}\n\n${historyPrefix}${prompt}`
+                    : `${historyPrefix}${prompt}`;
+            }
 
             const startTime = Date.now();
             const { resp: dsResp } = await askDeepSeekStream(fullPrompt, agentId, requestedModel);
@@ -1322,10 +1389,7 @@ const server = http.createServer(async (req, res) => {
                     return;
                 }
                 console.log(`${agentTag} Empty response (msg#${session.messageCount}, retry ${retryAttempt}/${MAX_RETRIES}). Resetting session...`);
-                session.id = null;
-                session.parentMessageId = null;
-                session.createdAt = null;
-                session.messageCount = 0;
+                resetSession(session);
                 // Brief delay before retry to let DeepSeek breathe
                 await new Promise(r => setTimeout(r, Math.min(1000 * retryAttempt, 5000)));
                 const { resp: retryResp } = await askDeepSeekStream(fullPrompt, agentId, requestedModel);
@@ -1367,10 +1431,7 @@ const server = http.createServer(async (req, res) => {
             // Retry if TOOL_CALL was found but JSON was truncated/invalid
             if (!toolCall && /TOOL_CALL:\s*\w/i.test(fullContent)) {
                 console.log(`${agentTag} TOOL_CALL detected but JSON invalid/truncated (${fullContent.length} chars). Retrying with stricter prompt...`);
-                session.id = null;
-                session.parentMessageId = null;
-                session.createdAt = null;
-                session.messageCount = 0;
+                resetSession(session);
                 await new Promise(r => setTimeout(r, 1000));
                 const strictPrompt = fullPrompt + '\n\n[STRICT INSTRUCTION] Your previous response had a TOOL_CALL but the arguments were too long and got cut off. Keep the arguments SHORT — no large file contents. Just use a minimal example or reference the file by name. Output ONLY: TOOL_CALL: <function>\narguments: <short JSON>';
                 const { resp: retryResp2 } = await askDeepSeekStream(strictPrompt, agentId, requestedModel);
@@ -1402,6 +1463,10 @@ const server = http.createServer(async (req, res) => {
             }
 
             storeHistory(agentId, prompt, fullContent, toolCall);
+
+            // Record processed messages to allow sending delta next time
+            session.processedMessageCount = messages.length;
+            session.lastProcessedMessages = messages.map(m => ({ role: m.role, content: m.content, tool_calls: m.tool_calls }));
 
             const openaiResponse = toolCall
                 ? buildToolCallResponse(toolCall, requestedModel, fullPrompt, reasoningContent)
@@ -1506,4 +1571,8 @@ async function main() {
     });
 }
 
-main().catch(err => { console.error('[DS-API] FATAL:', err); process.exit(1); });
+if (require.main === module) {
+    main().catch(err => { console.error('[DS-API] FATAL:', err); process.exit(1); });
+} else {
+    module.exports = { createSession, resetSession, messagesMatch, formatMessages, maskAgentId };
+}
