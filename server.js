@@ -1218,6 +1218,10 @@ function isLocal(req) {
 function isCrossOrigin(req) {
     const src = req.headers.origin || req.headers.referer;
     if (!src) return false;
+    // Browser extensions (this project's account-import popup) are user-installed
+    // and declare an explicit host permission for this server. A web page cannot
+    // forge a *-extension:// Origin, so these are trusted, not a CSRF vector.
+    if (/^(chrome-extension|moz-extension|safari-web-extension):\/\//i.test(src)) return false;
     try { return new URL(src).host !== req.headers.host; } catch { return true; }
 }
 
