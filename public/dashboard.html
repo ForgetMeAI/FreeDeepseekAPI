@@ -313,12 +313,16 @@ async function loadHealth(){
   try{
     const j=await (await fetch(origin+'/health')).json(); healthCache=j;
     const n=(j.models||[]).length;
-    const ac=j.accounts||{};
+    // /health.accounts is an ARRAY of {id, ready, cooldown, ...} — not {online,total}.
+    // Derive the counts from it (was reading ac.online/ac.total → always 0/0).
+    const accs=Array.isArray(j.accounts)?j.accounts:[];
+    const total=accs.length;
+    const online=accs.filter(a=>a&&a.ready).length;
     $('#statusDot').className='dot on';
-    $('#statusText').textContent='онлайн · '+n+' моделей · '+(ac.online??0)+'/'+(ac.total??0)+' акк.';
+    $('#statusText').textContent='онлайн · '+n+' моделей · '+online+'/'+total+' акк.';
     $('#kpiStatus').textContent='Онлайн'; $('#kpiStatus').className='num ok';
     $('#kpiModels').textContent=n;
-    $('#kpiAuth').textContent=(ac.online??0)+' / '+(ac.total??0); $('#kpiAuth').className='num'+(ac.online?' ok':' err');
+    $('#kpiAuth').textContent=online+' / '+total; $('#kpiAuth').className='num'+(online?' ok':' err');
   }catch{ $('#statusDot').className='dot off'; $('#statusText').textContent='офлайн'; $('#kpiStatus').textContent='Офлайн'; $('#kpiStatus').className='num err'; $('#kpiAuth').textContent='—'; }
 }
 function fmtExp(ms){ if(!ms) return ''; const d=Math.round((ms-Date.now())/864e5); return 'до '+new Date(ms).toISOString().slice(0,10)+(d>=0?' ('+d+' дн)':' (истёк)'); }
