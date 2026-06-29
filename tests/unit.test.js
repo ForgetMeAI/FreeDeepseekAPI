@@ -6,6 +6,7 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
 const ROOT = path.resolve(__dirname, '..');
+const serverInternals = require('../server.js').__test;
 
 function tmpdir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'fdsapi-test-'));
@@ -108,4 +109,37 @@ test('chrome auth prints actionable OS instructions when Chrome is missing', () 
   assert.match(out, /macOS/i);
   assert.match(out, /Linux/i);
   assert.match(out, /CHROME_PATH/i);
+});
+
+test('DeepSeek stream parser treats SEARCH fragments as assistant output', () => {
+  const rebuilt = serverInternals.rebuildFragmentText([
+    { type: 'SEARCH', content: 'The official Reuters website is ' },
+    { type: 'SEARCH', content: 'https://www.reuters.com/.' },
+  ]);
+
+  assert.equal(rebuilt.responseText, 'The official Reuters website is https://www.reuters.com/.');
+  assert.equal(rebuilt.thinkText, '');
+});
+
+test('DeepSeek stream parser applies response-level fragment append patches', () => {
+  const fragments = [];
+  const appendFragments = (value) => {
+    const incoming = Array.isArray(value) ? value : [value];
+    for (const fragment of incoming) fragments.push({ ...fragment });
+  };
+
+  const applied = serverInternals.applyResponsePatchOperations([
+    { p: 'fragments', o: 'APPEND', v: [{ type: 'RESPONSE', content: 'The' }] },
+    { p: 'has_pending_fragment', o: 'SET', v: false },
+  ], appendFragments);
+
+  assert.equal(applied, true);
+  assert.deepEqual(fragments, [{ type: 'RESPONSE', content: 'The' }]);
+  assert.equal(serverInternals.rebuildFragmentText(fragments).responseText, 'The');
+});
+
+test('DeepSeek stream parser does not treat service content chunks as model errors', () => {
+  assert.equal(serverInternals.isDeepSeekModelErrorEvent({ content: 'Official Reuters website URL' }), false);
+  assert.equal(serverInternals.isDeepSeekModelErrorEvent({ finish_reason: 'stop' }), false);
+  assert.equal(serverInternals.isDeepSeekModelErrorEvent({ type: 'error', content: 'backend error' }), true);
 });
