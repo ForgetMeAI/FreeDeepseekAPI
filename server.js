@@ -16,6 +16,7 @@ const os = require('os');
 const path = require('path');
 const readline = require('readline');
 const { spawnSync } = require('child_process');
+const { parseAuthInput, finalizeAuth } = require('./lib/parseAuth');
 
 const SERVER_HOST = os.hostname();  // Dynamic hostname detection
 const SERVER_PUBLIC_IP = (() => {
@@ -61,7 +62,13 @@ const SESSION_TTL_MS = 2 * 60 * 60 * 1000;  // 2 hours
 
 // === DeepSeek Web API Config — loaded from external config file ===
 const DS_CONFIG_PATH = process.env.DEEPSEEK_AUTH_PATH || path.join(__dirname, 'deepseek-auth.json');
+// Managed runtime auth dir: accounts added through the dashboard / import scripts
+// are written here as account_<ts>.json and picked up on the next reload. This
+// directory is always scanned in addition to the env-provided paths, so runtime
+// CRUD works on top of the maintainer's file-based pool without a separate store.
+const MANAGED_AUTH_DIR = path.join(__dirname, 'data', 'accounts');
 const DEFAULT_ACCOUNT_COOLDOWN_MS = Number(process.env.DEEPSEEK_ACCOUNT_COOLDOWN_MS || 10 * 60 * 1000);
+const DEFAULT_WASM = 'https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm';
 let DS_CONFIG = {};
 let dsHeaders = {};
 const accounts = [];
@@ -83,22 +90,45 @@ function buildBaseHeaders(config = DS_CONFIG) {
         "Content-Type": "application/json",
     };
 }
+// *.json files from the managed runtime dir (data/accounts). Created on demand so
+// runtime-added accounts survive reloads. Returns [] if the dir cannot be created.
+function managedAuthPaths() {
+    try {
+        fs.mkdirSync(MANAGED_AUTH_DIR, { recursive: true });
+        return fs.readdirSync(MANAGED_AUTH_DIR)
+            .filter(f => f.endsWith('.json'))
+            .sort()
+            .map(f => path.join(MANAGED_AUTH_DIR, f));
+    } catch (e) {
+        console.error(`[DS-API] Could not read managed auth dir ${MANAGED_AUTH_DIR}: ${e.message}`);
+        return [];
+    }
+}
 function discoverAuthPaths() {
+    let envPaths;
     if (process.env.DEEPSEEK_AUTH_DIR) {
         try {
-            return fs.readdirSync(process.env.DEEPSEEK_AUTH_DIR)
+            envPaths = fs.readdirSync(process.env.DEEPSEEK_AUTH_DIR)
                 .filter(f => f.endsWith('.json'))
                 .sort()
                 .map(f => path.join(process.env.DEEPSEEK_AUTH_DIR, f));
         } catch (e) {
             console.error(`[DS-API] Could not read DEEPSEEK_AUTH_DIR: ${e.message}`);
-            return [];
+            envPaths = [];
         }
+    } else if (process.env.DEEPSEEK_AUTH_PATH && process.env.DEEPSEEK_AUTH_PATH.includes(',')) {
+        envPaths = process.env.DEEPSEEK_AUTH_PATH.split(',').map(s => s.trim()).filter(Boolean);
+    } else {
+        envPaths = [DS_CONFIG_PATH];
     }
-    if (process.env.DEEPSEEK_AUTH_PATH && process.env.DEEPSEEK_AUTH_PATH.includes(',')) {
-        return process.env.DEEPSEEK_AUTH_PATH.split(',').map(s => s.trim()).filter(Boolean);
+    // Always also include the managed runtime dir, de-duplicated against env paths
+    // (resolved to absolute) so the same file is never loaded twice.
+    const seen = new Set(envPaths.map(p => path.resolve(p)));
+    const merged = [...envPaths];
+    for (const p of managedAuthPaths()) {
+        if (!seen.has(path.resolve(p))) { seen.add(path.resolve(p)); merged.push(p); }
     }
-    return [DS_CONFIG_PATH];
+    return merged;
 }
 function loadDeepSeekConfig({ fatal = true } = {}) {
     accounts.length = 0;
@@ -187,6 +217,120 @@ function markAccountFailure(account, status, reason = '', retryAfterRaw = null) 
         const cooldownMs = retryMs != null ? retryMs : DEFAULT_ACCOUNT_COOLDOWN_MS;
         account.cooldownUntil = Date.now() + cooldownMs;
         console.log(`[account:${account.id}] cooldown for ${Math.round(cooldownMs / 1000)}s after HTTP ${status}${reason ? ` (${reason})` : ''}${retryMs != null ? ' (Retry-After)' : ''}`);
+    }
+}
+
+// === Account management (dashboard / import) on top of the file-based pool ===
+
+// Decode a JWT payload's `exp` (in ms) without verifying the signature.
+function decodeTokenInfo(token) {
+    try {
+        const p = JSON.parse(Buffer.from(String(token).split('.')[1], 'base64url').toString());
+        return { exp: p.exp ? p.exp * 1000 : null };
+    } catch { return { exp: null }; }
+}
+
+// String status used by the dashboard. Distinct from accountStatus() (object form)
+// which is consumed by /health and the rest of the server.
+function accountStatusStr(account) {
+    if (!account.config.token || !account.config.cookie) return 'INVALID';
+    const { exp } = decodeTokenInfo(account.config.token);
+    if (exp && exp <= Date.now()) return 'EXPIRED';
+    if (account.cooldownUntil > Date.now()) return 'WAIT';
+    return 'OK';
+}
+
+// True only when the given absolute path lives inside the managed runtime dir.
+// Guards file deletion so env-provided auth files are never touched.
+function isManagedFile(file) {
+    if (!file) return false;
+    const dir = path.resolve(MANAGED_AUTH_DIR);
+    const rel = path.relative(dir, path.resolve(file));
+    return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+}
+
+// Add an account from a parsed auth object ({token,cookie,wasmUrl,hif_dliq,hif_leim,email}).
+// Dedups by token; writes a new file into the managed dir; reloads the pool.
+function addAccountFromAuth(parsed) {
+    const token = parsed && parsed.token;
+    if (!token) return { error: 'Need token' };
+    if (!parsed.cookie) return { error: 'Need cookie' };
+    const dup = accounts.find(a => a.config.token === token);
+    if (dup) return { error: 'This account is already added', existingId: dup.id };
+    const content = {
+        token,
+        cookie: parsed.cookie,
+        wasmUrl: parsed.wasmUrl || '',
+        hif_dliq: parsed.hif_dliq || '',
+        hif_leim: parsed.hif_leim || '',
+        email: parsed.email || '',
+        label: parsed.label || '',
+    };
+    try {
+        fs.mkdirSync(MANAGED_AUTH_DIR, { recursive: true });
+        const file = path.join(MANAGED_AUTH_DIR, `account_${Date.now()}.json`);
+        fs.writeFileSync(file, JSON.stringify(content, null, 2), { mode: 0o600 });
+    } catch (e) {
+        return { error: 'Could not save account: ' + e.message };
+    }
+    loadDeepSeekConfig({ fatal: false });
+    const added = accounts.find(a => a.config.token === token);
+    return { ok: true, id: added ? added.id : null };
+}
+
+// Delete an account by id. Only removes the backing file when it is inside the
+// managed dir; env-provided files are left in place. Reloads the pool.
+function deleteAccountById(id) {
+    const account = accounts.find(a => a.id === id);
+    if (!account) return { error: 'Account not found' };
+    if (account.file && isManagedFile(account.file)) {
+        try { fs.unlinkSync(account.file); }
+        catch (e) { return { error: 'Could not delete account file: ' + e.message }; }
+    }
+    loadDeepSeekConfig({ fatal: false });
+    return { ok: true };
+}
+
+// Public, dashboard-friendly view of the pool.
+function listAccountsPublic() {
+    return accounts.map(a => ({
+        id: a.id,
+        status: accountStatusStr(a),
+        email: a.config.email || '',
+        label: a.config.label || '',
+        exp: decodeTokenInfo(a.config.token).exp,
+        resetAt: a.cooldownUntil > Date.now() ? new Date(a.cooldownUntil).toISOString() : null,
+        preview: String(a.config.token || '').slice(-6),
+    }));
+}
+
+// Live liveness check via GET users/current — validates token/cookie directly,
+// needs no PoW (PoW is only required for completion). Hard 15s timeout so the
+// /check route can never hang. Returns { status, email }; never throws.
+async function checkAccountLive(account) {
+    try {
+        const resp = await fetch('https://chat.deepseek.com/api/v0/users/current', {
+            headers: buildBaseHeaders(account.config),
+            signal: AbortSignal.timeout(15000),
+        });
+        const text = await resp.text();
+        let j = null;
+        try { j = text ? JSON.parse(text) : null; } catch { j = null; }
+        if (resp.status === 429) {
+            markAccountFailure(account, 429, 'check');
+            return { status: 'WAIT', email: '' };
+        }
+        const code = j && (j.code ?? j.data?.code);
+        if (resp.status === 401 || resp.status === 403 || [40003, 40300, 40301].includes(Number(code))) {
+            return { status: 'INVALID', email: '' };
+        }
+        if (resp.ok && j && j.data && j.data.biz_data) {
+            return { status: 'OK', email: j.data.biz_data.email || '' };
+        }
+        return { status: 'ERROR', email: '' };
+    } catch {
+        // Network error or 15s timeout — treat as unknown, do not crash the route.
+        return { status: 'ERROR', email: '' };
     }
 }
 async function readDeepSeekJsonResponse(resp, label, account) {
@@ -1120,6 +1264,26 @@ function formatMessages(messages, tools) {
     return { prompt: conversation.trim(), systemPrompt: systemPrompt.trim() };
 }
 
+// Account management is allowed from the local machine only.
+function isLocal(req) {
+    const ip = (req.socket && req.socket.remoteAddress) || '';
+    return ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
+}
+
+// CSRF guard for account management: reject cross-site requests. A browser always
+// sends Origin (and Referer) on a cross-origin request, so reject when the source
+// host does not match the server host. Non-browser clients (curl/scripts) send
+// neither and are not a CSRF vector, so they pass.
+function isCrossOrigin(req) {
+    const src = req.headers.origin || req.headers.referer;
+    if (!src) return false;
+    // Browser extensions (this project's account-import popup) are user-installed
+    // and declare an explicit host permission for this server. A web page cannot
+    // forge a *-extension:// Origin, so these are trusted, not a CSRF vector.
+    if (/^(chrome-extension|moz-extension|safari-web-extension):\/\//i.test(src)) return false;
+    try { return new URL(src).host !== req.headers.host; } catch { return true; }
+}
+
 // === HTTP Server ===
 const server = http.createServer(async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -1193,6 +1357,118 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status: 'session_reset', agent: agentId, history_preserved: historyCount, history: historyPreview }));
         return;
+    }
+
+    // Dashboard (web UI) — single static file
+    if (req.method === 'GET' && url.pathname === '/dashboard') {
+        try {
+            const html = fs.readFileSync(path.join(__dirname, 'public', 'dashboard.html'));
+            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+            res.end(html);
+        } catch {
+            res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+            res.end('Dashboard not built (public/dashboard.html missing)');
+        }
+        return;
+    }
+
+    // Auth status for dashboard: decode JWT exp (no signature check) + presence flags
+    if (req.method === 'GET' && url.pathname === '/api/auth-status') {
+        const ok = accounts.find(a => accountStatusStr(a) === 'OK');
+        const tokenExp = ok ? decodeTokenInfo(ok.config.token).exp : null;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            config_ready: hasAuthConfig(),
+            accounts_total: accounts.length,
+            accounts_online: accounts.filter(a => accountStatusStr(a) === 'OK').length,
+            accounts_limited: accounts.filter(a => accountStatusStr(a) === 'WAIT').length,
+            token_exp: tokenExp,
+            has_token: accounts.some(a => a.config.token),
+            has_cookie: accounts.some(a => a.config.cookie),
+            has_hif: accounts.some(a => a.config.hif_dliq || a.config.hif_leim),
+        }));
+        return;
+    }
+
+    // ── DeepSeek account management (localhost only) ──
+    if (url.pathname === '/api/accounts' || url.pathname.startsWith('/api/accounts/')) {
+        if (!isLocal(req)) { res.writeHead(403, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Available from localhost only' })); return; }
+        if (isCrossOrigin(req)) { res.writeHead(403, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Cross-origin request rejected' })); return; }
+
+        // GET /api/accounts — list with statuses
+        if (req.method === 'GET' && url.pathname === '/api/accounts') {
+            res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ accounts: listAccountsPublic() })); return;
+        }
+
+        // POST /api/accounts/import — add an account from cURL/HAR (request body)
+        if (req.method === 'POST' && url.pathname === '/api/accounts/import') {
+            let body = '';
+            req.on('data', c => { body += c; if (body.length > 25 * 1024 * 1024) req.destroy(); });
+            req.on('end', () => {
+                try {
+                    const prevWasm = accounts.find(a => a.config.wasmUrl)?.config.wasmUrl || DEFAULT_WASM;
+                    const parsed = finalizeAuth(parseAuthInput(body), prevWasm);
+                    if (parsed.error) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(parsed)); return; }
+                    const r = addAccountFromAuth(parsed);
+                    const code = r.error ? (r.existingId ? 409 : 400) : 200;
+                    res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(r));
+                } catch (e) { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Import error: ' + e.message })); }
+            });
+            return;
+        }
+
+        // POST /api/accounts/:id/check — real liveness check via GET users/current
+        const mCheck = url.pathname.match(/^\/api\/accounts\/(account_[A-Za-z0-9]+)\/check$/);
+        if (req.method === 'POST' && mCheck) {
+            const id = mCheck[1];
+            const account = accounts.find(a => a.id === id);
+            if (!account) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Account not found' })); return; }
+            const { status, email } = await checkAccountLive(account);
+            // On success, persist a freshly discovered email both in memory and (for
+            // managed files) on disk, so it survives the next pool reload.
+            if (status === 'OK' && email) {
+                account.config.email = email;
+                if (isManagedFile(account.file)) {
+                    try { fs.writeFileSync(account.file, JSON.stringify(account.config, null, 2), { mode: 0o600 }); }
+                    catch (e) { console.error(`[account:${id}] could not persist email: ${e.message}`); }
+                }
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ id, status, email: account.config.email || '', exp: decodeTokenInfo(account.config.token).exp }));
+            return;
+        }
+
+        // POST /api/accounts/:id/label — set a human-friendly label for the account
+        const mLabel = url.pathname.match(/^\/api\/accounts\/(account_[A-Za-z0-9]+)\/label$/);
+        if (req.method === 'POST' && mLabel) {
+            const id = mLabel[1];
+            const account = accounts.find(a => a.id === id);
+            if (!account) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Account not found' })); return; }
+            let body = '';
+            req.on('data', c => { body += c; if (body.length > 64 * 1024) req.destroy(); });
+            req.on('end', () => {
+                try {
+                    const label = String((JSON.parse(body || '{}').label) || '').slice(0, 80);
+                    account.config.label = label;
+                    // Persist for managed files so the label survives the next pool reload.
+                    if (isManagedFile(account.file)) {
+                        try { fs.writeFileSync(account.file, JSON.stringify(account.config, null, 2), { mode: 0o600 }); }
+                        catch (e) { console.error(`[account:${id}] could not persist label: ${e.message}`); }
+                    }
+                    res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true, id, label }));
+                } catch (e) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Invalid label body: ' + e.message })); }
+            });
+            return;
+        }
+
+        // DELETE /api/accounts/:id  or  POST /api/accounts/:id/delete
+        const mDel = url.pathname.match(/^\/api\/accounts\/(account_[A-Za-z0-9]+)(\/delete)?$/);
+        if (mDel && (req.method === 'DELETE' || (req.method === 'POST' && mDel[2]))) {
+            const r = deleteAccountById(mDel[1]);
+            res.writeHead(r.error ? 400 : 200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(r)); return;
+        }
+
+        res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Unknown accounts endpoint' })); return;
     }
 
     const apiMode = url.pathname === '/v1/messages'
