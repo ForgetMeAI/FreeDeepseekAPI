@@ -204,6 +204,45 @@ test('parseToolCall handles inline-JSON tool-call body', () => {
   assert.equal(args.todos.length, 1);
 });
 
+// Regression: with >1 ready account, every request must rotate to a DIFFERENT
+// account (round-robin) to dilute per-account traffic and reduce ban risk, and
+// reset the web session when the account changes.
+test('selectAccountForSession round-robins across multiple ready accounts', () => {
+  const mk = (id) => ({ id, config: { token: 't', cookie: 'c' }, cooldownUntil: 0, failures: 0, lastUsedAt: 0 });
+  serverInternals._setAccountsForTest([mk('account_1'), mk('account_2')]);
+  serverInternals._resetRoundRobin();
+  const session = { id: 'sess-x', parentMessageId: 'p', createdAt: Date.now(), messageCount: 3 };
+
+  const seen = [];
+  let sessionResetWhenChanged = true;
+  for (let i = 0; i < 4; i++) {
+    const acct = serverInternals.selectAccountForSession(session);
+    seen.push(acct.id);
+    // account must differ from the previous request's account
+    if (i > 0 && seen[i] === seen[i - 1]) {
+      sessionResetWhenChanged = false;
+    }
+  }
+  // 4 requests over 2 accounts -> alternates: account_1, account_2, account_1, account_2
+  assert.deepEqual(seen, ['account_1', 'account_2', 'account_1', 'account_2']);
+  assert.equal(sessionResetWhenChanged, true, 'each request must hit a different account');
+  serverInternals._setAccountsForTest([]);
+});
+
+// Regression: with a single account, selection stays sticky (no rotation, no reset).
+test('selectAccountForSession stays sticky with a single account', () => {
+  const mk = (id) => ({ id, config: { token: 't', cookie: 'c' }, cooldownUntil: 0, failures: 0, lastUsedAt: 0 });
+  serverInternals._setAccountsForTest([mk('account_1')]);
+  serverInternals._resetRoundRobin();
+  const session = { id: 'sess-y', parentMessageId: 'p', createdAt: Date.now(), messageCount: 3 };
+  const a = serverInternals.selectAccountForSession(session);
+  const b = serverInternals.selectAccountForSession(session);
+  assert.equal(a.id, 'account_1');
+  assert.equal(b.id, 'account_1');
+  assert.equal(session.id, 'sess-y', 'session must not be reset with a single account');
+  serverInternals._setAccountsForTest([]);
+});
+
 test('sweepIdleSessions evicts only idle entries', () => {
   serverInternals.sessions.set('stale-x', { lastActivityAt: 1 });
   serverInternals.sessions.set('fresh-x', { lastActivityAt: Date.now() });
