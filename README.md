@@ -30,6 +30,28 @@ ForgetMeAI: https://t.me/forgetmeai
 
 ---
 
+## 🔧 Tool-call normalization patch (vendored)
+
+This fork/variant includes a vendored **tool-call normalizer** (`toolcall_normalizer.js`) that
+closes a gap in the upstream parser: DeepSeek Web emits native function calls as XML —
+
+```xml
+<tool_call name="todo_write">
+  <parameter name="todos">[{"id":"1","content":"...","status":"in_progress"}]</parameter>
+</tool_call>
+```
+
+— which the original `parseToolCall()` could not parse (it expected a JSON body).
+The normalizer runs as a FAST-PATH inside `parseToolCall()` and converts that native
+shape (plus strict-JSON / fenced-JSON / legacy `TOOL_CALL:` variants) into a clean
+OpenAI `tool_calls` payload.
+
+- **Upstream project (original author — please credit):** [ForgetMeAI/FreeDeepseekAPI](https://github.com/ForgetMeAI/FreeDeepseekAPI) by **ForgetMeAI** (`t.me/forgetmeai`), MIT.
+- **Companion normalizer:** [RC-ia/deepseek-toolcall-normalizer](https://github.com/RC-ia/deepseek-toolcall-normalizer) by **RC-ia**, MIT.
+- Tests cover the native XML shape (see `tests/unit.test.js`). Run `npm test`.
+
+---
+
 ## Навигация
 
 - [Что это даёт](#-что-это-даёт)

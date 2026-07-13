@@ -7,6 +7,7 @@ const { spawnSync } = require('node:child_process');
 
 const ROOT = path.resolve(__dirname, '..');
 const serverInternals = require('../server.js').__test;
+const { parseToolCall } = require('../server.js');
 
 function tmpdir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'fdsapi-test-'));
@@ -142,4 +143,37 @@ test('DeepSeek stream parser does not treat service content chunks as model erro
   assert.equal(serverInternals.isDeepSeekModelErrorEvent({ content: 'Official Reuters website URL' }), false);
   assert.equal(serverInternals.isDeepSeekModelErrorEvent({ finish_reason: 'stop' }), false);
   assert.equal(serverInternals.isDeepSeekModelErrorEvent({ type: 'error', content: 'backend error' }), true);
+});
+
+test('parseToolCall handles native DeepSeek Web XML <tool_call name=> with <parameter>', () => {
+  const text = `Vou começar.
+
+<tool_call name="todo_write">
+    <parameter name="todos">[{"id":"1","content":"Criar HTML base","status":"in_progress"},{"id":"2","content":"CSS","status":"pending"}]</parameter>
+</tool_call>`;
+  const tc = parseToolCall(text);
+  assert.ok(tc, 'should detect tool call');
+  assert.equal(tc.name, 'todo_write');
+  const args = JSON.parse(tc.arguments);
+  assert.ok(Array.isArray(args.todos), 'todos should be an array');
+  assert.equal(args.todos.length, 2);
+  assert.equal(args.todos[0].status, 'in_progress');
+});
+
+test('parseToolCall still returns null for plain text', () => {
+  assert.equal(parseToolCall('Just talking, no tool call here.'), null);
+});
+
+test('parseToolCall multi-parameter mixed types', () => {
+  const text = `<tool_call name="write_file">
+    <parameter name="path">/tmp/hi.py</parameter>
+    <parameter name="overwrite">true</parameter>
+    <parameter name="count">7</parameter>
+  </tool_call>`;
+  const tc = parseToolCall(text);
+  assert.equal(tc.name, 'write_file');
+  const args = JSON.parse(tc.arguments);
+  assert.equal(args.path, '/tmp/hi.py');
+  assert.equal(args.overwrite, true);
+  assert.equal(args.count, 7);
 });

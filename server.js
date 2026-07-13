@@ -17,6 +17,16 @@ const path = require('path');
 const readline = require('readline');
 const { spawnSync } = require('child_process');
 
+// Vendored companion normalizer (RC-ia/deepseek-toolcall-normalizer).
+// Closes the gap where DeepSeek Web emits native <tool_call name=><parameter>
+// XML that the original parseToolCall() could not parse. See toolcall_normalizer.js.
+let normalizeToolCall = null;
+try {
+    ({ normalizeToolCall } = require('./toolcall_normalizer.js'));
+} catch (e) {
+    console.log('[DS-API] toolcall_normalizer.js not found — native DeepSeek XML tool calls will be skipped.');
+}
+
 const SERVER_HOST = os.hostname();  // Dynamic hostname detection
 const SERVER_PUBLIC_IP = (() => {
     try {
@@ -612,6 +622,18 @@ function parseJsonToolCandidate(raw, label = 'json') {
 
 function parseToolCall(text) {
     if (!text || typeof text !== 'string') return null;
+
+    // FAST-PATH (vendored normalizer): DeepSeek Web emits native tool calls as
+    // <tool_call name="x"><parameter name="p">...</parameter></tool_call>.
+    // The legacy branches below treat that XML body as JSON and fail. If the
+    // normalizer recognizes a real tool call, prefer it and short-circuit.
+    if (normalizeToolCall) {
+        const norm = normalizeToolCall(text);
+        if (norm && norm.name) {
+            console.log(`[parseToolCall] SUCCESS normalized (native/companion): ${norm.name}`);
+            return { name: norm.name, arguments: typeof norm.arguments === 'string' ? norm.arguments : JSON.stringify(norm.arguments) };
+        }
+    }
 
     // XML-ish wrappers used by some agent prompts.
     const xmlMatch = text.match(/<tool_call[^>]*>([\s\S]*?)<\/tool_call>/i);
@@ -1616,4 +1638,6 @@ module.exports = {
         rebuildFragmentText,
         applyResponsePatchOperations,
     },
+    parseToolCall,
+    toolcallNormalizer: normalizeToolCall ? require('./toolcall_normalizer.js') : null,
 };
