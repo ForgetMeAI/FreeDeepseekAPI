@@ -177,3 +177,12 @@ test('parseToolCall multi-parameter mixed types', () => {
   assert.equal(args.overwrite, true);
   assert.equal(args.count, 7);
 });
+
+test('sweepIdleSessions evicts only idle entries', () => {
+  serverInternals.sessions.set('stale-x', { lastActivityAt: 1 });
+  serverInternals.sessions.set('fresh-x', { lastActivityAt: Date.now() });
+  serverInternals.sweepIdleSessions(60 * 1000);
+  assert.equal(serverInternals.sessions.has('stale-x'), false);
+  assert.equal(serverInternals.sessions.has('fresh-x'), true);
+  serverInternals.sessions.delete('fresh-x');
+});
