@@ -645,7 +645,12 @@ function parseToolCall(text) {
     if (normalizeToolCall) {
         const norm = normalizeToolCall(text);
         if (norm && norm.name) {
-            console.log(`[parseToolCall] SUCCESS normalized (native/companion): ${norm.name}`);
+            const argObj = typeof norm.arguments === 'string' ? safeParse(norm.arguments) : norm.arguments;
+            if (!argObj || Object.keys(argObj).length === 0) {
+                console.log(`[parseToolCall] WARN normalized (native/companion): ${norm.name} args EMPTY — raw text was: ${text.substring(0, 600).replace(/\n/g, '\\n')}`);
+            } else {
+                console.log(`[parseToolCall] SUCCESS normalized (native/companion): ${norm.name}`);
+            }
             return { name: norm.name, arguments: typeof norm.arguments === 'string' ? norm.arguments : JSON.stringify(norm.arguments) };
         }
     }

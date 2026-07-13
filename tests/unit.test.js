@@ -178,6 +178,32 @@ test('parseToolCall multi-parameter mixed types', () => {
   assert.equal(args.count, 7);
 });
 
+// Regression: DeepSeek Web emits <parameter name="todos" type="array"> with
+// extra type attribute — the normalizer must still extract the array (Qwen
+// Code's TodoWrite/TodoList requires `todos` to be an array, not empty).
+test('parseToolCall tolerates extra type attr on <parameter> and yields array', () => {
+  const text = `<tool_call name="todo_write">
+    <parameter name="todos" type="array">[{"id":"1","content":"Criar HTML base","status":"in_progress"},{"id":"2","content":"CSS","status":"pending"}]</parameter>
+  </tool_call>`;
+  const tc = parseToolCall(text);
+  assert.equal(tc.name, 'todo_write');
+  const args = JSON.parse(tc.arguments);
+  assert.ok(Array.isArray(args.todos), 'todos must be an array');
+  assert.equal(args.todos.length, 2);
+  assert.equal(args.todos[0].status, 'in_progress');
+});
+
+// Regression: tool-call body as inline JSON (no <parameter> children) must
+// also be parsed, not returned as empty args.
+test('parseToolCall handles inline-JSON tool-call body', () => {
+  const text = `<tool_call name="todo_write">{"todos":[{"id":"1","content":"X","status":"in_progress"}]}</tool_call>`;
+  const tc = parseToolCall(text);
+  assert.equal(tc.name, 'todo_write');
+  const args = JSON.parse(tc.arguments);
+  assert.ok(Array.isArray(args.todos), 'todos must be an array');
+  assert.equal(args.todos.length, 1);
+});
+
 test('sweepIdleSessions evicts only idle entries', () => {
   serverInternals.sessions.set('stale-x', { lastActivityAt: 1 });
   serverInternals.sessions.set('fresh-x', { lastActivityAt: Date.now() });
