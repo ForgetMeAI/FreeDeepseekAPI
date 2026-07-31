@@ -178,7 +178,7 @@ function buildBaseHeaders(config = DS_CONFIG) {
         "x-hif-leim": config.hif_leim || '',
         "Origin": "https://chat.deepseek.com",
         "Referer": "https://chat.deepseek.com/",
-        "Cookie": config.cookie || '',
+        "Cookie": config.cookie || "ds_cookie_preference=%7B%22level%22%3A%22all%22%7D;",
         "Content-Type": "application/json",
     };
 }
@@ -224,7 +224,7 @@ function loadDeepSeekConfig({ fatal = true } = {}) {
     }
     return false;
 }
-function hasAuthConfig() { return accounts.some(a => a.config.token && a.config.cookie); }
+function hasAuthConfig() { return accounts.some(a => a.config.token); }
 function accountStatus(account) {
     return {
         id: account.id,
@@ -246,9 +246,9 @@ function selectAccountForSession(session) {
         resetRemoteSession(session);
         session.accountId = null;
     }
-    const ready = accounts.filter(a => a.config.token && a.config.cookie && a.cooldownUntil <= now);
+    const ready = accounts.filter(a => a.config.token && a.cooldownUntil <= now);
     if (ready.length === 0) {
-        const waiting = accounts.filter(a => a.config.token && a.config.cookie).sort((a, b) => a.cooldownUntil - b.cooldownUntil)[0];
+        const waiting = accounts.filter(a => a.config.token).sort((a, b) => a.cooldownUntil - b.cooldownUntil)[0];
         if (waiting) {
             const waitSec = Math.max(1, Math.ceil((waiting.cooldownUntil - now) / 1000));
             // Tagged so the request handler returns 429 + Retry-After instead of a
@@ -1795,7 +1795,7 @@ const server = http.createServer(async (req, res) => {
     // one account can serve right now, so an aggregator/LB won't route to a cold pool.
     if (req.method === 'GET' && url.pathname === '/readyz') {
         const now = Date.now();
-        const ready = accounts.filter(a => a.config.token && a.config.cookie && a.cooldownUntil <= now).length;
+        const ready = accounts.filter(a => a.config.token && a.cooldownUntil <= now).length;
         res.writeHead(ready > 0 ? 200 : 503, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ready: ready > 0, ready_accounts: ready, total_accounts: accounts.length }));
         return;
@@ -1960,6 +1960,13 @@ const server = http.createServer(async (req, res) => {
 
             const session = getOrCreateAgentSession(agentId);
             activeSession = session;
+
+            // Auto-reset DeepSeek web session if client starts a new conversation (no assistant turns yet)
+            const hasAssistantTurns = messages.some(m => m && m.role === "assistant");
+            if (!hasAssistantTurns && session.id) {
+                console.log(`${agentTag} New conversation payload detected (no assistant turns); resetting remote session.`);
+                resetRemoteSession(session);
+            }
 
             // Roll over TTL/depth-limited sessions before deciding whether to
             // inject local recovery history into the newly built prompt.
