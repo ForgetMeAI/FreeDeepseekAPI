@@ -1962,7 +1962,14 @@ const server = http.createServer(async (req, res) => {
             activeSession = session;
 
             // Auto-reset DeepSeek web session if client starts a new conversation (no assistant turns yet)
-            const hasAssistantTurns = messages.some(m => m && m.role === "assistant");
+            const isTitleRequest = /generate\\s+(?:a\\s+)?(?:short\\s+)?title/i.test(lastUserText) || /title for this conversation/i.test(lastUserText);
+            if (!isTitleRequest) {
+                const hasAssistantTurns = messages.some(m => m && m.role === "assistant");
+                if (!hasAssistantTurns && session.id) {
+                    console.log(`${agentTag} New conversation payload detected; resetting remote session.`);
+                    resetRemoteSession(session);
+                }
+            }
             if (!hasAssistantTurns && session.id) {
                 console.log(`${agentTag} New conversation payload detected (no assistant turns); resetting remote session.`);
                 resetRemoteSession(session);
