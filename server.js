@@ -244,6 +244,7 @@ function selectAccountForSession(session) {
         // If that account disappeared, lost credentials, or is cooling down,
         // never reuse its session id under a different account.
         resetRemoteSession(session);
+                    session.history = [];
         session.accountId = null;
     }
     const ready = accounts.filter(a => a.config.token && a.cooldownUntil <= now);
@@ -614,6 +615,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
         if (resp.status === 400 || resp.status === 404 || resp.status === 500) {
             console.log(`${agentTag} Session ${session.id} expired. Creating new session...`);
             resetRemoteSession(session);
+                    session.history = [];
 
             const sr2 = await dsFetch('https://chat.deepseek.com/api/v0/chat_session/create', {
                 method: 'POST', headers: dsHeaders, body: '{}'
@@ -1968,11 +1970,13 @@ const server = http.createServer(async (req, res) => {
                 if (!hasAssistantTurns && session.id) {
                     console.log(`${agentTag} New conversation payload detected; resetting remote session.`);
                     resetRemoteSession(session);
+                    session.history = [];
                 }
             }
             if (!hasAssistantTurns && session.id) {
                 console.log(`${agentTag} New conversation payload detected (no assistant turns); resetting remote session.`);
                 resetRemoteSession(session);
+                    session.history = [];
             }
 
             // Roll over TTL/depth-limited sessions before deciding whether to
@@ -2136,6 +2140,7 @@ const server = http.createServer(async (req, res) => {
                 const reason = contextTooLong ? 'context-too-long response' : 'empty response';
                 console.log(`${agentTag} ${reason} (msg#${session.messageCount}, retry ${retryAttempt}/${MAX_EMPTY_RETRIES}, prompt=${retryPrompt.length} chars). Resetting session...`);
                 resetRemoteSession(session);
+                    session.history = [];
                 // Brief delay before retry to let DeepSeek breathe
                 await new Promise(r => setTimeout(r, Math.min(500 * retryAttempt, 1500)));
                 const { resp: retryResp } = await askDeepSeekStream(retryPrompt, agentId, requestedModel);
@@ -2157,6 +2162,7 @@ const server = http.createServer(async (req, res) => {
                 const timedOut = deadlineHit();
                 const failureClass = classifyRecoveryFailure(modelError, timedOut);
                 const failure = resetRemoteSession(session);
+                    session.history = [];
                 const errorType = failureClass.type;
                 const errorMessage = modelError?.content
                     || (timedOut
@@ -2211,6 +2217,7 @@ const server = http.createServer(async (req, res) => {
                 if (!isContinuationRecoverySafe(contBeforeId, continuationCall)) {
                     console.log(`${agentTag} continuation rotated to ${contAccount.id} ≠ ${contBeforeId} — skipping (foreign session)`);
                     resetRemoteSession(session);
+                    session.history = [];
                     break;
                 }
                 const contResult = await readDeepSeekResponse(contResp.body);
@@ -2241,6 +2248,7 @@ const server = http.createServer(async (req, res) => {
             if (allowedToolNames.size > 0 && !toolCall && looksLikeToolCallMarkup(fullContent) && !clientGone && !deadlineHit()) {
                 console.log(`${agentTag} Tool-call markup detected but invalid/truncated (${fullContent.length} chars). Retrying with stricter prompt...`);
                 resetRemoteSession(session);
+                    session.history = [];
                 await new Promise(r => setTimeout(r, 1000));
                 const strictPrompt = appendPromptInstruction(
                     freshPromptBuild.prompt,
@@ -2265,6 +2273,7 @@ const server = http.createServer(async (req, res) => {
 
             if (allowedToolNames.size > 0 && !toolCall && looksLikeToolCallMarkup(fullContent)) {
                 const failure = resetRemoteSession(session);
+                    session.history = [];
                 res.writeHead(502, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: {
                     message: 'DeepSeek returned malformed tool-call markup after one repair attempt',
