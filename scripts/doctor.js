@@ -26,7 +26,7 @@ function checkAuthFile(file) {
   try { auth = JSON.parse(fs.readFileSync(file, 'utf8')); }
   catch (e) { return { file, ok: false, issues: [`invalid JSON: ${e.message}`], auth: null }; }
   if (!auth.token) issues.push('token missing');
-  if (!auth.cookie) issues.push('cookie missing');
+  // cookie optional
   if (!auth.wasmUrl) issues.push('wasmUrl missing');
   if (process.platform !== 'win32') {
     const mode = fs.statSync(file).mode & 0o777;

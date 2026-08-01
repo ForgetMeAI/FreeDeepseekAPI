@@ -178,7 +178,7 @@ function buildBaseHeaders(config = DS_CONFIG) {
         "x-hif-leim": config.hif_leim || '',
         "Origin": "https://chat.deepseek.com",
         "Referer": "https://chat.deepseek.com/",
-        "Cookie": config.cookie || '',
+        "Cookie": config.cookie || "ds_cookie_preference=%7B%22level%22%3A%22all%22%7D;",
         "Content-Type": "application/json",
     };
 }
@@ -224,7 +224,7 @@ function loadDeepSeekConfig({ fatal = true } = {}) {
     }
     return false;
 }
-function hasAuthConfig() { return accounts.some(a => a.config.token && a.config.cookie); }
+function hasAuthConfig() { return accounts.some(a => a.config.token); }
 function accountStatus(account) {
     return {
         id: account.id,
@@ -244,11 +244,12 @@ function selectAccountForSession(session) {
         // If that account disappeared, lost credentials, or is cooling down,
         // never reuse its session id under a different account.
         resetRemoteSession(session);
+                    session.history = [];
         session.accountId = null;
     }
-    const ready = accounts.filter(a => a.config.token && a.config.cookie && a.cooldownUntil <= now);
+    const ready = accounts.filter(a => a.config.token && a.cooldownUntil <= now);
     if (ready.length === 0) {
-        const waiting = accounts.filter(a => a.config.token && a.config.cookie).sort((a, b) => a.cooldownUntil - b.cooldownUntil)[0];
+        const waiting = accounts.filter(a => a.config.token).sort((a, b) => a.cooldownUntil - b.cooldownUntil)[0];
         if (waiting) {
             const waitSec = Math.max(1, Math.ceil((waiting.cooldownUntil - now) / 1000));
             // Tagged so the request handler returns 429 + Retry-After instead of a
@@ -614,6 +615,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
         if (resp.status === 400 || resp.status === 404 || resp.status === 500) {
             console.log(`${agentTag} Session ${session.id} expired. Creating new session...`);
             resetRemoteSession(session);
+                    session.history = [];
 
             const sr2 = await dsFetch('https://chat.deepseek.com/api/v0/chat_session/create', {
                 method: 'POST', headers: dsHeaders, body: '{}'
@@ -1795,7 +1797,7 @@ const server = http.createServer(async (req, res) => {
     // one account can serve right now, so an aggregator/LB won't route to a cold pool.
     if (req.method === 'GET' && url.pathname === '/readyz') {
         const now = Date.now();
-        const ready = accounts.filter(a => a.config.token && a.config.cookie && a.cooldownUntil <= now).length;
+        const ready = accounts.filter(a => a.config.token && a.cooldownUntil <= now).length;
         res.writeHead(ready > 0 ? 200 : 503, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ready: ready > 0, ready_accounts: ready, total_accounts: accounts.length }));
         return;
@@ -1961,6 +1963,22 @@ const server = http.createServer(async (req, res) => {
             const session = getOrCreateAgentSession(agentId);
             activeSession = session;
 
+            // Auto-reset DeepSeek web session if client starts a new conversation (no assistant turns yet)
+            const isTitleRequest = /generate\\s+(?:a\\s+)?(?:short\\s+)?title/i.test(lastUserText) || /title for this conversation/i.test(lastUserText);
+            if (!isTitleRequest) {
+                const hasAssistantTurns = messages.some(m => m && m.role === "assistant");
+                if (!hasAssistantTurns && session.id) {
+                    console.log(`${agentTag} New conversation payload detected; resetting remote session.`);
+                    resetRemoteSession(session);
+                    session.history = [];
+                }
+            }
+            if (!hasAssistantTurns && session.id) {
+                console.log(`${agentTag} New conversation payload detected (no assistant turns); resetting remote session.`);
+                resetRemoteSession(session);
+                    session.history = [];
+            }
+
             // Roll over TTL/depth-limited sessions before deciding whether to
             // inject local recovery history into the newly built prompt.
             const promptRollover = prepareSessionForPrompt(session);
@@ -2122,6 +2140,7 @@ const server = http.createServer(async (req, res) => {
                 const reason = contextTooLong ? 'context-too-long response' : 'empty response';
                 console.log(`${agentTag} ${reason} (msg#${session.messageCount}, retry ${retryAttempt}/${MAX_EMPTY_RETRIES}, prompt=${retryPrompt.length} chars). Resetting session...`);
                 resetRemoteSession(session);
+                    session.history = [];
                 // Brief delay before retry to let DeepSeek breathe
                 await new Promise(r => setTimeout(r, Math.min(500 * retryAttempt, 1500)));
                 const { resp: retryResp } = await askDeepSeekStream(retryPrompt, agentId, requestedModel);
@@ -2143,6 +2162,7 @@ const server = http.createServer(async (req, res) => {
                 const timedOut = deadlineHit();
                 const failureClass = classifyRecoveryFailure(modelError, timedOut);
                 const failure = resetRemoteSession(session);
+                    session.history = [];
                 const errorType = failureClass.type;
                 const errorMessage = modelError?.content
                     || (timedOut
@@ -2197,6 +2217,7 @@ const server = http.createServer(async (req, res) => {
                 if (!isContinuationRecoverySafe(contBeforeId, continuationCall)) {
                     console.log(`${agentTag} continuation rotated to ${contAccount.id} ≠ ${contBeforeId} — skipping (foreign session)`);
                     resetRemoteSession(session);
+                    session.history = [];
                     break;
                 }
                 const contResult = await readDeepSeekResponse(contResp.body);
@@ -2227,6 +2248,7 @@ const server = http.createServer(async (req, res) => {
             if (allowedToolNames.size > 0 && !toolCall && looksLikeToolCallMarkup(fullContent) && !clientGone && !deadlineHit()) {
                 console.log(`${agentTag} Tool-call markup detected but invalid/truncated (${fullContent.length} chars). Retrying with stricter prompt...`);
                 resetRemoteSession(session);
+                    session.history = [];
                 await new Promise(r => setTimeout(r, 1000));
                 const strictPrompt = appendPromptInstruction(
                     freshPromptBuild.prompt,
@@ -2251,6 +2273,7 @@ const server = http.createServer(async (req, res) => {
 
             if (allowedToolNames.size > 0 && !toolCall && looksLikeToolCallMarkup(fullContent)) {
                 const failure = resetRemoteSession(session);
+                    session.history = [];
                 res.writeHead(502, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: {
                     message: 'DeepSeek returned malformed tool-call markup after one repair attempt',
