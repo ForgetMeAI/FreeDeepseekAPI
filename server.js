@@ -1898,6 +1898,9 @@ const server = http.createServer(async (req, res) => {
             const messages = params.messages || [];
             const tools = params.tools || [];
             const stream = params.stream === true;
+            // For tool-less chat we can stream real content deltas to OpenAI clients.
+            // If tools are requested, we currently buffer the full response to parse tool-call markup.
+            const realOpenAITextStream = stream && apiMode === 'openai' && tools.length === 0;
             const requestedModel = String(params.model || 'deepseek-chat').toLowerCase();
             if (!isKnownModel(requestedModel)) {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -1985,6 +1988,34 @@ const server = http.createServer(async (req, res) => {
                 console.log(`${agentTag} Compacted upstream prompt ${promptBuild.originalChars} -> ${promptBuild.promptChars} chars${promptBuild.historyDropped ? ' (recovery history dropped)' : ''}`);
             }
 
+            let openaiStreamMeta = null;
+            const sendOpenAIStreamDelta = realOpenAITextStream
+                ? (contentDelta) => {
+                    if (clientGone) return;
+                    const payload = {
+                        id: openaiStreamMeta.id,
+                        object: 'chat.completion.chunk',
+                        created: openaiStreamMeta.created,
+                        model: openaiStreamMeta.model,
+                        choices: [{
+                            index: 0,
+                            delta: { content: contentDelta },
+                            finish_reason: null,
+                        }],
+                    };
+                    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+                }
+                : null;
+
+            if (realOpenAITextStream) {
+                openaiStreamMeta = {
+                    id: 'ds-' + Date.now(),
+                    created: Math.floor(Date.now() / 1000),
+                    model: requestedModel,
+                };
+                res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
+            }
+
             const startTime = Date.now();
             const initialCall = await askDeepSeekStream(fullPrompt, agentId, requestedModel, freshPromptBuild.prompt);
             const dsResp = initialCall.resp;
@@ -1997,7 +2028,7 @@ const server = http.createServer(async (req, res) => {
             }
 
             // Process streaming response from DeepSeek — returns { content, reasoningContent, messageId, finishReason }
-            async function readDeepSeekResponse(readable) {
+            async function readDeepSeekResponse(readable, onContentDelta) {
                 let buffer = '';
                 let lastPath = null;
                 const fragments = [];
@@ -2014,11 +2045,37 @@ const server = http.createServer(async (req, res) => {
                 };
 
                 const appendFragments = (value) => {
+                    const previousContent = fullContent;
                     const incoming = Array.isArray(value) ? value : [value];
                     for (const fragment of incoming) {
                         if (fragment && typeof fragment === 'object') fragments.push({ ...fragment });
                     }
                     rebuildFragmentState();
+                    if (!onContentDelta) return;
+                    if (!previousContent) {
+                        if (fullContent) onContentDelta(fullContent);
+                        return;
+                    }
+                    if (fullContent.startsWith(previousContent)) {
+                        const appended = fullContent.slice(previousContent.length);
+                        if (appended) onContentDelta(appended);
+                    }
+                };
+
+                const syncSnapshotContent = (snapshotContent) => {
+                    const nextContent = String(snapshotContent || '');
+                    if (!nextContent) return;
+                    const previousContent = fullContent;
+                    fullContent = nextContent;
+                    if (!onContentDelta) return;
+                    if (!previousContent) {
+                        onContentDelta(nextContent);
+                        return;
+                    }
+                    if (nextContent.startsWith(previousContent)) {
+                        const appended = nextContent.slice(previousContent.length);
+                        if (appended) onContentDelta(appended);
+                    }
                 };
 
                 const decoder = new TextDecoder();  // one instance: preserves multi-byte (Cyrillic/emoji) split across chunks
@@ -2043,7 +2100,7 @@ const server = http.createServer(async (req, res) => {
                                         newMessageId = d.v.response.message_id;
                                     }
                                     if (d.v.response.content !== undefined) {
-                                        fullContent = d.v.response.content;
+                                        syncSnapshotContent(d.v.response.content);
                                     }
                                     if (Array.isArray(d.v.response.fragments)) {
                                         fragments.length = 0;
@@ -2062,12 +2119,16 @@ const server = http.createServer(async (req, res) => {
                                 if (lastPath === 'response/fragments/-1/content' && d.v !== undefined && typeof d.v !== 'object') {
                                     if (fragments.length > 0) {
                                         const lastFragment = fragments[fragments.length - 1];
-                                        lastFragment.content = `${lastFragment.content || ''}${d.v}`;
+                                        const deltaText = String(d.v);
+                                        lastFragment.content = `${lastFragment.content || ''}${deltaText}`;
+                                        if (onContentDelta) onContentDelta(deltaText);
                                         rebuildFragmentState();
                                     }
                                 }
                                 if (lastPath === 'response/content' && d.v !== undefined && typeof d.v !== 'object') {
-                                    fullContent += d.v;
+                                    const deltaText = String(d.v);
+                                    fullContent += deltaText;
+                                    if (onContentDelta) onContentDelta(deltaText);
                                 }
                                 if (lastPath === 'response/finish_reason' && d.v !== undefined) {
                                     finishReason = d.v;
@@ -2090,7 +2151,7 @@ const server = http.createServer(async (req, res) => {
                 return { content: fullContent, reasoningContent, messageId: newMessageId, finishReason, modelError };
             }
 
-            let { content: fullContent, reasoningContent, finishReason, modelError } = await readDeepSeekResponse(dsResp.body);
+            let { content: fullContent, reasoningContent, finishReason, modelError } = await readDeepSeekResponse(dsResp.body, sendOpenAIStreamDelta);
             fullContent = sanitizeContent(fullContent);
             reasoningContent = sanitizeContent(reasoningContent || '');
             const elapsed = Date.now() - startTime;
@@ -2125,7 +2186,7 @@ const server = http.createServer(async (req, res) => {
                 // Brief delay before retry to let DeepSeek breathe
                 await new Promise(r => setTimeout(r, Math.min(500 * retryAttempt, 1500)));
                 const { resp: retryResp } = await askDeepSeekStream(retryPrompt, agentId, requestedModel);
-                const retryResult = await readDeepSeekResponse(retryResp.body);
+                const retryResult = await readDeepSeekResponse(retryResp.body, sendOpenAIStreamDelta);
                 const retryState = normalizeRetryResponse(retryResult);
                 fullPrompt = retryPrompt;
                 modelError = retryState.modelError;
@@ -2199,7 +2260,7 @@ const server = http.createServer(async (req, res) => {
                     resetRemoteSession(session);
                     break;
                 }
-                const contResult = await readDeepSeekResponse(contResp.body);
+                const contResult = await readDeepSeekResponse(contResp.body, sendOpenAIStreamDelta);
                 const contContent = contResult && contResult.content ? sanitizeContent(contResult.content) : '';
                 const contReasoning = contResult && contResult.reasoningContent ? sanitizeContent(contResult.reasoningContent) : '';
                 if (contContent && contContent.trim().length > 0 && !contContent.includes('I am an AI')) {
@@ -2233,7 +2294,7 @@ const server = http.createServer(async (req, res) => {
                     '[STRICT INSTRUCTION] Your previous response contained incomplete tool-call markup. Keep arguments short and output ONLY strict JSON: {"tool_call":{"name":"<function>","arguments":{...}}}'
                 );
                 const { resp: retryResp2 } = await askDeepSeekStream(strictPrompt, agentId, requestedModel);
-                const retryResult2 = await readDeepSeekResponse(retryResp2.body);
+                const retryResult2 = await readDeepSeekResponse(retryResp2.body, sendOpenAIStreamDelta);
                 const retryContent2 = retryResult2 && retryResult2.content ? sanitizeContent(retryResult2.content) : '';
                 if (retryContent2 && retryContent2.trim()) {
                     const retryTc = parseToolCall(retryContent2);
@@ -2279,6 +2340,30 @@ const server = http.createServer(async (req, res) => {
             }
 
             storeHistory(agentId, prompt, fullContent, toolCall);
+
+            if (stream && realOpenAITextStream && apiMode === 'openai') {
+                // Real streaming mode: we already emitted content deltas while reading
+                // DeepSeek response. Finish the OpenAI SSE stream now.
+                if (!clientGone && openaiStreamMeta) {
+                    const finalFinish = finishReason === 'length' ? 'length' : 'stop';
+                    const payload = {
+                        id: openaiStreamMeta.id,
+                        object: 'chat.completion.chunk',
+                        created: openaiStreamMeta.created,
+                        model: openaiStreamMeta.model,
+                        choices: [{
+                            index: 0,
+                            delta: {},
+                            finish_reason: finalFinish,
+                        }],
+                    };
+                    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+                    res.write('data: [DONE]\n\n');
+                    res.end();
+                }
+                console.log(`${agentTag} Streamed ${apiMode} (real text stream) in ${elapsed}ms`);
+                return;
+            }
 
             const openaiResponse = toolCall
                 ? buildToolCallResponse(toolCall, requestedModel, clientPromptText, reasoningContent)

@@ -21,6 +21,20 @@ const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 
+// Node.js в этой среде не предоставляет глобальный WebSocket.
+// Используем ws-пакет (нужно установить `npm i ws`).
+const WebSocket =
+    globalThis.WebSocket ||
+    (() => {
+        try {
+            return require('ws');
+        } catch {
+            throw new Error(
+                'WebSocket is not defined. Install dependency "ws" (run: npm i ws) to use deepseek_chrome_auth.js.',
+            );
+        }
+    })();
+
 const repoRoot = path.resolve(__dirname, '..');
 const qwenRepoRoot = path.resolve(repoRoot, '..', 'FreeQwenApi');
 const profileDir =
