@@ -158,6 +158,25 @@ Steps:
 5. Call `wasm_solve()` — returns answer on success or 0 on failure
 6. Pack `{algorithm, challenge, salt, answer, signature, target_path}` into base64
 
+### 2.5 Edit Message (edit session mode)
+
+When `DEEPSEEK_SESSION_MODE=edit`, the proxy calls:
+
+```
+POST https://chat.deepseek.com/api/v0/chat/edit_message
+
+Body:
+{
+  "chat_session_id": "uuid",
+  "message_id": 1,
+  "prompt": "<full conversation text>",
+  "thinking_enabled": false,
+  "search_enabled": false
+}
+```
+
+PoW `target_path` is `/api/v0/chat/edit_message`. The same user message is rewritten on every turn; DeepSeek does not accumulate a message tree. If edit fails after session recreate, the proxy falls back to chain completion for that request.
+
 ---
 
 ## 3. Proxy Endpoints
@@ -438,9 +457,10 @@ The proxy uses `user` from the request body. If not set, it falls back to the cl
 ```javascript
 {
   id: "uuid",                    // DeepSeek web session ID
-  parentMessageId: <int|null>,   // Last message ID for threading
+  parentMessageId: <int|null>,   // Last message ID for threading (chain mode)
+  editMessageId: <int|null>,     // Fixed user message edited in edit mode (default 1)
   createdAt: <timestamp>,        // Session creation time
-  messageCount: 0-100,           // Messages in this session
+  messageCount: 0-100,           // Turn count; depth cap applies only in chain mode
   history: [                     // Last 15 exchanges for context recovery
     { user: "...", assistant: "..." }
   ]
@@ -515,7 +535,7 @@ The parser traverses character by character tracking brace depth:
 
 | Condition | Action |
 |---|---|
-| Message count >= 100 | Auto-reset DeepSeek session, keep history buffer |
+| Message count >= 100 | Auto-reset DeepSeek session in **chain** mode only; edit mode keeps one message |
 | Session age > 2 hours | Auto-reset (DeepSeek web session TTL) |
 | HTTP 400/404/500 response | Reset and retry once |
 | Empty content response | Compact context, reset session, retry up to `DEEPSEEK_MAX_RETRIES` (default 2) |

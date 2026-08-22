@@ -147,14 +147,27 @@ test('chrome extension manifest only declares icon files that exist', () => {
   }
 });
 
-test('DeepSeek stream parser treats SEARCH fragments as assistant output', () => {
+test('DeepSeek stream parser treats SEARCH fragments as source cards, not assistant prose', () => {
   const rebuilt = serverInternals.rebuildFragmentText([
-    { type: 'SEARCH', content: 'The official Reuters website is ' },
-    { type: 'SEARCH', content: 'https://www.reuters.com/.' },
+    {
+      type: 'SEARCH',
+      content: null,
+      queries: [{ query: 'погода Москва' }],
+      results: [{ cite_index: 1, title: 'REGNUM', url: 'https://regnum.ru/news/4056823' }],
+    },
+    { type: 'RESPONSE', content: 'В Москве [citation:1].' },
   ]);
 
-  assert.equal(rebuilt.responseText, 'The official Reuters website is https://www.reuters.com/.');
+  assert.equal(rebuilt.responseText, 'В Москве [citation:1].');
   assert.equal(rebuilt.thinkText, '');
+  assert.equal(serverInternals.isSearchFragment({ type: 'SEARCH', content: null }), true);
+  assert.equal(serverInternals.isAssistantOutputFragment({ type: 'SEARCH', content: 'text' }), false);
+  assert.equal(
+    serverInternals.resolveSearchCitations('см. [citation:1]', [
+      { cite_index: 1, url: 'https://regnum.ru/news/4056823' },
+    ]),
+    'см. [1](https://regnum.ru/news/4056823)',
+  );
 });
 
 test('DeepSeek stream parser applies response-level fragment append patches', () => {
@@ -172,6 +185,131 @@ test('DeepSeek stream parser applies response-level fragment append patches', ()
   assert.equal(applied, true);
   assert.deepEqual(fragments, [{ type: 'RESPONSE', content: 'The' }]);
   assert.equal(serverInternals.rebuildFragmentText(fragments).responseText, 'The');
+});
+
+test('DeepSeek stream parser keeps metadata prefix so the first word and TOOL_CALL stay intact', () => {
+  const contentChunks = [];
+  const reasoningChunks = [];
+  const parser = serverInternals.createDeepSeekSseParser({
+    onContentDelta: (chunk) => contentChunks.push(chunk),
+    onReasoningDelta: (chunk) => reasoningChunks.push(chunk),
+  });
+
+  parser.ingest({
+    p: 'response/metadata',
+    v: { response: { message_id: 7, content: 'He' } },
+  });
+  parser.ingest({ p: 'response/content', v: 'llo world' });
+
+  assert.equal(parser.result().content, 'Hello world');
+  assert.equal(contentChunks.join(''), 'Hello world');
+  assert.equal(serverInternals.mergeDeepSeekSnapshotPrefix('TO', 'OL_CALL: terminal', ''), 'TOOL_CALL: terminal');
+});
+
+test('DeepSeek stream parser does not leak THINK into content and restores TOOL_CALL after reasoning', () => {
+  const contentChunks = [];
+  const reasoningChunks = [];
+  const parser = serverInternals.createDeepSeekSseParser({
+    onContentDelta: (chunk) => contentChunks.push(chunk),
+    onReasoningDelta: (chunk) => reasoningChunks.push(chunk),
+  });
+
+  parser.ingest({
+    p: 'response/metadata',
+    v: {
+      response: {
+        message_id: 8,
+        content: 'TO',
+        fragments: [{ type: 'THINK', content: '' }],
+      },
+    },
+  });
+  parser.ingest({ p: 'response/fragments/-1/content', v: 'I will look this up. ' });
+  parser.ingest({ p: 'response/fragments/-1/content', v: 'Then I call a tool.' });
+  parser.ingest({
+    p: 'response',
+    v: [{ p: 'fragments', o: 'APPEND', v: [{ type: 'RESPONSE', content: '' }] }],
+  });
+  parser.ingest({ p: 'response/fragments/-1/content', v: 'OL_CALL: terminal\narguments: {"command":"ls"}' });
+
+  const result = parser.result();
+  assert.equal(result.content, 'TOOL_CALL: terminal\narguments: {"command":"ls"}');
+  assert.equal(result.reasoningContent, 'I will look this up. Then I call a tool.');
+  assert.equal(contentChunks.join(''), result.content);
+  assert.equal(reasoningChunks.join(''), result.reasoningContent);
+  assert.equal(contentChunks.join('').includes('I will look'), false);
+  const parsed = serverInternals.parseToolCall(result.content);
+  assert.equal(parsed && parsed.name, 'terminal');
+});
+
+test('DeepSeek stream parser folds SEARCH results and citation masks into sources', () => {
+  const contentChunks = [];
+  const parser = serverInternals.createDeepSeekSseParser({
+    onContentDelta: (chunk) => contentChunks.push(chunk),
+  });
+
+  parser.ingest({
+    v: {
+      response: {
+        message_id: 2,
+        parent_id: 1,
+        role: 'ASSISTANT',
+        search_enabled: true,
+        search_triggered: true,
+        fragments: [{
+          id: 2,
+          type: 'SEARCH',
+          status: 'WIP',
+          content: null,
+          queries: [
+            { query: 'погода Москва 2026-08-22' },
+            { query: 'Moscow weather August 22 2026' },
+          ],
+          results: [],
+        }],
+      },
+    },
+  });
+  parser.ingest({
+    p: 'response/fragments/-1/results',
+    v: [
+      {
+        url: 'https://regnum.ru/news/4056823',
+        title: 'Гидрометцентр спрогнозировал до +25 градусов',
+        snippet: 'В Москве 22 августа температура днем поднимется до +25 градусов',
+        cite_index: 1,
+        site_name: 'ИА REGNUM',
+      },
+      {
+        url: 'https://www.m24.ru/news/22082026/933245',
+        title: 'Кратковременный дождь и до 25 градусов',
+        cite_index: 3,
+        site_name: 'Москва 24',
+      },
+    ],
+  });
+  parser.ingest({ p: 'response/fragments/-1/status', v: 'FINISHED' });
+  parser.ingest({
+    p: 'response',
+    o: 'BATCH',
+    v: [
+      { p: 'fragments', o: 'APPEND', v: [{ id: 3, type: 'RESPONSE', content: '##', references: [], stage_id: 2 }] },
+      { p: 'has_pending_fragment', o: 'SET', v: false },
+    ],
+  });
+  parser.ingest({ p: 'response/fragments/-1/content', o: 'APPEND', v: ' Погода в Москве' });
+  parser.ingest({ v: ' [citation:1]' });
+  parser.ingest({ v: ' и [citation:3].' });
+
+  const result = parser.result({ finalize: true });
+  assert.match(result.content, /## Погода в Москве \[1\]\(https:\/\/regnum\.ru\/news\/4056823\)/);
+  assert.match(result.content, /\[3\]\(https:\/\/www\.m24\.ru\/news\/22082026\/933245\)/);
+  assert.match(result.content, /Sources:/);
+  assert.match(result.content, /Гидрометцентр спрогнозировал до \+25 градусов/);
+  assert.equal(result.searchResults.length, 2);
+  assert.equal(result.messageId, 2);
+  assert.equal(contentChunks.join('').includes('[citation:1]'), false);
+  assert.equal(result.content.includes('null'), false);
 });
 
 test('DeepSeek stream parser does not treat service content chunks as model errors', () => {
@@ -430,6 +568,65 @@ test('parseToolCall rejects partially consumed DSML parameters and wrapper scope
   }
 });
 
+test('live content gate streams prose and withholds tool markup until parse', () => {
+  assert.equal(serverInternals.findToolMarkupIndex('Hello TOOL_CALL: shell'), 6);
+  const gated = serverInternals.applyLiveContentHoldback('', 'Hello TOOL_CALL: shell\narguments: {}', true);
+  assert.equal(gated.emit, 'Hello ');
+  assert.equal(gated.suppressed, true);
+  assert.match(gated.hold, /TOOL_CALL:/);
+
+  const gate = serverInternals.createLiveContentGate(true);
+  const first = gate.push('Sure, I can help. ');
+  assert.equal(first, ''); // held until holdback fills
+  const filler = 'x'.repeat(serverInternals.TOOL_STREAM_HOLDBACK_CHARS);
+  const streamed = gate.push(filler);
+  assert.match(streamed, /Sure, I can help/);
+  const beforeMarker = gate.push('TOOL_CALL: terminal\narguments: {"c":1}');
+  assert.equal(beforeMarker, filler); // previously held tail is safe and flushes
+  assert.equal(gate.isSuppressed(), true);
+  assert.equal(gate.flush(), '');
+});
+
+test('live content gate withholds the JSON envelope brace before tool_call', () => {
+  assert.equal(serverInternals.findToolMarkupIndex('{"tool_call":{"name":"x"}'), 0);
+  assert.equal(serverInternals.findToolMarkupIndex('Hello {"tool_call":'), 6);
+  assert.equal(serverInternals.findToolMarkupIndex('{\n  "tool_call":'), 0);
+
+  const jsonCall = serverInternals.applyLiveContentHoldback('', '{"tool_call":{"name":"terminal","arguments":{"c":1}}}', true);
+  assert.equal(jsonCall.emit, '');
+  assert.equal(jsonCall.suppressed, true);
+  assert.match(jsonCall.hold, /^\{/);
+
+  const gate = serverInternals.createLiveContentGate(true);
+  assert.equal(gate.push('{'), '');
+  assert.equal(gate.push('\n"tool_call": {"name":"terminal","arguments":{}}'), '');
+  assert.equal(gate.isSuppressed(), true);
+  assert.equal(gate.flush(), '');
+});
+
+test('live content gate without tools flushes immediately', () => {
+  const gate = serverInternals.createLiveContentGate(false);
+  assert.equal(gate.push('hello'), 'hello');
+  assert.equal(gate.flush(), '');
+});
+
+test('OpenAI tool-call stream deltas never mix assistant content with tool_calls', () => {
+  const deltas = serverInternals.buildOpenAIToolCallDeltas({
+    name: 'Shell',
+    arguments: '{"command":"ls"}',
+  });
+  assert.equal(deltas[0].role, 'assistant');
+  assert.equal(deltas[0].content, null);
+  assert.equal(Object.prototype.hasOwnProperty.call(deltas[0], 'tool_calls'), false);
+  assert.equal(deltas[1].tool_calls[0].index, 0);
+  assert.equal(deltas[1].tool_calls[0].type, 'function');
+  assert.equal(deltas[1].tool_calls[0].function.name, 'Shell');
+  assert.equal(deltas[1].tool_calls[0].function.arguments, '');
+  assert.equal(deltas[2].tool_calls[0].index, 0);
+  assert.equal(deltas[2].tool_calls[0].function.arguments, '{"command":"ls"}');
+  assert.equal(deltas.some(delta => typeof delta.content === 'string' && delta.content.length > 0), false);
+});
+
 test('tool schema compaction drops prose annotations but preserves validation shape', () => {
   const compact = serverInternals.compactToolSchema({
     type: 'object',
@@ -584,6 +781,7 @@ test('remote reset preserves local history and sticky account while returning fa
   });
   assert.equal(session.id, null);
   assert.equal(session.parentMessageId, null);
+  assert.equal(session.editMessageId, null);
   assert.equal(session.createdAt, null);
   assert.equal(session.messageCount, 0);
   assert.equal(session.accountId, 'account_2');
@@ -662,6 +860,68 @@ test('TTL and depth rollover happens before prompt construction and preserves re
   assert.equal(ttlReset.failedSessionId, 'old-session');
 });
 
+test('chain reuse sends only the latest user/tool turn; a new chat keeps the full transcript', () => {
+  const messages = [
+    { role: 'system', content: 'rules' },
+    { role: 'user', content: 'first question' },
+    { role: 'assistant', content: 'first answer' },
+    { role: 'user', content: 'follow up only' },
+  ];
+  const formatted = serverInternals.formatMessages(messages, []);
+  const delta = serverInternals.formatLatestTurn(messages);
+
+  assert.match(formatted.prompt, /first question/);
+  assert.match(formatted.prompt, /follow up only/);
+  assert.equal(delta, 'User: follow up only');
+  assert.doesNotMatch(delta, /first question/);
+  assert.equal(serverInternals.shouldSendFullConversation('chain', false), true);
+  assert.equal(serverInternals.shouldSendFullConversation('chain', true), false);
+  assert.equal(serverInternals.shouldSendFullConversation('edit', true), true);
+});
+
+test('chain reuse after a tool call sends only the new tool result', () => {
+  const delta = serverInternals.formatLatestTurn([
+    { role: 'user', content: 'run it' },
+    { role: 'assistant', tool_calls: [{ function: { name: 'terminal', arguments: '{"cmd":"ls"}' } }] },
+    { role: 'tool', content: 'file.txt' },
+  ]);
+  assert.match(delta, /\[Tool Result\]\nfile\.txt/);
+  assert.match(delta, /Continue the task/);
+  assert.doesNotMatch(delta, /run it/);
+});
+
+test('chain reuse keeps the tool adapter even when conversation history is omitted', () => {
+  const tools = [
+    { type: 'function', function: { name: 'terminal', description: 'run', parameters: { type: 'object' } } },
+  ];
+  const first = serverInternals.resolveUpstreamSystemPrompt({
+    sendFullConversation: true,
+    systemPrompt: 'rules' + serverInternals.formatToolDefinitions(tools),
+    tools,
+    toolsAdapterSent: false,
+  });
+  assert.match(first.systemForUpstream, /TOOL REQUEST SYSTEM/);
+  assert.equal(first.toolsAdapterIncluded, true);
+
+  const reuse = serverInternals.resolveUpstreamSystemPrompt({
+    sendFullConversation: false,
+    systemPrompt: first.systemForUpstream,
+    tools,
+    toolsAdapterSent: true,
+  });
+  assert.equal(reuse.systemForUpstream, '');
+  assert.equal(reuse.toolsAdapterIncluded, false);
+
+  const lateTools = serverInternals.resolveUpstreamSystemPrompt({
+    sendFullConversation: false,
+    systemPrompt: '',
+    tools,
+    toolsAdapterSent: false,
+  });
+  assert.match(lateTools.systemForUpstream, /TOOL REQUEST SYSTEM/);
+  assert.equal(lateTools.toolsAdapterIncluded, true);
+});
+
 test('tool results use the global prompt cap instead of an unconditional 8k truncation', () => {
   const toolResult = `RESULT_START\n${'z'.repeat(12000)}\nRESULT_END`;
   const formatted = serverInternals.formatMessages([
@@ -732,4 +992,164 @@ test('stream helpers preserve the request-level exact CORS origin', () => {
     send(res, response);
     assert.equal(Object.hasOwn(writeHeadHeaders, 'Access-Control-Allow-Origin'), false);
   }
+});
+
+test('normalizeSessionMode accepts edit and defaults unknown values to chain', () => {
+  assert.equal(serverInternals.normalizeSessionMode('edit'), 'edit');
+  assert.equal(serverInternals.normalizeSessionMode('EDIT'), 'edit');
+  assert.equal(serverInternals.normalizeSessionMode('chain'), 'chain');
+  assert.equal(serverInternals.normalizeSessionMode(''), 'chain');
+  assert.equal(serverInternals.normalizeSessionMode('unknown'), 'chain');
+});
+
+test('resolveSessionModeChoice maps menu answers 1/2 and rejects invalid input', () => {
+  assert.equal(serverInternals.resolveSessionModeChoice(''), 'chain');
+  assert.equal(serverInternals.resolveSessionModeChoice('1'), 'chain');
+  assert.equal(serverInternals.resolveSessionModeChoice('2'), 'edit');
+  assert.equal(serverInternals.resolveSessionModeChoice('edit'), 'edit');
+  assert.equal(serverInternals.resolveSessionModeChoice('chain'), 'chain');
+  assert.equal(serverInternals.resolveSessionModeChoice('', 'edit'), 'edit');
+  assert.equal(serverInternals.resolveSessionModeChoice('9'), null);
+});
+
+test('client request log redacts bearer tokens and summarizes messages', () => {
+  assert.equal(serverInternals.shouldLogClientRequest({}), true);
+  assert.equal(serverInternals.shouldLogClientRequest({ DEEPSEEK_LOG_CLIENT_REQUEST: '0' }), false);
+  assert.equal(serverInternals.shouldLogClientRequest({ DEEPSEEK_LOG_CLIENT_REQUEST: 'full' }), true);
+  assert.equal(serverInternals.sanitizeRequestHeaders({
+    authorization: 'Bearer secret-token',
+    'x-session-id': 'abc',
+    'x-session-affinity': 'sticky-1',
+  }).authorization, 'Bearer ***');
+
+  const log = serverInternals.buildClientRequestLog(
+    {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer secret-token',
+        'x-agent-session': 'dev-agent',
+        'x-session-id': 'sess-42',
+        'x-session-affinity': 'aff-7',
+        'content-type': 'application/json',
+      },
+    },
+    new URL('http://localhost:9655/v1/chat/completions'),
+    'openai',
+    {
+      model: 'deepseek-chat',
+      stream: true,
+      messages: [
+        { role: 'system', content: 'be helpful' },
+        { role: 'user', content: 'hello world' },
+      ],
+      tools: [{ type: 'function', function: { name: 'terminal' } }],
+    },
+  );
+
+  assert.equal(log.model, 'deepseek-chat');
+  assert.equal(log.messages_count, 2);
+  assert.deepEqual(log.tool_names, ['terminal']);
+  assert.equal(log.headers.authorization, 'Bearer ***');
+  assert.equal(log.headers['x-session-id'], 'sess-42');
+  assert.equal(log.headers['x-session-affinity'], 'aff-7');
+  assert.ok(log.header_names.includes('x-session-id'));
+  assert.equal(log.resolved_session_key, 'dev-agent');
+  assert.equal(log.messages[1].content_preview, 'hello world');
+  assert.equal(Object.hasOwn(log, 'raw_body'), false);
+});
+
+test('resolveRequestedSessionKey prefers session headers including X-Session-Id', () => {
+  assert.equal(serverInternals.resolveRequestedSessionKey({
+    headers: { 'x-session-id': 'from-header' },
+  }, { user: 'from-body' }), 'from-header');
+  assert.equal(serverInternals.resolveRequestedSessionKey({
+    headers: { 'x-session-affinity': 'affinity-only' },
+  }, {}), 'affinity-only');
+  assert.equal(serverInternals.resolveRequestedSessionKey({
+    headers: {},
+  }, { session: 'body-session' }), 'body-session');
+});
+
+test('CORS allow-headers reflects preflight request headers', () => {
+  const headers = new Map();
+  const response = { setHeader: (name, value) => headers.set(name, value) };
+  serverInternals.setCorsResponseHeaders(response, {
+    headers: { 'access-control-request-headers': 'x-session-id, content-type' },
+  });
+  assert.equal(headers.get('Access-Control-Allow-Headers'), 'x-session-id, content-type');
+});
+
+test('resolveHistoryPrefix keeps recovery context in edit mode for single-turn clients', () => {
+  const recovery = '[Previous conversation]\nUser: old\nAssistant: answer\n\n[Continue from here]\n\n';
+  const singleTurn = [{ role: 'user', content: 'next' }];
+  const multiTurn = [
+    { role: 'user', content: 'hello' },
+    { role: 'assistant', content: 'hi' },
+    { role: 'user', content: 'next' },
+  ];
+
+  assert.equal(serverInternals.resolveHistoryPrefix('chain', 'session-1', singleTurn, recovery), '');
+  assert.equal(serverInternals.resolveHistoryPrefix('edit', 'session-1', singleTurn, recovery), recovery);
+  assert.equal(serverInternals.resolveHistoryPrefix('edit', 'session-1', multiTurn, recovery), '');
+  assert.equal(serverInternals.resolveHistoryPrefix('chain', null, singleTurn, recovery), recovery);
+});
+
+test('edit mode skips max_message_depth rollover but still honors TTL', () => {
+  const deepSession = serverInternals.createSession();
+  deepSession.id = 'deep-session';
+  deepSession.messageCount = 100;
+  assert.equal(serverInternals.prepareSessionForPrompt(deepSession, Date.now(), 'edit'), null);
+  assert.equal(deepSession.id, 'deep-session');
+
+  const now = Date.now();
+  const ttlSession = serverInternals.createSession();
+  ttlSession.id = 'old-session';
+  ttlSession.createdAt = now - (2 * 60 * 60 * 1000) - 1;
+  const ttlReset = serverInternals.prepareSessionForPrompt(ttlSession, now, 'edit');
+  assert.equal(ttlReset.reason, 'session_ttl');
+  assert.equal(ttlSession.id, null);
+});
+
+test('recordUpstreamTurn tracks edit anchor or chain parent without growing both', () => {
+  const session = serverInternals.createSession();
+  session.id = 'remote';
+
+  serverInternals.recordUpstreamTurn(session, 'edit', 42, true);
+  assert.equal(session.editReady, true);
+  assert.equal(session.editMessageId, serverInternals.DEFAULT_EDIT_MESSAGE_ID);
+  assert.equal(session.parentMessageId, 42);
+  assert.equal(session.messageCount, 1);
+
+  serverInternals.recordUpstreamTurn(session, 'edit', 99, false);
+  assert.equal(session.editMessageId, serverInternals.DEFAULT_EDIT_MESSAGE_ID);
+  assert.equal(session.messageCount, 2);
+
+  const chainSession = serverInternals.createSession();
+  serverInternals.recordUpstreamTurn(chainSession, 'chain', 7, false);
+  assert.equal(chainSession.parentMessageId, 7);
+  assert.equal(chainSession.editMessageId, null);
+  assert.equal(chainSession.editReady, false);
+  assert.equal(chainSession.messageCount, 1);
+});
+
+test('shouldUseEditUpstream requires a bootstrapped edit session', () => {
+  const session = serverInternals.createSession();
+  session.id = 'remote';
+  assert.equal(serverInternals.shouldUseEditUpstream('edit', session, {}), false);
+  serverInternals.markEditSessionReady(session);
+  assert.equal(serverInternals.shouldUseEditUpstream('edit', session, {}), true);
+  assert.equal(serverInternals.shouldUseEditUpstream('edit', session, { forceChain: true }), false);
+  assert.equal(serverInternals.shouldUseEditUpstream('chain', session, {}), false);
+});
+
+test('resetRemoteSession clears edit anchor state', () => {
+  const session = serverInternals.createSession();
+  session.id = 'remote';
+  session.editMessageId = serverInternals.DEFAULT_EDIT_MESSAGE_ID;
+  session.editReady = true;
+  session.toolsAdapterSent = true;
+  serverInternals.resetRemoteSession(session);
+  assert.equal(session.editMessageId, null);
+  assert.equal(session.editReady, false);
+  assert.equal(session.toolsAdapterSent, false);
 });

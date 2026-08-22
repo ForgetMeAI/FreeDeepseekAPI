@@ -104,17 +104,32 @@ npm start
 `npm start` показывает меню запуска:
 
 - `1` — авторизоваться / обновить DeepSeek login
-- `2` — показать модели и статусы
-- `3` — запустить proxy
-- `4` — выйти
+- `2` — импортировать auth-файл / cookies
+- `3` — показать модели и статусы
+- `4` — запустить proxy (спрашивает режим сообщений: `1` chain / `2` edit)
+- `5` — выйти
 
-Для headless/CI-запуска без меню:
+Для headless/CI-запуска без меню задайте режим через env:
 
 ```bash
-NON_INTERACTIVE=1 npm start
+NON_INTERACTIVE=1 DEEPSEEK_SESSION_MODE=edit npm start
 # или
-SKIP_ACCOUNT_MENU=1 npm start
+SKIP_ACCOUNT_MENU=1 DEEPSEEK_SESSION_MODE=chain npm start
 ```
+
+Временный лог входящих запросов клиента включён по умолчанию (`CLIENT REQUEST` в консоли) и печатает **все** `req.headers` (Authorization/Cookie маскируются). Отключить: `DEEPSEEK_LOG_CLIENT_REQUEST=0`. Полный JSON body: `DEEPSEEK_LOG_CLIENT_REQUEST=full`.
+
+Проверка raw-заголовков без LLM:
+
+```bash
+curl -s http://localhost:9655/debug/echo \
+  -H "X-Session-Id: test-1" \
+  -H "x-session-affinity: sticky" \
+  -H "Content-Type: application/json" \
+  -d "{\"ping\":true}"
+```
+
+Если `x-session-id` нет в ответе echo — заголовок отрезал gateway/nginx до Node (`proxy_pass_request_headers on;`, не пересобирать запрос вручную).
 
 По умолчанию сервер слушает:
 
@@ -326,8 +341,9 @@ npm run doctor -- --offline
 FreeDeepseekAPI не создаёт новый DeepSeek чат на каждый HTTP-запрос без причины. Логика такая:
 
 - один `x-agent-session`, `session` или `user` → одна DeepSeek chat session;
-- если session id уже есть — proxy переиспользует его и продолжает chain через `parent_message_id`;
-- auto-reset происходит при TTL, ошибке DeepSeek session или слишком длинной цепочке сообщений;
+- **`DEEPSEEK_SESSION_MODE=chain`** (по умолчанию): каждый ход добавляет сообщение через `parent_message_id`. Новый чат получает полную историю; reuse отправляет только последнее новое сообщение (user/tool после последнего assistant) — остальное уже лежит в дереве DeepSeek;
+- **`DEEPSEEK_SESSION_MODE=edit`**: первый ход — `completion` (bootstrap), дальше редактируется `message_id=1`; при пустом ответе edit — fallback на chain;
+- auto-reset происходит при TTL, ошибке DeepSeek session или (только в chain) слишком длинной цепочке сообщений;
 - локальная history сохраняется коротким контекстом, чтобы новая DeepSeek session могла продолжить разговор.
 - длинные agent-запросы перед отправкой ограничиваются `DEEPSEEK_MAX_PROMPT_CHARS` (по умолчанию 80 000 символов): сохраняются начало задачи, свежие tool results и tool adapter;
 - если клиент уже прислал multi-turn history, локальная recovery-history второй раз не добавляется;
@@ -336,10 +352,15 @@ FreeDeepseekAPI не создаёт новый DeepSeek чат на каждый
 Явно задать agent/session:
 
 ```bash
+# chain mode (default)
 curl -X POST http://localhost:9655/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "x-agent-session: my-agent" \
   -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"Привет"}]}'
+
+# edit mode без меню (CI / headless)
+NON_INTERACTIVE=1 DEEPSEEK_SESSION_MODE=edit npm start
+# интерактивно: npm start → 4 → 2
 ```
 
 Посмотреть активные sessions:
