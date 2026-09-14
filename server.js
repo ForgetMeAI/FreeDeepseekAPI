@@ -86,6 +86,11 @@ function prompt(question) {
     return new Promise(resolve => rl.question(question, ans => { rl.close(); resolve(ans); }));
 }
 function isTruthy(value) { return typeof value === 'string' && ['1','true','yes','on'].includes(value.trim().toLowerCase()); }
+function shouldSkipStartupMenu() {
+    if (isTruthy(process.env.SKIP_ACCOUNT_MENU) || isTruthy(process.env.NON_INTERACTIVE)) return true;
+    // pm2/systemd/nohup: no interactive terminal attached
+    return !process.stdin.isTTY;
+}
 
 function isProxyAuthorized(authorization, expectedKey = PROXY_API_KEY) {
     if (!expectedKey) return true;
@@ -2350,7 +2355,7 @@ function printStatus() {
 }
 
 async function showStartupMenu() {
-    if (isTruthy(process.env.SKIP_ACCOUNT_MENU) || isTruthy(process.env.NON_INTERACTIVE)) {
+    if (shouldSkipStartupMenu()) {
         if (!hasAuthConfig()) loadDeepSeekConfig({ fatal: true });
         return true;
     }

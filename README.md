@@ -42,7 +42,7 @@ ForgetMeAI: https://t.me/forgetmeai
 - [Diagnostics / doctor](#-diagnostics--doctor)
 - [Session reuse и сброс чатов](#-session-reuse-и-сброс-чатов)
 - [Multi-account pool](#-multi-account-pool)
-- [Идеи для консольной авторизации](#-идеи-для-консольной-авторизации)
+- [Консольная авторизация](#-консольная-авторизация)
 - [Проверка работы](#-проверка-работы)
 - [Примеры запросов](#-примеры-запросов)
   - [Chat Completions](#chat-completions)
@@ -401,18 +401,23 @@ DEEPSEEK_ACCOUNT_COOLDOWN_MS=600000 npm start
 
 ---
 
-## 🔑 Идеи для консольной авторизации
+## 🔑 Консольная авторизация
 
-Парольный flow из PR #3 можно делать, но безопаснее не хранить пароль и не делать это дефолтом. Нормальная реализация:
+Если Chrome недоступен, авторизацию можно выполнить напрямую через HTTP API DeepSeek:
 
-1. `npm run auth:console` спрашивает email/телефон и пароль через hidden prompt.
-2. Пароль держится только в памяти процесса, не пишется в файлы/logs/history.
-3. Скрипт повторяет Web login flow через `fetch`/CDP: получает captcha/verify challenge, отдаёт человеку ссылку/код, ждёт подтверждение.
-4. После успешного login сохраняется только `deepseek-auth.json` стандартного формата.
-5. Если DeepSeek просит captcha/2FA — скрипт честно говорит “открой ссылку, пройди проверку, нажми Enter”, а не пытается обходить защиту.
-6. Для VPS лучше режим `auth:console --no-save-password --output deepseek-auth.json`.
+```bash
+npm run auth -- --login-console
+```
 
-Минимальный безопасный MVP: console auth только интерактивный, без env-пароля. Допустимый automation-вариант: `DEEPSEEK_EMAIL=... npm run auth:console`, но пароль всё равно вводится hidden prompt.
+Команда запросит логин и пароль в терминале; пароль вводится скрыто. Для автоматизированного запуска можно использовать переменные окружения:
+
+```bash
+DEEPSEEK_LOGIN="email@example.com" DEEPSEEK_PASSWORD="your-password" npm run auth -- --login-console
+```
+
+После успешного входа скрипт проверяет web-сессию и сохраняет токен и cookies в `deepseek-auth.json`. При необходимости captcha или 2FA DeepSeek может отклонить HTTP-вход — в таком случае используйте браузерный режим `npm run auth -- --login`.
+
+> ⚠️ Не храните логин и пароль в общих скриптах, истории shell или CI-логах. Файл `deepseek-auth.json` содержит действующие credentials и не должен попадать в Git.
 
 ---
 
