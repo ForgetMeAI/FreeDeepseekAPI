@@ -35,8 +35,14 @@ ForgetMeAI: https://t.me/forgetmeai
 - [Что это даёт](#-что-это-даёт)
 - [Возможности](#-возможности)
 - [Быстрый старт](#-быстрый-старт)
-  - [Консольная авторизация](#консольная-авторизация)
-- [Фоновый запуск (PM2)](#-фоновый-запуск-pm2)
+- [Windows запуск](#-windows-запуск)
+- [Linux / Chromium запуск](#-linux--chromium-запуск)
+- [VPS / headless запуск](#-vps--headless-запуск)
+- [Rootless Podman](#-rootless-podman)
+- [Diagnostics / doctor](#-diagnostics--doctor)
+- [Session reuse и сброс чатов](#-session-reuse-и-сброс-чатов)
+- [Multi-account pool](#-multi-account-pool)
+- [Консольная авторизация](#-консольная-авторизация)
 - [Проверка работы](#-проверка-работы)
 - [Примеры запросов](#-примеры-запросов)
   - [Chat Completions](#chat-completions)
@@ -116,101 +122,302 @@ SKIP_ACCOUNT_MENU=1 npm start
 http://localhost:9655
 ```
 
-### Консольная авторизация
+По умолчанию proxy доступен только с этого компьютера. Для доступа из сети
+явно задайте адрес и отдельный ключ proxy:
 
-Если Chrome недоступен или авторизацию нужно выполнить без браузера, используйте HTTP-авторизацию через консоль. Команда запросит логин и пароль интерактивно, причём пароль не отображается на экране:
+```bash
+HOST=0.0.0.0 PROXY_API_KEY='replace-with-a-long-random-value' npm start
+```
+
+После этого передавайте ключ как `Authorization: Bearer <key>`. Без
+`PROXY_API_KEY` non-health endpoints остаются без авторизации, поэтому не
+публикуйте такой экземпляр в сеть.
+
+Browser-запросы разрешены с loopback-origin. Если UI открыт на другом адресе,
+добавьте его точный origin через запятую, например
+`PROXY_CORS_ORIGINS=https://ui.example.com,http://192.168.1.20:3000`.
+
+---
+
+## 🪟 Windows запуск
+
+```powershell
+git clone https://github.com/ForgetMeAI/FreeDeepseekAPI.git
+cd FreeDeepseekAPI
+npm run auth
+npm start
+```
+
+Если Chrome установлен нестандартно, явно укажите путь:
+
+```powershell
+$env:CHROME_PATH="C:\Program Files\Google\Chrome\Application\chrome.exe"
+npm run auth
+```
+
+Если Chrome не найден, `npm run auth` теперь печатает готовые инструкции для Windows/macOS/Linux вместо загадочного stack trace.
+
+---
+
+## 🐧 Linux / Chromium запуск
+
+```bash
+git clone https://github.com/ForgetMeAI/FreeDeepseekAPI.git
+cd FreeDeepseekAPI
+CHROME_PATH=$(which chromium) npm run auth
+npm start
+```
+
+Если Chromium называется иначе:
+
+```bash
+CHROME_PATH=$(which chromium-browser) npm run auth
+# или
+CHROME_PATH=$(which google-chrome) npm run auth
+```
+
+---
+
+## 🖥 VPS / headless запуск
+
+Самый надёжный flow без Chrome на сервере:
+
+1. На домашнем ПК, где есть GUI/Chrome:
+
+```bash
+npm run auth
+```
+
+2. Скопируйте `deepseek-auth.json` на VPS:
+
+```bash
+scp deepseek-auth.json user@your-vps:/opt/FreeDeepseekAPI/deepseek-auth.json
+```
+
+3. На VPS импортируйте/проверьте файл и выставьте безопасные права:
+
+```bash
+cd /opt/FreeDeepseekAPI
+npm run auth:import -- --input ./deepseek-auth.json
+npm run doctor -- --offline
+```
+
+4. Запускайте proxy без интерактивного меню:
+
+```bash
+NON_INTERACTIVE=1 npm start
+```
+
+Можно импортировать не только готовый `deepseek-auth.json`, но и browser cookie export:
+
+```bash
+DEEPSEEK_TOKEN="<token>" npm run auth:import -- --input ./cookies.json
+```
+
+> Важно: `deepseek-auth.json` — это доступ к вашему DeepSeek Web login. Не коммитьте, не публикуйте, храните с правами `0600`.
+
+---
+
+## 🦭 Rootless Podman
+
+Контейнер предназначен только для non-interactive запуска proxy. Авторизацию
+через браузер выполните на хосте командой `npm run auth`: auth-скрипты и
+`deepseek-auth.json` в образ не копируются.
+
+Запускайте Podman обычным пользователем, без `sudo`.
+
+1. Соберите локальный образ:
+
+```bash
+podman build --tag localhost/free-deepseek-api:local --file Containerfile .
+```
+
+2. Передайте DeepSeek auth и отдельный ключ proxy через Podman secrets:
+
+```bash
+podman secret create --replace free-deepseek-auth ./deepseek-auth.json
+
+printf 'Proxy API key: '
+IFS= read -r -s PROXY_API_KEY
+printf '\n'
+printf '%s' "$PROXY_API_KEY" |
+  podman secret create --replace free-deepseek-proxy-key -
+```
+
+Используйте длинный случайный ключ. Значение останется в переменной
+`PROXY_API_KEY` текущего shell, чтобы проверить API; оно не попадает в образ или
+командную строку Podman.
+
+3. Запустите контейнер с минимальными привилегиями:
+
+```bash
+podman run --detach \
+  --name free-deepseek-api \
+  --publish 127.0.0.1:9655:9655 \
+  --secret free-deepseek-auth,target=deepseek-auth.json,uid=1000,gid=1000,mode=0400 \
+  --secret free-deepseek-proxy-key,target=proxy-api-key,uid=1000,gid=1000,mode=0400 \
+  --read-only \
+  --cap-drop=ALL \
+  --security-opt=no-new-privileges \
+  localhost/free-deepseek-api:local
+```
+
+Внутри контейнера заранее выставлены `NON_INTERACTIVE=1`, `HOST=0.0.0.0` и
+пути к обоим secrets. `REQUIRE_PROXY_API_KEY=1` не даст контейнеру запуститься,
+если secret с ключом отсутствует или пуст. На хосте порт публикуется только на
+`127.0.0.1`; не убирайте этот адрес без отдельного сетевого firewall/access
+policy.
+
+4. Проверьте liveness, readiness аккаунта и защищённый endpoint:
+
+```bash
+podman healthcheck run free-deepseek-api
+curl --fail http://127.0.0.1:9655/readyz
+curl --fail \
+  -H "Authorization: Bearer $PROXY_API_KEY" \
+  http://127.0.0.1:9655/v1/models
+```
+
+Встроенный healthcheck проверяет локальный `/health` (жив ли процесс).
+`/readyz` дополнительно вернёт `503`, если ни один DeepSeek auth-аккаунт сейчас
+не готов обслуживать запросы. Диагностика контейнера:
+
+```bash
+podman logs free-deepseek-api
+podman inspect --format '{{.State.Health.Status}}' free-deepseek-api
+```
+
+Остановка и удаление контейнера вместе с сохранёнными Podman secrets:
+
+```bash
+podman stop free-deepseek-api
+podman rm free-deepseek-api
+podman secret rm free-deepseek-auth free-deepseek-proxy-key
+unset PROXY_API_KEY
+```
+
+При ротации auth или proxy key замените соответствующий secret и пересоздайте
+контейнер, чтобы поведение не зависело от версии Podman.
+
+---
+
+## 🩺 Diagnostics / doctor
+
+```bash
+npm run doctor
+# без сетевых запросов к DeepSeek:
+npm run doctor -- --offline
+```
+
+`doctor` проверяет:
+
+- найден ли `deepseek-auth.json` / `DEEPSEEK_AUTH_DIR`;
+- валидный ли JSON;
+- есть ли `token`, `cookie`, `wasmUrl`;
+- безопасные ли права файла на macOS/Linux (`0600`);
+- при обычном запуске — доступен ли DeepSeek PoW endpoint.
+
+Если видите `data.biz_data is null`, `fetch failed`, `401/403/429` или Hermes/OpenCode не видит модели — первым делом запускайте `npm run doctor`.
+
+---
+
+## ♻️ Session reuse и сброс чатов
+
+FreeDeepseekAPI не создаёт новый DeepSeek чат на каждый HTTP-запрос без причины. Логика такая:
+
+- один `x-agent-session`, `session` или `user` → одна DeepSeek chat session;
+- если session id уже есть — proxy переиспользует его и продолжает chain через `parent_message_id`;
+- auto-reset происходит при TTL, ошибке DeepSeek session или слишком длинной цепочке сообщений;
+- локальная history сохраняется коротким контекстом, чтобы новая DeepSeek session могла продолжить разговор.
+- длинные agent-запросы перед отправкой ограничиваются `DEEPSEEK_MAX_PROMPT_CHARS` (по умолчанию 80 000 символов): сохраняются начало задачи, свежие tool results и tool adapter;
+- если клиент уже прислал multi-turn history, локальная recovery-history второй раз не добавляется;
+- пустой ответ повторяется максимум `DEEPSEEK_MAX_RETRIES` раз (по умолчанию 2), причём на каждом retry контекст уменьшается.
+
+Явно задать agent/session:
+
+```bash
+curl -X POST http://localhost:9655/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "x-agent-session: my-agent" \
+  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"Привет"}]}'
+```
+
+Посмотреть активные sessions:
+
+```bash
+curl http://localhost:9655/v1/sessions
+```
+
+Сбросить одну session:
+
+```bash
+curl -X POST "http://localhost:9655/reset-session?agent=my-agent"
+```
+
+Сбросить все sessions:
+
+```bash
+curl -X POST "http://localhost:9655/reset-session?agent=all"
+```
+
+Почему чаты всё равно появляются в DeepSeek Web: proxy работает через внутренний Web Chat API, а DeepSeek хранит реальные chat sessions у себя. Это нормально для web-proxy. Задача session reuse — не плодить новые чаты без необходимости и аккуратно сбрасываться только когда chain протух/сломался.
+
+---
+
+## 👥 Multi-account pool
+
+Можно подключить несколько auth-файлов. Правильная модель: sticky account per agent/session — proxy не переключает аккаунт внутри живой DeepSeek-сессии. Если аккаунт получил `401/403/429` и ушёл в cooldown, session безопасно сбрасывается и новый запрос может перейти на другой доступный аккаунт.
+
+Вариант 1 — директория с auth-файлами:
+
+```bash
+mkdir -p accounts
+cp deepseek-auth-main.json accounts/main.json
+cp deepseek-auth-backup.json accounts/backup.json
+chmod 600 accounts/*.json
+DEEPSEEK_AUTH_DIR=./accounts NON_INTERACTIVE=1 npm start
+```
+
+Вариант 2 — список файлов:
+
+```bash
+DEEPSEEK_AUTH_PATH="./accounts/main.json,./accounts/backup.json" NON_INTERACTIVE=1 npm start
+```
+
+Как работает pool:
+
+- новый agent/session получает доступный аккаунт round-robin;
+- выбранный аккаунт закрепляется за session (`sticky`);
+- при `401`, `403`, `429` аккаунт уходит в cooldown;
+- если sticky-аккаунт session ушёл в cooldown, старая DeepSeek-сессия сбрасывается, чтобы не долбить rate-limited/expired аккаунт;
+- статус аккаунтов виден в `/health` без путей к auth-файлам и без имён файлов;
+- auth-файлы должны храниться с правами `0600`.
+
+Настроить cooldown:
+
+```bash
+DEEPSEEK_ACCOUNT_COOLDOWN_MS=600000 npm start
+```
+
+---
+
+## 🔑 Консольная авторизация
+
+Если Chrome недоступен, авторизацию можно выполнить напрямую через HTTP API DeepSeek:
 
 ```bash
 npm run auth -- --login-console
 ```
 
-Также можно выбрать пункт `4` (**Авторизация в консоли (логин/пароль)**) в меню `npm run auth`.
-
-Для автоматизированного запуска передайте учётные данные через переменные окружения:
+Команда запросит логин и пароль в терминале; пароль вводится скрыто. Для автоматизированного запуска можно использовать переменные окружения:
 
 ```bash
 DEEPSEEK_LOGIN="email@example.com" DEEPSEEK_PASSWORD="your-password" npm run auth -- --login-console
 ```
 
-После успешной авторизации команда проверяет web-сессию и сохраняет токен и cookies в `deepseek-auth.json`. Затем запустите proxy:
+После успешного входа скрипт проверяет web-сессию и сохраняет токен и cookies в `deepseek-auth.json`. При необходимости captcha или 2FA DeepSeek может отклонить HTTP-вход — в таком случае используйте браузерный режим `npm run auth -- --login`.
 
-```bash
-npm start
-```
-
-> ⚠️ Консольная авторизация не открывает Chrome и выполняет вход напрямую в HTTP API DeepSeek. Не передавайте логин и пароль в общие скрипты, историю shell или CI-логи. Локальный `deepseek-auth.json` содержит действующие credentials и не должен попадать в Git.
-
----
-
-## 🔄 Фоновый запуск (PM2)
-
-Для VPS/сервера без открытого терминала удобно запускать proxy через [PM2](https://pm2.keymetrics.io/). Сначала авторизуйтесь (`npm run auth`), затем поднимите сервер в фоне.
-
-При запуске через pm2 меню **пропускается автоматически** (нет интерактивного TTY). Явно можно задать `NON_INTERACTIVE=1` или `SKIP_ACCOUNT_MENU=1`.
-
-> **Важно:** флаг pm2 `--env` — это имя блока из `ecosystem.config.cjs` (`production`, `development`), а **не** `KEY=VALUE`. Запись `--env NON_INTERACTIVE=1` **не работает**.
-
-### Установка и быстрый старт
-
-```bash
-npm install -g pm2
-cd FreeDeepseekAPI
-npm run auth   # deepseek-auth.json должен существовать
-
-pm2 delete deepseek-api 2>/dev/null || true
-pm2 start server.js --name deepseek-api
-pm2 save
-```
-
-С явной переменной окружения (если нужно):
-
-```bash
-NON_INTERACTIVE=1 pm2 start server.js --name deepseek-api --update-env
-```
-
-Проверка:
-
-```bash
-pm2 status
-curl http://127.0.0.1:9655/health
-```
-
-### Конфиг ecosystem (рекомендуется)
-
-В репозитории есть готовый `ecosystem.config.cjs`:
-
-```bash
-pm2 delete deepseek-api 2>/dev/null || true
-pm2 start ecosystem.config.cjs
-pm2 save
-pm2 startup   # автозапуск после перезагрузки сервера
-```
-
-### Логи
-
-```bash
-pm2 logs deepseek-api              # live-лог (Ctrl+C не останавливает процесс)
-pm2 logs deepseek-api --lines 100 # последние 100 строк
-pm2 flush deepseek-api             # очистить логи
-```
-
-Файлы логов по умолчанию:
-
-```text
-~/.pm2/logs/deepseek-api-out.log
-~/.pm2/logs/deepseek-api-error.log
-```
-
-### Управление процессом
-
-```bash
-pm2 restart deepseek-api
-pm2 stop deepseek-api
-pm2 delete deepseek-api
-pm2 monit   # CPU/RAM в терминале
-```
-
-После обновления auth (`npm run auth`) перезапустите proxy: `pm2 restart deepseek-api`.
+> ⚠️ Не храните логин и пароль в общих скриптах, истории shell или CI-логах. Файл `deepseek-auth.json` содержит действующие credentials и не должен попадать в Git.
 
 ---
 
@@ -329,8 +536,9 @@ FreeDeepseekAPI принимает:
 Прокси просит DeepSeek вернуть строгий JSON tool call, но также умеет парсить fallback-форматы:
 
 - `TOOL_CALL:`
-- fenced JSON
+- fenced JSON with an explicit `tool_call`, `tool_calls`, or `function_call` envelope
 - `<tool_call>...</tool_call>`
+- DeepSeek DSML (`<｜DSML｜tool_calls>...`) и Web-вариант с `<｜｜DSML｜｜ Tool Calls>`
 
 ---
 
@@ -402,7 +610,9 @@ http://host.docker.internal:9655/v1
 http://localhost:9655/v1
 ```
 
-API key можно указать любой: proxy сам ходит в DeepSeek Web через сохранённую browser-сессию.
+Если `PROXY_API_KEY` не задан, API key можно указать любой. Если ключ задан,
+клиент должен передавать именно его — proxy проверяет bearer token перед
+доступом к моделям, сессиям и completions.
 
 ---
 

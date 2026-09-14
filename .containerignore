@@ -1,0 +1,9 @@
+# Keep the build context free of browser sessions, auth exports, source-only
+# helpers, and any future unlisted files. Containerfile copies this allow-list.
+*
+!Containerfile
+!.containerignore
+!package.json
+!server.js
+!lib/
+!lib/pow.js

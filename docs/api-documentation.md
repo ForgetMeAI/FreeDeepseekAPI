@@ -359,8 +359,9 @@ DeepSeek Web does not expose native OpenAI tool calls, so the proxy prompt-emula
 
 - strict JSON: `{"tool_call":{"name":"tool","arguments":{...}}}`
 - legacy format: `TOOL_CALL: tool\narguments: {...}`
-- fenced JSON blocks
+- fenced JSON blocks with an explicit `tool_call`, `tool_calls`, or `function_call` envelope
 - XML-ish `<tool_call>{...}</tool_call>` wrappers
+- DeepSeek DSML (`<｜DSML｜tool_calls>...`) and the doubled-bar Web variant
 
 ### 3.7 List Active Sessions
 
@@ -439,8 +440,8 @@ The proxy uses `user` from the request body. If not set, it falls back to the cl
   id: "uuid",                    // DeepSeek web session ID
   parentMessageId: <int|null>,   // Last message ID for threading
   createdAt: <timestamp>,        // Session creation time
-  messageCount: 0-50,            // Messages in this session
-  history: [                     // Last 5 exchanges for context recovery
+  messageCount: 0-100,           // Messages in this session
+  history: [                     // Last 15 exchanges for context recovery
     { user: "...", assistant: "..." }
   ]
 }
@@ -514,14 +515,15 @@ The parser traverses character by character tracking brace depth:
 
 | Condition | Action |
 |---|---|
-| Message count >= 50 | Auto-reset DeepSeek session, keep history buffer |
+| Message count >= 100 | Auto-reset DeepSeek session, keep history buffer |
 | Session age > 2 hours | Auto-reset (DeepSeek web session TTL) |
 | HTTP 400/404/500 response | Reset and retry once |
-| Empty content response | Return HTTP 502 (no retry) |
+| Empty content response | Compact context, reset session, retry up to `DEEPSEEK_MAX_RETRIES` (default 2) |
+| Context/content too long | Pre-compact to `DEEPSEEK_MAX_PROMPT_CHARS`, then retry with a smaller budget |
 
 ### 6.2 History Buffer
 
-When a session is reset, the proxy preserves the **last 5 exchanges** (capped at ~3000 chars). On the next request, it injects them as context:
+When a session is reset, the proxy preserves the **last 15 exchanges** (capped at 10,000 chars). It injects this recovery context only when the client did not already send multi-turn history:
 
 ```
 [Previous conversation]
@@ -553,9 +555,10 @@ If DeepSeek's web session expires (HTTP 400/404/500):
 ### 7.1 Proxy Configuration (in deepseek-api-server.js)
 
 ```javascript
-const MAX_HISTORY_LENGTH = 5;     // Keep last 5 exchanges
-const MAX_HISTORY_CHARS = 3000;   // Max chars for history buffer
-const MAX_MESSAGE_DEPTH = 50;     // Auto-reset after 50 messages
+const MAX_HISTORY_LENGTH = 15;    // Keep last 15 exchanges
+const MAX_HISTORY_CHARS = 10000;  // Max chars for history buffer
+const MAX_MESSAGE_DEPTH = 100;    // Auto-reset after 100 messages
+const MAX_UPSTREAM_PROMPT_CHARS = 80000; // Configurable via DEEPSEEK_MAX_PROMPT_CHARS
 const SESSION_TTL_MS = 2 * 60 * 60 * 1000;  // 2 hours
 
 const DS_CONFIG = {

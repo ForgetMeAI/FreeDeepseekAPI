@@ -425,8 +425,26 @@ async function readPageAuth(cdp) {
     'https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm';
   return { token, cookie, hif_dliq, hif_leim, wasmUrl, baseUrl: 'https://chat.deepseek.com', href: pageState.href, cookiesCount: cookies.length };
 }
+function chromeInstallHelp(missingPath) {
+  return `Chrome/Chrome for Testing not found${missingPath ? `: ${missingPath}` : ''}.
+
+How to fix:
+  Windows PowerShell:
+    $env:CHROME_PATH="C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"; npm run auth
+    # or install Chrome normally: https://www.google.com/chrome/
+
+  macOS:
+    CHROME_PATH="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" npm run auth
+
+  Linux / Chromium:
+    CHROME_PATH=$(which chromium) npm run auth
+    # Ubuntu example: sudo apt install chromium-browser || sudo apt install chromium
+
+If Chrome is installed elsewhere, set CHROME_PATH to the real executable path.`;
+}
+
 async function main() {
-  if (!fs.existsSync(chromePath)) throw new Error(`Chrome/Chrome for Testing not found: ${chromePath}. Set CHROME_PATH.`);
+  if (!fs.existsSync(chromePath)) throw new Error(chromeInstallHelp(chromePath));
 
   if (!reuseChrome) {
     killExistingTestingChrome();
