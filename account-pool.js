@@ -103,6 +103,50 @@ function resolveAuthSources(options = {}) {
     return sources;
 }
 
+// Where a newly added account file should be written: an explicit DEEPSEEK_AUTH_DIR wins,
+// otherwise the ./accounts drop-in folder. Mirrors resolveAuthSources() above.
+function resolveAuthDir(options = {}) {
+    const baseDir = options.baseDir || __dirname;
+    const dir = String(options.dir !== undefined ? options.dir : (process.env.DEEPSEEK_AUTH_DIR || '')).trim();
+    return dir ? path.resolve(baseDir, dir) : path.resolve(baseDir, DEFAULT_ACCOUNTS_DIR);
+}
+
+// A free file name for a new account inside `dir`: 'main.json' when the folder is empty,
+// otherwise the first unused account-N.json.
+function nextAccountFileName(dir) {
+    let existing = [];
+    try { existing = fs.readdirSync(dir).filter(n => n.toLowerCase().endsWith('.json')); } catch {}
+    if (existing.length === 0) return 'main.json';
+    for (let i = 1; i < 1000; i++) {
+        const name = `account-${i}.json`;
+        if (!existing.includes(name)) return name;
+    }
+    return `account-${Date.now()}.json`;
+}
+
+// Turn whatever the user typed into a safe *.json file name ('' when nothing usable is left).
+function sanitizeAccountFileName(raw) {
+    const base = String(raw || '').trim().replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+    if (!base) return '';
+    return base.toLowerCase().endsWith('.json') ? base : `${base}.json`;
+}
+
+// Copy every currently-used auth file into `dir`, so that switching to the drop-in folder
+// never silently drops an account that was loaded from somewhere else. Returns what it copied.
+function seedAccountsDir(dir, currentFiles) {
+    fs.mkdirSync(dir, { recursive: true });
+    const copied = [];
+    for (const file of currentFiles) {
+        if (path.resolve(path.dirname(file)) === path.resolve(dir)) continue;
+        const dest = path.join(dir, path.basename(file));
+        if (fs.existsSync(dest)) continue;
+        fs.copyFileSync(file, dest);
+        try { fs.chmodSync(dest, 0o600); } catch {}
+        copied.push(dest);
+    }
+    return copied;
+}
+
 function createPool(options = {}) {
     const baseDir = options.baseDir || __dirname;
     const now = options.now || (() => Date.now());   // injectable clock, used by the tests
@@ -113,7 +157,7 @@ function createPool(options = {}) {
     const maxWaitMs = options.maxWaitMs !== undefined
         ? options.maxWaitMs
         : readEnvInt('DEEPSEEK_POOL_MAX_WAIT_MS', DEFAULT_MAX_WAIT_MS);
-    const sources = options.sources || resolveAuthSources({ baseDir });
+    let sources = options.sources || resolveAuthSources({ baseDir });
 
     const accounts = [];
     const stickyByAgent = new Map(); // agentId -> accountId
@@ -290,6 +334,9 @@ function createPool(options = {}) {
     }
 
     function refresh() {
+        // In drop-in folder mode, re-resolve the sources first, so a JSON file dropped into
+        // accounts/ while the process is running is picked up on the next refresh.
+        if (!options.sources) sources = resolveAuthSources({ baseDir });
         const preserve = new Map(accounts.map(a => [a.id, a]));
         const n = load(preserve);
         if (typeof log.log === 'function') log.log(`[pool] Loaded ${n} account(s) from ${sources.length} source(s)`);
@@ -311,7 +358,8 @@ function createPool(options = {}) {
         maxWaitMs,
         // Exposed for the server and for tests; contains live credentials, never log it.
         accounts,
-        sources,
+        get sources() { return sources; },
+        get accountsDir() { return resolveAuthDir({ baseDir }); },
         _stickyByAgent: stickyByAgent,
     };
 }
@@ -319,6 +367,10 @@ function createPool(options = {}) {
 module.exports = {
     createPool,
     resolveAuthSources,
+    resolveAuthDir,
+    nextAccountFileName,
+    sanitizeAccountFileName,
+    seedAccountsDir,
     buildHeadersFor,
     DEFAULT_WASM_URL,
     DEFAULT_COOLDOWN_MS,

@@ -62,7 +62,7 @@ const SESSION_TTL_MS = 2 * 60 * 60 * 1000;  // 2 hours
 // === DeepSeek Web API Config — multi-account pool (see account-pool.js) ===
 // Sources, in priority order: DEEPSEEK_AUTH_DIR, DEEPSEEK_AUTH_PATH (comma list or single
 // path), then the legacy ./deepseek-auth.json. One account behaves exactly as before.
-const { createPool, AUTH_FAILURE_STATUSES } = require('./account-pool');
+const { createPool, nextAccountFileName, sanitizeAccountFileName, seedAccountsDir, AUTH_FAILURE_STATUSES } = require('./account-pool');
 const POOL = createPool();
 
 function loadDeepSeekConfig({ fatal = true } = {}) {
@@ -1341,11 +1341,38 @@ const server = http.createServer(async (req, res) => {
     });
 });
 
-async function runAuthScript() {
-    const script = path.join(__dirname, 'scripts', 'deepseek_chrome_auth.js');
-    const result = spawnSync(process.execPath, [script], { stdio: 'inherit', env: process.env });
+const AUTH_SCRIPT = path.join(__dirname, 'scripts', 'deepseek_chrome_auth.js');
+
+// Run the browser login. `targetPath` decides which account file it writes; without one the
+// script falls back to its own default (./deepseek-auth.json).
+async function runAuthScript(targetPath = null) {
+    const args = [AUTH_SCRIPT];
+    if (targetPath) args.push('--out', targetPath);
+    const result = spawnSync(process.execPath, args, { stdio: 'inherit', env: process.env });
     loadDeepSeekConfig({ fatal: false });
     return result.status === 0 && hasAuthConfig();
+}
+
+// Which existing account file to overwrite when refreshing a login.
+async function pickAccountToUpdate() {
+    const files = POOL.sources;
+    if (files.length <= 1) return files[0] || null;
+    console.log('\nКакой аккаунт обновить?');
+    files.forEach((f, i) => console.log(`  ${i + 1} - ${path.basename(f)}`));
+    const answer = Number((await prompt('Номер (Enter = 1): ')).trim());
+    return files[answer - 1] || files[0];
+}
+
+// Where a new account file goes: ./accounts by default. Existing account files are carried
+// over first, so switching to the drop-in folder never silently drops a loaded account.
+async function pickAccountToAdd() {
+    const dir = POOL.accountsDir;
+    for (const dest of seedAccountsDir(dir, POOL.sources)) {
+        console.log(`[pool] Существующий аккаунт скопирован в ${dest}`);
+    }
+    const suggested = nextAccountFileName(dir);
+    const answer = await prompt(`Имя нового аккаунта (Enter = ${suggested}): `);
+    return path.join(dir, sanitizeAccountFileName(answer) || suggested);
 }
 
 function printStatus() {
@@ -1374,7 +1401,19 @@ async function showStartupMenu() {
         let choice = await prompt('Ваш выбор (Enter = 3): ');
         if (!choice) choice = '3';
         if (choice === '1') {
-            await runAuthScript();
+            if (POOL.size() === 0) {
+                await runAuthScript(await pickAccountToAdd());
+            } else {
+                console.log('\n1 - Обновить существующий аккаунт');
+                console.log('2 - Добавить новый аккаунт');
+                const sub = (await prompt('Ваш выбор (Enter = 1): ')).trim() || '1';
+                if (sub === '2') {
+                    await runAuthScript(await pickAccountToAdd());
+                } else {
+                    const target = await pickAccountToUpdate();
+                    if (target) await runAuthScript(target);
+                }
+            }
         } else if (choice === '2') {
             console.log(JSON.stringify(ALL_MODEL_CAPABILITIES, null, 2));
             await prompt('\nНажмите Enter, чтобы вернуться в меню...');

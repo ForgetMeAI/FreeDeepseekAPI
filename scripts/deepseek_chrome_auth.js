@@ -5,8 +5,12 @@
 
   Usage:
     node scripts/deepseek_chrome_auth.js
+    # write to a specific account file: node scripts/deepseek_chrome_auth.js --out accounts/main.json
     # optional override: CHROME_PATH="/path/to/browser" node scripts/deepseek_chrome_auth.js
     # optional reuse: DEEPSEEK_REUSE_CHROME=1 DEEPSEEK_KEEP_CHROME_PROFILE=1 node scripts/deepseek_chrome_auth.js
+
+  The browser is detected automatically (Chrome, Chromium, Brave, Edge; puppeteer/playwright
+  caches; flatpak/snap). Set CHROME_PATH only to force a specific binary.
 
   Default auth starts a clean disposable Chrome for Testing profile and uses
   --use-mock-keychain to avoid macOS Keychain prompts.
@@ -26,7 +30,15 @@ const qwenRepoRoot = path.resolve(repoRoot, '..', 'FreeQwenApi');
 const profileDir = process.env.DEEPSEEK_CHROME_PROFILE || path.join(repoRoot, '.chrome-for-testing-profile-deepseek');
 // Use a dedicated default port so an older normal-Chrome auth window on 9333 is not reused.
 const port = Number(process.env.DEEPSEEK_CHROME_PORT || 9334);
-const outPath = process.env.DEEPSEEK_AUTH_PATH || path.join(repoRoot, 'deepseek-auth.json');
+// Output target: --out <path> wins, then DEEPSEEK_AUTH_PATH, then the legacy ./deepseek-auth.json.
+const outArg = (() => {
+  const argv = process.argv.slice(2);
+  const eq = argv.find(a => a.startsWith('--out='));
+  if (eq) return eq.slice('--out='.length);
+  const i = argv.indexOf('--out');
+  return i >= 0 ? argv[i + 1] : '';
+})();
+const outPath = path.resolve(outArg || process.env.DEEPSEEK_AUTH_PATH || path.join(repoRoot, 'deepseek-auth.json'));
 const url = 'https://chat.deepseek.com/';
 const reuseChrome = /^(1|true|yes|on)$/i.test(process.env.DEEPSEEK_REUSE_CHROME || '');
 const keepProfile = /^(1|true|yes|on)$/i.test(process.env.DEEPSEEK_KEEP_CHROME_PROFILE || '');
@@ -40,13 +52,14 @@ function sleepSync(ms) {
 }
 
 function killExistingTestingChrome() {
-  if (process.platform !== 'darwin') return;
+  // Linux and macOS both ship pkill; on Windows there is nothing to kill this way.
+  if (process.platform === 'win32') return;
   const patterns = [
     `--remote-debugging-port=${port}`,
     profileDir,
   ].map(shellPatternSafe);
   for (const pattern of patterns) {
-    try { execFileSync('/usr/bin/pkill', ['-f', pattern], { stdio: 'ignore' }); } catch {}
+    try { execFileSync('pkill', ['-f', pattern], { stdio: 'ignore' }); } catch {}
   }
   sleepSync(800);
 }
@@ -70,36 +83,173 @@ function removeProfileSafely(dir) {
   }
 }
 
-function resolveChromePath() {
-  if (process.env.CHROME_PATH) return process.env.CHROME_PATH;
+// --- Browser discovery -----------------------------------------------------
+// Find any Chromium-based browser instead of asking the user for a path. Order:
+//   CHROME_PATH -> puppeteer/playwright bundled browser -> caches -> known locations -> PATH.
+function isExecutable(p) {
+  if (!p) return false;
+  try { fs.accessSync(p, fs.constants.X_OK); return true; } catch { return false; }
+}
 
-  // Match FreeQwenApi: prefer Puppeteer's bundled "Google Chrome for Testing"
-  // instead of the user's normal /Applications/Google Chrome.app.
-  for (const base of [repoRoot, qwenRepoRoot]) {
+// Executable paths inside one Chrome-for-Testing version directory.
+function testingBrowserPaths(versionDir) {
+  if (process.platform === 'darwin') {
+    const app = ['Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing'];
+    return [
+      path.join(versionDir, 'chrome-mac-arm64', ...app),
+      path.join(versionDir, 'chrome-mac-x64', ...app),
+    ];
+  }
+  if (process.platform === 'win32') {
+    return [
+      path.join(versionDir, 'chrome-win64', 'chrome.exe'),
+      path.join(versionDir, 'chrome-win32', 'chrome.exe'),
+    ];
+  }
+  return [
+    path.join(versionDir, 'chrome-linux64', 'chrome'),
+    path.join(versionDir, 'chrome-linux', 'chrome'),
+  ];
+}
+
+function findInPuppeteerCache(home) {
+  const roots = [
+    path.join(home, '.cache', 'puppeteer', 'chrome'),
+    path.join(home, 'Library', 'Caches', 'puppeteer', 'chrome'),
+  ];
+  for (const root of roots) {
+    let versions;
+    try { versions = fs.readdirSync(root); } catch { continue; }
+    const found = versions
+      .sort()
+      .reverse()
+      .flatMap(v => testingBrowserPaths(path.join(root, v)))
+      .filter(isExecutable);
+    if (found[0]) return found[0];
+  }
+  return null;
+}
+
+function findInPlaywrightCache(home) {
+  const roots = [
+    path.join(home, '.cache', 'ms-playwright'),
+    path.join(home, 'Library', 'Caches', 'ms-playwright'),
+  ];
+  for (const root of roots) {
+    let dirs;
+    try { dirs = fs.readdirSync(root); } catch { continue; }
+    for (const d of dirs.filter(n => /^chromium/.test(n)).sort().reverse()) {
+      const hit = [
+        path.join(root, d, 'chrome-linux64', 'chrome'),
+        path.join(root, d, 'chrome-linux', 'chrome'),
+        path.join(root, d, 'chrome-mac', 'Chromium.app', 'Contents', 'MacOS', 'Chromium'),
+        path.join(root, d, 'chrome-win', 'chrome.exe'),
+      ].find(isExecutable);
+      if (hit) return hit;
+    }
+  }
+  return null;
+}
+
+function knownBrowserPaths(home) {
+  if (process.platform === 'darwin') {
+    return [
+      '/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing',
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      '/Applications/Chromium.app/Contents/MacOS/Chromium',
+      '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+    ];
+  }
+  if (process.platform === 'win32') {
+    const pf = process.env['PROGRAMFILES'] || 'C:\\Program Files';
+    const pf86 = process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)';
+    const local = process.env.LOCALAPPDATA || '';
+    return [
+      path.join(pf, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      path.join(pf86, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      path.join(local, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    ];
+  }
+  // Linux: distro packages, Fedora's chromium wrapper, snap, flatpak.
+  return [
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/opt/google/chrome/chrome',
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/usr/lib64/chromium-browser/chromium-browser',
+    '/usr/lib/chromium-browser/chromium-browser',
+    '/usr/lib/chromium/chromium',
+    '/snap/bin/chromium',
+    '/var/lib/flatpak/exports/bin/com.google.Chrome',
+    '/var/lib/flatpak/exports/bin/org.chromium.Chromium',
+    path.join(home, '.local', 'share', 'flatpak', 'exports', 'bin', 'com.google.Chrome'),
+    path.join(home, '.local', 'share', 'flatpak', 'exports', 'bin', 'org.chromium.Chromium'),
+  ];
+}
+
+function findOnPath() {
+  const names = process.platform === 'win32'
+    ? ['chrome.exe', 'chromium.exe']
+    : (process.platform === 'darwin'
+      ? ['google-chrome', 'chromium', 'brave-browser']
+      : ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser', 'brave-browser', 'microsoft-edge']);
+  const dirs = String(process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  for (const name of names) {
+    for (const dir of dirs) {
+      const candidate = path.join(dir, name);
+      if (isExecutable(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+function resolveChromePath() {
+  const home = process.env.HOME || process.env.USERPROFILE || '';
+
+  // An explicit override always wins, but only when it actually points at a binary.
+  if (process.env.CHROME_PATH) {
+    if (isExecutable(process.env.CHROME_PATH)) return process.env.CHROME_PATH;
+    console.warn(`[auth] CHROME_PATH="${process.env.CHROME_PATH}" is not executable — ignoring it.`);
+  }
+
+  // A browser the project already depends on (puppeteer bundles Chrome for Testing).
+  for (const base of [repoRoot, qwenRepoRoot, process.cwd()]) {
     try {
       const puppeteerPath = require.resolve('puppeteer', { paths: [base] });
       const puppeteer = require(puppeteerPath);
       if (typeof puppeteer.executablePath === 'function') {
         const p = puppeteer.executablePath();
-        if (p && fs.existsSync(p)) return p;
+        if (isExecutable(p)) return p;
       }
     } catch {}
   }
 
-  const cacheRoot = path.join(process.env.HOME || '', '.cache', 'puppeteer', 'chrome');
-  try {
-    const candidates = fs.readdirSync(cacheRoot)
-      .map(dir => path.join(cacheRoot, dir, 'chrome-mac-arm64', 'Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing'))
-      .filter(p => fs.existsSync(p))
-      .sort()
-      .reverse();
-    if (candidates[0]) return candidates[0];
-  } catch {}
+  if (home) {
+    const cached = findInPuppeteerCache(home) || findInPlaywrightCache(home);
+    if (cached) return cached;
+  }
 
-  return '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+  const known = knownBrowserPaths(home).find(isExecutable);
+  if (known) return known;
+
+  return findOnPath();
 }
 
 const chromePath = resolveChromePath();
+
+function browserHelp() {
+  const how = {
+    darwin: 'brew install --cask google-chrome',
+    win32: 'winget install Google.Chrome',
+    linux: 'sudo dnf install chromium   (Fedora; Debian/Ubuntu: sudo apt install chromium)',
+  }[process.platform] || 'install Google Chrome or Chromium';
+  return [
+    'Не найден Chrome/Chromium.',
+    `  Установите: ${how}`,
+    '  Либо укажите путь вручную: CHROME_PATH=/путь/к/браузеру node scripts/deepseek_chrome_auth.js',
+  ].join('\n');
+}
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function ask(q) {
@@ -219,7 +369,9 @@ async function readPageAuth(cdp) {
   return { token, cookie, hif_dliq, hif_leim, wasmUrl, baseUrl: 'https://chat.deepseek.com', href: pageState.href, cookiesCount: cookies.length };
 }
 async function main() {
-  if (!fs.existsSync(chromePath)) throw new Error(`Chrome/Chrome for Testing not found: ${chromePath}. Set CHROME_PATH.`);
+  if (!chromePath || !fs.existsSync(chromePath)) throw new Error(browserHelp());
+  console.log(`[auth] Browser: ${chromePath}`);
+  console.log(`[auth] Output:  ${outPath}`);
 
   if (!reuseChrome) {
     killExistingTestingChrome();
@@ -233,9 +385,10 @@ async function main() {
   if (reuseChrome && await devtoolsReady()) {
     console.log(`[auth] Reusing Chrome DevTools on port ${port}`);
   } else {
-    console.log(`[auth] Starting clean Chrome for Testing profile: ${profileDir}`);
-    console.log(`[auth] Browser executable: ${chromePath}`);
-    const chrome = spawn(chromePath, [
+    console.log(`[auth] Starting clean browser profile: ${profileDir}`);
+    // macOS flags stay: --use-mock-keychain avoids Keychain prompts there and is ignored
+    // elsewhere, so this list is safe on every platform.
+    const chromeArgs = [
       `--user-data-dir=${profileDir}`,
       `--remote-debugging-port=${port}`,
       '--use-mock-keychain',
@@ -245,8 +398,13 @@ async function main() {
       '--disable-component-extensions-with-background-pages',
       '--disable-features=AutofillServerCommunication,OptimizationHints,MediaRouter,InterestFeedContentSuggestions,Translate',
       '--no-first-run', '--no-default-browser-check', '--disable-infobars',
-      url,
-    ], { stdio: 'ignore', detached: true });
+    ];
+    // Chrome refuses to start as root without this; a normal user does not need it.
+    if (process.platform === 'linux' && typeof process.getuid === 'function' && process.getuid() === 0) {
+      chromeArgs.push('--no-sandbox');
+    }
+    chromeArgs.push(url);
+    const chrome = spawn(chromePath, chromeArgs, { stdio: 'ignore', detached: true });
     chrome.unref();
   }
 
@@ -268,7 +426,10 @@ async function main() {
     await sleep(500);
   }
   const { href, cookiesCount, ...persisted } = auth;
-  fs.writeFileSync(outPath, JSON.stringify(persisted, null, 2));
+  // The file holds live tokens — create the folder and keep it owner-only from the start.
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  fs.writeFileSync(outPath, JSON.stringify(persisted, null, 2), { mode: 0o600 });
+  try { fs.chmodSync(outPath, 0o600); } catch {}
   console.log(`[auth] Saved: ${outPath}`);
   console.log(`[auth] page: ${href || 'unknown'}`);
   console.log(`[auth] token: ${persisted.token ? 'OK (' + persisted.token.length + ' chars)' : 'MISSING'}`);
@@ -277,4 +438,9 @@ async function main() {
   cdp.close();
   if (!persisted.token || !persisted.cookie) process.exitCode = 2;
 }
-main().catch(e => { console.error('[auth] ERROR:', e); process.exit(1); });
+if (require.main === module) {
+  main().catch(e => { console.error('[auth] ERROR:', e); process.exit(1); });
+}
+
+// Exported so browser detection and the output path can be checked without launching anything.
+module.exports = { resolveChromePath, browserHelp, outPath };
