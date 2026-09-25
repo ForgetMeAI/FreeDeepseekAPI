@@ -3,6 +3,8 @@ node_modules/
 *.log
 auth.json
 deepseek-auth.json
+accounts/
+server.js.bak
 .chrome-profile-deepseek/
 .chrome-for-testing-profile-deepseek/
 .chrome-for-testing-profile-deepseek.stale-*/

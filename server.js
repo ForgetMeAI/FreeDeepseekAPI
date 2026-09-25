@@ -59,45 +59,21 @@ const MAX_HISTORY_CHARS = 10000;
 const MAX_MESSAGE_DEPTH = 100;  // auto-reset after this many messages
 const SESSION_TTL_MS = 2 * 60 * 60 * 1000;  // 2 hours
 
-// === DeepSeek Web API Config — loaded from external config file ===
-const DS_CONFIG_PATH = process.env.DEEPSEEK_AUTH_PATH || path.join(__dirname, 'deepseek-auth.json');
-let DS_CONFIG = {};
-let BASE_HEADERS = {};
-function buildBaseHeaders() {
-    return {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
-        "x-client-platform": "web",
-        "x-client-version": "2.0.0",
-        "x-client-locale": "ru",
-        "x-client-timezone-offset": "14400",
-        "x-app-version": "2.0.0",
-        "Authorization": `Bearer ${DS_CONFIG.token || ''}`,
-        "x-hif-dliq": DS_CONFIG.hif_dliq || '',
-        "x-hif-leim": DS_CONFIG.hif_leim || '',
-        "Origin": "https://chat.deepseek.com",
-        "Referer": "https://chat.deepseek.com/",
-        "Cookie": DS_CONFIG.cookie || '',
-        "Content-Type": "application/json",
-    };
-}
+// === DeepSeek Web API Config — multi-account pool (see account-pool.js) ===
+// Sources, in priority order: DEEPSEEK_AUTH_DIR, DEEPSEEK_AUTH_PATH (comma list or single
+// path), then the legacy ./deepseek-auth.json. One account behaves exactly as before.
+const { createPool, AUTH_FAILURE_STATUSES } = require('./account-pool');
+const POOL = createPool();
+
 function loadDeepSeekConfig({ fatal = true } = {}) {
-    try {
-        const raw = fs.readFileSync(DS_CONFIG_PATH, 'utf8');
-        DS_CONFIG = JSON.parse(raw);
-        BASE_HEADERS = buildBaseHeaders();
-        console.log(`[DS-API] Loaded auth config from ${DS_CONFIG_PATH}`);
-        return true;
-    } catch (e) {
-        DS_CONFIG = {};
-        BASE_HEADERS = buildBaseHeaders();
-        if (fatal) {
-            console.error(`[DS-API] FATAL: Could not load auth config: ${e.message}`);
-            process.exit(1);
-        }
-        return false;
+    const loaded = POOL.refresh();
+    if (loaded === 0 && fatal) {
+        console.error('[DS-API] FATAL: Could not load any auth config (checked DEEPSEEK_AUTH_DIR, DEEPSEEK_AUTH_PATH, deepseek-auth.json)');
+        process.exit(1);
     }
+    return loaded > 0;
 }
-function hasAuthConfig() { return !!(DS_CONFIG.token && DS_CONFIG.cookie); }
+function hasAuthConfig() { return POOL.hasReady(); }
 loadDeepSeekConfig({ fatal: false });
 
 function createSession() {
@@ -117,8 +93,17 @@ function getOrCreateAgentSession(agentId) {
     return sessions.get(agentId);
 }
 
+// Drop the DeepSeek web session but keep local history. Used when the pool moves an agent to
+// a different account: the old web session belongs to the account that was parked.
+function resetAgentSession(session) {
+    session.id = null;
+    session.parentMessageId = null;
+    session.createdAt = null;
+    session.messageCount = 0;
+}
+
 async function solvePOW(challenge) {
-    const resp = await fetch(DS_CONFIG.wasmUrl);
+    const resp = await fetch(POOL.getWasmUrl());
     const wasmBytes = await resp.arrayBuffer();
     const mod = await WebAssembly.instantiate(wasmBytes, { wbg: {} });
     const e = mod.instance.exports;
@@ -246,10 +231,15 @@ function resolveModelConfig(model) {
 function isKnownModel(model) { return Object.prototype.hasOwnProperty.call(MODEL_CONFIGS, String(model || '').toLowerCase()); }
 function isSupportedModel(model) { return resolveModelConfig(model).supported === true; }
 
-async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
+async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', account = null) {
     const modelCfg = resolveModelConfig(model);
     const session = getOrCreateAgentSession(agentId);
     const agentTag = `[${agentId}]`;
+    // The account is chosen by the caller so it can release/rotate it. This fallback only
+    // covers direct calls; a null here means the pool has nothing usable.
+    const activeAccount = account || POOL.acquire(agentId).account;
+    if (!activeAccount) throw new Error('no_account_available');
+    const headers = activeAccount.headers;
 
     // Auto-reset on deep message chain
     if (session.id && session.messageCount >= MAX_MESSAGE_DEPTH) {
@@ -271,7 +261,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
     }
 
     const cr = await fetch('https://chat.deepseek.com/api/v0/chat/create_pow_challenge', {
-        method: 'POST', headers: BASE_HEADERS,
+        method: 'POST', headers: headers,
         body: JSON.stringify({ target_path: '/api/v0/chat/completion' })
     });
     const chalJson = JSON.parse(await cr.text());
@@ -280,7 +270,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
 
     if (!session.id) {
         const sr = await fetch('https://chat.deepseek.com/api/v0/chat_session/create', {
-            method: 'POST', headers: BASE_HEADERS, body: '{}'
+            method: 'POST', headers: headers, body: '{}'
         });
         const sessionData = await sr.json();
         session.id = sessionData.data.biz_data.chat_session?.id || sessionData.data.biz_data.id;
@@ -299,7 +289,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
     })).toString('base64');
     const resp = await fetch('https://chat.deepseek.com/api/v0/chat/completion', {
         method: 'POST',
-        headers: { ...BASE_HEADERS, 'X-DS-PoW-Response': powB64 },
+        headers: { ...headers, 'X-DS-PoW-Response': powB64 },
         body: JSON.stringify({
             chat_session_id: session.id,
             parent_message_id: session.parentMessageId,
@@ -322,7 +312,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
             session.messageCount = 0;
 
             const sr2 = await fetch('https://chat.deepseek.com/api/v0/chat_session/create', {
-                method: 'POST', headers: BASE_HEADERS, body: '{}'
+                method: 'POST', headers: headers, body: '{}'
             });
             const sessionData2 = await sr2.json();
             session.id = sessionData2.data.biz_data.chat_session?.id || sessionData2.data.biz_data.id;
@@ -337,7 +327,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
             })).toString('base64');
             const resp2 = await fetch('https://chat.deepseek.com/api/v0/chat/completion', {
                 method: 'POST',
-                headers: { ...BASE_HEADERS, 'X-DS-PoW-Response': newPowB64 },
+                headers: { ...headers, 'X-DS-PoW-Response': newPowB64 },
                 body: JSON.stringify({
                     chat_session_id: session.id,
                     parent_message_id: null,
@@ -959,7 +949,7 @@ const server = http.createServer(async (req, res) => {
     // Health check
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'ok', service: 'FreeDeepseekAPI', watermark: FORGETMEAI_WATERMARK, models: SUPPORTED_MODEL_IDS, unsupported_models: Object.keys(MODEL_CONFIGS).filter(id => !MODEL_CONFIGS[id].supported), agents: sessions.size, config_ready: hasAuthConfig() }));
+        res.end(JSON.stringify({ status: 'ok', service: 'FreeDeepseekAPI', watermark: FORGETMEAI_WATERMARK, models: SUPPORTED_MODEL_IDS, unsupported_models: Object.keys(MODEL_CONFIGS).filter(id => !MODEL_CONFIGS[id].supported), agents: sessions.size, config_ready: hasAuthConfig(), accounts_ready: POOL.hasReady(), accounts: POOL.status() }));
         return;
     }
 
@@ -1061,6 +1051,19 @@ const server = http.createServer(async (req, res) => {
 
             const session = getOrCreateAgentSession(agentId);
 
+            // Pick an account for this agent: sticky if it already has a healthy one, otherwise
+            // round-robin. If every account is cooling down we wait for the nearest recovery.
+            // This runs before the history prefix is built, so a rotation-induced session reset
+            // still carries the local history into the new request.
+            const acq = await POOL.acquireWithWait(agentId);
+            if (!acq.account) {
+                res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': String(Math.max(1, Math.ceil((acq.retryAfterMs || 0) / 1000))) });
+                res.end(JSON.stringify({ error: { message: 'No DeepSeek account is currently available (all are cooling down)', type: 'no_account_available', retry_after_ms: acq.retryAfterMs || 0, accounts: POOL.status() } }));
+                return;
+            }
+            let account = acq.account;
+            if (acq.resetRequired) resetAgentSession(session);
+
             // Build history prefix if starting fresh
             let historyPrefix = '';
             if (!session.id && session.history.length > 0) {
@@ -1076,7 +1079,25 @@ const server = http.createServer(async (req, res) => {
                 : `${historyPrefix}${prompt}`;
 
             const startTime = Date.now();
-            const { resp: dsResp } = await askDeepSeekStream(fullPrompt, agentId, requestedModel);
+            let { resp: dsResp } = await askDeepSeekStream(fullPrompt, agentId, requestedModel, account);
+
+            // An auth failure (401/403/429) means the account is the problem: park it and retry
+            // once on another account from the pool.
+            if (AUTH_FAILURE_STATUSES.has(dsResp.status)) {
+                POOL.release(account.id, { ok: false, status: dsResp.status });
+                const retry = await POOL.acquireWithWait(agentId);
+                if (!retry.account) {
+                    res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': String(Math.max(1, Math.ceil((retry.retryAfterMs || 0) / 1000))) });
+                    res.end(JSON.stringify({ error: { message: 'No DeepSeek account is currently available (all are cooling down)', type: 'no_account_available', retry_after_ms: retry.retryAfterMs || 0, accounts: POOL.status() } }));
+                    return;
+                }
+                account = retry.account;
+                resetAgentSession(session);
+                console.log(`${agentTag} Account ${account.label} after auth failure; DeepSeek session reset`);
+                ({ resp: dsResp } = await askDeepSeekStream(fullPrompt, agentId, requestedModel, account));
+            } else {
+                POOL.release(account.id, { ok: true });
+            }
 
             // Process streaming response from DeepSeek — returns { content, reasoningContent, messageId, finishReason }
             async function readDeepSeekResponse(readable) {
@@ -1329,8 +1350,8 @@ async function runAuthScript() {
 
 function printStatus() {
     console.log(`\n${formatWatermark()}`);
-    console.log(`Auth: ${hasAuthConfig() ? '✅ OK' : '❌ не найден deepseek-auth.json'}`);
-    console.log(`Auth file: ${DS_CONFIG_PATH}`);
+    console.log(`Auth: ${hasAuthConfig() ? '✅ OK' : '❌ нет доступных аккаунтов'}`);
+    console.log(`Аккаунты: ${POOL.size()} (готовы: ${POOL.hasReady() ? 'да' : 'нет'})`);
     console.log(`Рабочие модели: ${SUPPORTED_MODEL_IDS.join(', ')}`);
     console.log('Нерабочие/скрытые aliases: ' + Object.keys(MODEL_CONFIGS).filter(id => !MODEL_CONFIGS[id].supported).join(', '));
     console.log('Capabilities: GET /v1/model-capabilities');
@@ -1348,7 +1369,8 @@ async function showStartupMenu() {
         console.log('1 - Авторизоваться / обновить DeepSeek login');
         console.log('2 - Показать модели и статусы');
         console.log('3 - Запустить прокси (по умолчанию)');
-        console.log('4 - Выход');
+        console.log('4 - Статус аккаунтов');
+        console.log('5 - Выход');
         let choice = await prompt('Ваш выбор (Enter = 3): ');
         if (!choice) choice = '3';
         if (choice === '1') {
@@ -1363,6 +1385,17 @@ async function showStartupMenu() {
             }
             return true;
         } else if (choice === '4') {
+            const accounts = POOL.status();
+            if (accounts.length === 0) {
+                console.log('Аккаунты не загружены.');
+            } else {
+                for (const a of accounts) {
+                    const cd = a.state === 'cooldown' ? ` (осталось ${Math.ceil(a.cooldown_remaining_ms / 1000)} с)` : '';
+                    console.log(`- ${a.label}: ${a.state}${cd}, сбоев: ${a.failures}`);
+                }
+            }
+            await prompt('\nНажмите Enter, чтобы вернуться в меню...');
+        } else if (choice === '5') {
             return false;
         }
     }
@@ -1387,3 +1420,53 @@ async function main() {
 }
 
 main().catch(err => { console.error('[DS-API] FATAL:', err); process.exit(1); });
+  // --- DeepSeek DSML tool-call support (appended) ---
+  function parseDsml(text) {
+    if (!text || typeof text !== 'string') return null;
+    if (text.indexOf('DSML') < 0) return null;
+    var B = String.fromCharCode(0xFF5C);
+    var L = '[|' + B + ']{1,2}';
+    var M = L + '\\s*DSML\\s*' + L;
+    var s = text;
+    try {
+      s = s.replace(new RegExp(M, 'gi'), 'DSML');
+    } catch (e) {
+      console.log('[dsml] normalize failed ' + e.message);
+      return null;
+    }
+    if (s.indexOf('<DSML invoke') < 0) return null;
+    var P = '<DSML\\s+invoke\\s+name\\s*=\\s*"([^"]+)"';
+    var E = '<\\/DSML\\s+invoke\\s*>';
+    var re = new RegExp(P + '[^>]*>([\\s\\S]*?)' + E, 'gi');
+    var Q = '<DSML\\s+parameter\\s+name\\s*=\\s*"([^"]+)"';
+    var R = '<\\/DSML\\s+parameter\\s*>';
+    var pre = new RegExp(Q + '[^>]*>([\\s\\S]*?)' + R, 'gi');
+    var out = [];
+    var m;
+    while ((m = re.exec(s)) !== null) {
+      var args = {};
+      var p;
+      pre.lastIndex = 0;
+      while ((p = pre.exec(m[2])) !== null) {
+        var v = p[2].replace(/^\n/, '').replace(/\n$/, '');
+        args[p[1]] = v;
+      }
+      out.push({ name: m[1], arguments: JSON.stringify(args) });
+    }
+    if (out.length === 0) {
+      console.log('[dsml] DSML seen but no complete invoke');
+      return null;
+    }
+    console.log('[dsml] parsed ' + out[0].name);
+    return out[0];
+  }
+
+  (function () {
+    if (parseToolCall.__dsmlWrapped) return;
+    var base = parseToolCall;
+    var wrapped = function (t) {
+      return parseDsml(t) || base(t);
+    };
+    wrapped.__dsmlWrapped = true;
+    parseToolCall = wrapped;
+  })();
