@@ -5,15 +5,16 @@ function $(id) { return document.getElementById(id); }
 const WASM_URL = 'https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm';
 
 function buildAuthJson(data) {
-  const cookie = [];
-  if (data.ds_session_id) cookie.push(`ds_session_id=${data.ds_session_id}`);
-  if (data.smidV2) cookie.push(`smidV2=${data.smidV2}`);
+  // Older stored data only had the two individual cookies.
+  const legacyCookie = [];
+  if (data.ds_session_id) legacyCookie.push(`ds_session_id=${data.ds_session_id}`);
+  if (data.smidV2) legacyCookie.push(`smidV2=${data.smidV2}`);
 
   return {
     token: data.token || '',
     hif_dliq: data.hif_dliq || '',
     hif_leim: data.hif_leim || '',
-    cookie: cookie.join('; '),
+    cookie: data.cookie || legacyCookie.join('; '),
     wasmUrl: WASM_URL,
   };
 }
@@ -21,10 +22,9 @@ function buildAuthJson(data) {
 function getStatus(auth, data) {
   const checks = [
     { label: 'token', ok: !!auth.token },
-    { label: 'cookie (ds_session_id / smidV2)', ok: auth.cookie.includes('=') },
-    { label: 'hif_dliq', ok: !!auth.hif_dliq },
-    { label: 'hif_leim', ok: !!auth.hif_leim },
+    { label: 'cookie', ok: auth.cookie.includes('=') },
   ];
+  // hif_* headers are optional for the proxy.
   return { checks, allOk: checks.every((c) => c.ok) };
 }
 
@@ -41,7 +41,7 @@ function render(data) {
     $('status').textContent = '⚠️ No credentials yet. Click "Collect from Tab" while on chat.deepseek.com';
   } else if (allOk) {
     $('status').className = 'status ok';
-    $('status').textContent = '✅ All 4 credentials captured — ready to export';
+    $('status').textContent = '✅ Token and cookies captured — ready to export';
   } else {
     $('status').className = 'status warn';
     $('status').textContent = `⚠️ Missing: ${missing.join(', ')}`;
@@ -94,7 +94,8 @@ $('btnSave').addEventListener('click', () => {
   a.href = url;
   a.download = 'deepseek-auth.json';
   a.click();
-  URL.revokeObjectURL(url);
+  // Revoking synchronously can cancel the download before it starts.
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
   $('btnSave').textContent = '✅ Saved!';
   setTimeout(() => { $('btnSave').textContent = '💾 Download File'; }, 1500);
 });

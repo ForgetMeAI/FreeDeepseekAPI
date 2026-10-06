@@ -81,7 +81,7 @@ ForgetMeAI: https://t.me/forgetmeai
 - **Model capabilities:** `GET /v1/model-capabilities` с alias → real web mode
 - **Agent sessions:** отдельная DeepSeek-сессия на `user` / agent id
 - **Session recovery:** авто-сброс устаревших chains/sessions
-- **Zero dependencies:** Node.js 18+, без npm-зависимостей
+- **Zero dependencies:** Node.js 18+ для proxy (для `npm run auth` нужен Node.js 22+), без npm-зависимостей
 
 ---
 
@@ -101,12 +101,21 @@ npm start
 3. отправьте короткое сообщение вроде `ok`;
 4. вернитесь в терминал и нажмите Enter.
 
+> `npm run auth` использует встроенный в Node.js WebSocket, поэтому ему нужен
+> Node.js 22+. Сам proxy работает на Node.js 18+; на старом Node импортируйте
+> готовый `deepseek-auth.json` через `npm run auth:import`.
+
 `npm start` показывает меню запуска:
 
 - `1` — авторизоваться / обновить DeepSeek login
-- `2` — показать модели и статусы
-- `3` — запустить proxy
-- `4` — выйти
+- `2` — импортировать auth-файл / cookies
+- `3` — показать модели и статусы
+- `4` — запустить proxy (по умолчанию, Enter)
+- `5` — выйти
+
+Настройки можно положить в `.env` (шаблон — `.env.example`): `npm start`,
+`npm run auth` и `npm run doctor` читают его сами. Переменные окружения
+важнее значений из `.env`.
 
 Для headless/CI-запуска без меню:
 
@@ -129,7 +138,8 @@ http://localhost:9655
 HOST=0.0.0.0 PROXY_API_KEY='replace-with-a-long-random-value' npm start
 ```
 
-После этого передавайте ключ как `Authorization: Bearer <key>`. Без
+После этого передавайте ключ как `Authorization: Bearer <key>` или
+`x-api-key: <key>` (так его отправляют Anthropic SDK). Без
 `PROXY_API_KEY` non-health endpoints остаются без авторизации, поэтому не
 публикуйте такой экземпляр в сеть.
 
@@ -229,7 +239,7 @@ DEEPSEEK_TOKEN="<token>" npm run auth:import -- --input ./cookies.json
 1. Соберите локальный образ:
 
 ```bash
-podman build --tag localhost/free-deepseek-api:local --file Containerfile .
+podman build --format docker --tag localhost/free-deepseek-api:local --file Containerfile .
 ```
 
 2. Передайте DeepSeek auth и отдельный ключ proxy через Podman secrets:
@@ -279,6 +289,8 @@ curl --fail \
 ```
 
 Встроенный healthcheck проверяет локальный `/health` (жив ли процесс).
+`--format docker` при сборке обязателен: в формате OCI (по умолчанию у Podman)
+инструкция `HEALTHCHECK` молча отбрасывается.
 `/readyz` дополнительно вернёт `503`, если ни один DeepSeek auth-аккаунт сейчас
 не готов обслуживать запросы. Диагностика контейнера:
 
@@ -327,11 +339,15 @@ FreeDeepseekAPI не создаёт новый DeepSeek чат на каждый
 
 - один `x-agent-session`, `session` или `user` → одна DeepSeek chat session;
 - если session id уже есть — proxy переиспользует его и продолжает chain через `parent_message_id`;
-- auto-reset происходит при TTL, ошибке DeepSeek session или слишком длинной цепочке сообщений;
+- агенты (Hermes, Cline, Claude Code, OpenCode…) присылают всю историю в каждом запросе. Proxy запоминает, какие сообщения уже лежат в DeepSeek-чате, и в живой чат отправляет **только новые** (результаты tools, новый вопрос) плюс короткое напоминание о формате tool call. Раньше весь диалог (до 80 000 символов) отправлялся заново на каждом шаге, контекст чата рос квадратично, и через десяток шагов DeepSeek начинал отвечать пусто, писал «Содержание слишком длинное» или переставал вызывать tools (#23, #30);
+- если клиент изменил историю (сжал/отредактировал), сменил system prompt или набор tools — открывается новый DeepSeek-чат с полным промптом;
+- auto-reset происходит при TTL, ошибке DeepSeek session, слишком длинной цепочке сообщений или когда в чате накопилось больше `DEEPSEEK_MAX_SESSION_CHARS` символов (по умолчанию 3 × `DEEPSEEK_MAX_PROMPT_CHARS`);
+- параллельные запросы одного агента (например, фоновые review в Hermes) не смешиваются в одном чате: второй запрос обслуживается в отдельном временном DeepSeek-чате;
 - локальная history сохраняется коротким контекстом, чтобы новая DeepSeek session могла продолжить разговор.
 - длинные agent-запросы перед отправкой ограничиваются `DEEPSEEK_MAX_PROMPT_CHARS` (по умолчанию 80 000 символов): сохраняются начало задачи, свежие tool results и tool adapter;
 - если клиент уже прислал multi-turn history, локальная recovery-history второй раз не добавляется;
 - пустой ответ повторяется максимум `DEEPSEEK_MAX_RETRIES` раз (по умолчанию 2), причём на каждом retry контекст уменьшается.
+- длинная генерация (thinking) не обрывается по таймауту: поток ограничен паузой без данных (`DEEPSEEK_STREAM_IDLE_TIMEOUT_MS`, по умолчанию 60 с) и общим лимитом `DEEPSEEK_STREAM_MAX_MS` (10 минут).
 
 Явно задать agent/session:
 
@@ -388,7 +404,8 @@ DEEPSEEK_AUTH_PATH="./accounts/main.json,./accounts/backup.json" NON_INTERACTIVE
 
 - новый agent/session получает доступный аккаунт round-robin;
 - выбранный аккаунт закрепляется за session (`sticky`);
-- при `401`, `403`, `429` аккаунт уходит в cooldown;
+- при `401`, `403`, `429` аккаунт уходит в cooldown, а запрос повторяется на другом готовом аккаунте;
+- ответ DeepSeek «Too many messages» тоже считается rate limit: аккаунт уходит в короткий cooldown (`DEEPSEEK_RATE_LIMIT_COOLDOWN_MS`, по умолчанию 60 с); если других аккаунтов нет, клиент получает `429` с `Retry-After`;
 - если sticky-аккаунт session ушёл в cooldown, старая DeepSeek-сессия сбрасывается, чтобы не долбить rate-limited/expired аккаунт;
 - статус аккаунтов виден в `/health` без путей к auth-файлам и без имён файлов;
 - auth-файлы должны храниться с правами `0600`.
@@ -453,6 +470,15 @@ curl -X POST http://localhost:9655/v1/chat/completions \
     "stream": false
   }'
 ```
+
+При `stream: true` обычный ответ (запрос без `tools`) отдаётся клиенту по мере
+того, как DeepSeek его пишет: сначала размышление, потом текст. Если в запросе
+есть `tools`, ответ может оказаться вызовом инструмента, поэтому proxy дожидается
+конца и отдаёт его целиком, а пока ждёт — раз в
+`DEEPSEEK_STREAM_KEEPALIVE_MS` (10 с) шлёт SSE-комментарий `: keep-alive`, чтобы
+клиент не оборвал соединение по таймауту. Ошибка, случившаяся уже после начала
+потока, приходит событием `error` внутри стрима (SDK OpenAI и Anthropic
+превращают его в исключение); до начала потока — обычным HTTP-статусом.
 
 Для reasoning-моделей API отдаёт цепочку размышления отдельно от финального ответа:
 
@@ -535,43 +561,60 @@ FreeDeepseekAPI принимает:
 - `<tool_call>...</tool_call>`
 - DeepSeek DSML (`<｜DSML｜tool_calls>...`) и Web-вариант с `<｜｜DSML｜｜ Tool Calls>`
 
+Типичные ошибки модели исправляются при разборе: неэкранированные обратные
+слеши в Windows-путях (`"C:\git\src\index.ts"`) и настоящие переводы строк
+внутри строковых аргументов. Блоки кода с другим языком (```` ```csharp ````,
+```` ```python ````) никогда не считаются tool call.
+
 ---
 
 ## 🧠 Модели
 
 `GET /v1/models` возвращает только aliases, которые сейчас проверены и работают через этот proxy.
 
+### Единый режим DeepSeek Web (с 10.09.2026)
+
+10 сентября 2026 DeepSeek объединил в веб-чате режимы «Быстрый», «Эксперт» и
+«Распознавание» в один умный режим на модели **DeepSeek-V4.1-Flash**, а 14
+сентября отключил V4 Pro. Переключателя моделей больше нет, остались только
+«Глубокое мышление» (`thinking_enabled`) и «Поиск» (`search_enabled`) (#31).
+
+Поэтому все aliases теперь отправляют в Web API один и тот же
+`model_type: "default"` и отличаются только этими двумя флагами. Старые имена
+(`deepseek-expert`, `deepseek-v4-pro`, …) оставлены, чтобы не ломать конфиги
+клиентов, и помечены в `/v1/model-capabilities` как `deprecated`. Если DeepSeek
+снова поменяет значение `model_type`, его можно переопределить через
+`DEEPSEEK_MODEL_TYPE` (пустое значение — не отправлять поле).
+
 ### Рабочие aliases
 
-| Alias | Web mode | Reasoning | Web search | Комментарий |
-| --- | --- | --- | --- | --- |
-| `deepseek-chat` | `Быстрый` / `default` | нет | нет | базовый chat |
-| `deepseek-v3` | `Быстрый` / `default` | нет | нет | совместимый alias |
-| `deepseek-default` | `Быстрый` / `default` | нет | нет | совместимый alias |
-| `deepseek-reasoner` | `Быстрый` / `default` | да | нет | `thinking_enabled=true` |
-| `deepseek-r1` | `Быстрый` / `default` | да | нет | R1-compatible alias |
-| `deepseek-chat-search` | `Быстрый` / `default` | нет | да | web search |
-| `deepseek-default-search` | `Быстрый` / `default` | нет | да | web search alias |
-| `deepseek-reasoner-search` | `Быстрый` / `default` | да | да | reasoning + search |
-| `deepseek-r1-search` | `Быстрый` / `default` | да | да | R1-compatible + search |
-| `deepseek-expert` | `Эксперт` / `expert` | нет | нет | Expert mode |
-| `deepseek-v4-pro` | `Эксперт` / `expert` | да | нет | Expert + reasoning |
+| Alias | Глубокое мышление | Web search | Комментарий |
+| --- | --- | --- | --- |
+| `deepseek-chat` | нет | нет | базовый chat |
+| `deepseek-default` | нет | нет | совместимый alias |
+| `deepseek-v4-flash` | нет | нет | имя официального API |
+| `deepseek-v4.1-flash` | нет | нет | актуальная модель веб-чата |
+| `deepseek-v3` | нет | нет | устаревший alias |
+| `deepseek-reasoner` | да | нет | `thinking_enabled=true` |
+| `deepseek-r1` | да | нет | R1-compatible alias |
+| `deepseek-chat-search` | нет | да | web search |
+| `deepseek-default-search` | нет | да | web search alias |
+| `deepseek-reasoner-search` | да | да | reasoning + search |
+| `deepseek-r1-search` | да | да | R1-compatible + search |
+| `deepseek-expert` | да | нет | устаревший: «Эксперт» влит в единый режим |
+| `deepseek-v4-pro` | да | нет | устаревший: V4 Pro отключён, отвечает V4.1-Flash |
+| `deepseek-expert-search` | да | да | устаревший alias, теперь работает |
+
+`deepseek-vision` по-прежнему недоступен: веб-чат понимает картинки в едином
+режиме, но proxy пока не загружает изображения в DeepSeek. Картинки из
+запросов заменяются коротким маркером `[Image attached; not visible through
+this proxy]` вместо вставки base64 в промпт.
 
 Полный маппинг:
 
 ```bash
 curl http://localhost:9655/v1/model-capabilities
 ```
-
-По официальной странице DeepSeek V4 Preview `deepseek-chat` и `deepseek-reasoner` сейчас route'ятся в `deepseek-v4-flash` non-thinking/thinking. В самом `chat.deepseek.com` direct stream точное имя чекпойнта не отдаётся (`model: ""`), поэтому proxy фиксирует одновременно web-режим (`default` / `Быстрый`) и актуальную официальную маршрутизацию (`DeepSeek-V4-Flash`).
-
-Текущий вывод DeepSeek Web remote config показывает такие web-режимы:
-
-- `default` / UI `Быстрый` — работает; поддерживает `thinking_enabled` и `search_enabled`.
-- `expert` / UI `Эксперт` — работает через актуальный web-контракт (`x-client-version=2.0.0`) и поддерживает `thinking_enabled`. В `/v1/models` выдаются `deepseek-expert` без reasoning и `deepseek-v4-pro` как Expert + reasoning.
-- `vision` / UI `Распознавание` — виден в remote config, но сейчас direct Web API возвращает `backend_err_by_model` (`Vision is temporarily unavailable`). Поэтому `deepseek-vision` скрыт из `/v1/models`.
-
-Search для Expert по remote config недоступен, поэтому `deepseek-expert-search` остаётся unsupported.
 
 ---
 
@@ -623,7 +666,7 @@ npm start
 Локальные файлы авторизации не должны попадать в GitHub:
 
 - `deepseek-auth.json`
-- `.chrome-profile-deepseek/`
+- `.chrome-for-testing-profile-deepseek/`
 - `.env`
 
 Они уже добавлены в `.gitignore`.
@@ -632,13 +675,16 @@ npm start
 
 ## 🧪 Тесты
 
-Синтаксическая проверка проекта:
+Синтаксическая проверка, unit-тесты и end-to-end тесты против локального
+mock-сервера DeepSeek (сеть и аккаунт не нужны; для `node --test` нужен
+Node.js 18.13+):
 
 ```bash
 npm test
 ```
 
-Live smoke-тесты против запущенного локального proxy:
+Live smoke-тесты против запущенного локального proxy (если задан
+`PROXY_API_KEY`, он берётся из окружения):
 
 ```bash
 BASE_URL=http://127.0.0.1:9655 MODEL=deepseek-chat npm run test:live

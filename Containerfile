@@ -13,7 +13,7 @@ WORKDIR /app
 # FreeDeepseekAPI has no npm dependencies. Copy only the files needed by the
 # non-interactive proxy; browser auth helpers and credentials stay on the host.
 COPY --chown=1000:1000 package.json server.js ./
-COPY --chown=1000:1000 lib/pow.js ./lib/pow.js
+COPY --chown=1000:1000 lib/pow.js lib/env.js ./lib/
 
 USER 1000:1000
 

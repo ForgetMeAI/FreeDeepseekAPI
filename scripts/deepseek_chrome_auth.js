@@ -21,15 +21,18 @@ const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 
+const { loadDotEnv } = require('../lib/env');
+const { defaultAuthOutputPath, secureWriteJson } = require('./auth_import');
+
 const repoRoot = path.resolve(__dirname, '..');
+loadDotEnv(path.join(repoRoot, '.env'));
 const qwenRepoRoot = path.resolve(repoRoot, '..', 'FreeQwenApi');
 const profileDir =
     process.env.DEEPSEEK_CHROME_PROFILE ||
     path.join(repoRoot, '.chrome-for-testing-profile-deepseek');
 // Use a dedicated default port so an older normal-Chrome auth window on 9333 is not reused.
 const port = Number(process.env.DEEPSEEK_CHROME_PORT || 9334);
-const outPath =
-    process.env.DEEPSEEK_AUTH_PATH || path.join(repoRoot, 'deepseek-auth.json');
+const outPath = defaultAuthOutputPath(process.env, repoRoot);
 const url = 'https://chat.deepseek.com/';
 const reuseChrome = /^(1|true|yes|on)$/i.test(
     process.env.DEEPSEEK_REUSE_CHROME || '',
@@ -49,18 +52,36 @@ function sleepSync(ms) {
 }
 
 function killExistingTestingChrome() {
-    if (process.platform !== 'darwin') return;
+    // A previous auth run leaves its detached Chrome running. It must be gone
+    // before its profile is deleted and the DevTools port is reused.
+    if (process.platform === 'win32') return;
     const patterns = [`--remote-debugging-port=${port}`, profileDir].map(
         shellPatternSafe,
     );
     for (const pattern of patterns) {
         try {
-            execFileSync('/usr/bin/pkill', ['-f', pattern], {
+            // `--`: the port pattern starts with dashes and is not an option.
+            execFileSync('pkill', ['-f', '--', pattern], {
                 stdio: 'ignore',
             });
         } catch {}
     }
     sleepSync(800);
+}
+
+// Cross-platform: ask a Chrome that still listens on our DevTools port to quit.
+async function closeChromeViaDevtools() {
+    if (typeof WebSocket === 'undefined') return false;
+    const version = await devtoolsReady();
+    if (!version?.webSocketDebuggerUrl) return false;
+    try {
+        const browser = new CDP(version.webSocketDebuggerUrl);
+        await Promise.race([browser.ready(), sleep(2000)]);
+        await Promise.race([browser.send('Browser.close'), sleep(2000)]);
+        browser.close();
+    } catch {}
+    for (let i = 0; i < 20 && (await devtoolsReady()); i++) await sleep(250);
+    return true;
 }
 
 function removeProfileSafely(dir) {
@@ -77,7 +98,13 @@ function removeProfileSafely(dir) {
         } catch (e) {
             if (i === 4) {
                 const staleDir = `${dir}.stale-${Date.now()}`;
-                fs.renameSync(dir, staleDir);
+                try {
+                    fs.renameSync(dir, staleDir);
+                } catch (renameError) {
+                    throw new Error(
+                        `Chrome profile ${dir} is still in use (${renameError.code || renameError.message}). Close the DeepSeek auth Chrome window and run again.`,
+                    );
+                }
                 try {
                     fs.rmSync(staleDir, {
                         recursive: true,
@@ -245,6 +272,11 @@ async function getPageTarget() {
 }
 class CDP {
     constructor(wsUrl) {
+        if (typeof WebSocket === 'undefined') {
+            throw new Error(
+                `npm run auth needs Node.js 22+ (built-in WebSocket); this is Node ${process.versions.node}. Upgrade Node or use npm run auth:import.`,
+            );
+        }
         this.ws = new WebSocket(wsUrl);
         this.id = 0;
         this.pending = new Map();
@@ -405,8 +437,14 @@ If Chrome is installed elsewhere, set CHROME_PATH to the real executable path.`;
 async function main() {
     if (!fs.existsSync(chromePath))
         throw new Error(chromeInstallHelp(chromePath));
+    if (typeof WebSocket === 'undefined') {
+        throw new Error(
+            `npm run auth needs Node.js 22+ (built-in WebSocket); this is Node ${process.versions.node}. Upgrade Node or use npm run auth:import.`,
+        );
+    }
 
     if (!reuseChrome) {
+        await closeChromeViaDevtools();
         killExistingTestingChrome();
         if (!keepProfile && fs.existsSync(profileDir)) {
             removeProfileSafely(profileDir);
@@ -469,8 +507,15 @@ async function main() {
         await sleep(500);
     }
     const { href, cookiesCount, ...persisted } = auth;
-    fs.writeFileSync(outPath, JSON.stringify(persisted, null, 2));
-    console.log(`[auth] Saved: ${outPath}`);
+    const complete = Boolean(persisted.token && persisted.cookie);
+    if (complete) {
+        // Credentials: owner-only permissions (npm run doctor checks this).
+        secureWriteJson(outPath, persisted);
+        console.log(`[auth] Saved: ${outPath}`);
+    } else {
+        // Never replace a working auth file with an incomplete login.
+        console.log(`[auth] NOT saved: login incomplete, ${outPath} left unchanged.`);
+    }
     console.log(`[auth] page: ${href || 'unknown'}`);
     console.log(
         `[auth] token: ${persisted.token ? 'OK (' + persisted.token.length + ' chars)' : 'MISSING'}`,
@@ -482,7 +527,7 @@ async function main() {
         `[auth] hif headers: ${persisted.hif_dliq || persisted.hif_leim ? 'captured' : 'not captured/optional'}`,
     );
     cdp.close();
-    if (!persisted.token || !persisted.cookie) process.exitCode = 2;
+    if (!complete) process.exitCode = 2;
 }
 main().catch((e) => {
     console.error('[auth] ERROR:', e);

@@ -16,14 +16,117 @@ const os = require('os');
 const path = require('path');
 const readline = require('readline');
 const crypto = require('crypto');
+const events = require('events');
 const { spawnSync } = require('child_process');
 const { solvePOW } = require('./lib/pow');
+const { loadDotEnv } = require('./lib/env');
+
+// Real environment variables always win over .env.
+if (require.main === module) loadDotEnv(path.join(__dirname, '.env'));
+
+function envNumber(name, fallback, min = 0) {
+    const raw = process.env[name];
+    const value = raw === undefined || String(raw).trim() === '' ? NaN : Number(raw);
+    return Number.isFinite(value) ? Math.max(min, value) : fallback;
+}
+
+// DeepSeek Web endpoints. Overridable for corporate mirrors and offline tests.
+const DS_BASE_URL = String(process.env.DEEPSEEK_BASE_URL || 'https://chat.deepseek.com').replace(/\/+$/, '');
+function dsUrl(pathname) { return `${DS_BASE_URL}${pathname}`; }
 
 // Per-DeepSeek-request network timeout. Plain fetch() has NO default timeout, so a
 // stalled upstream would hang the inbound request (and pin the account) forever.
-const DS_FETCH_TIMEOUT_MS = Number(process.env.DEEPSEEK_FETCH_TIMEOUT_MS || 60000);
+const DS_FETCH_TIMEOUT_MS = envNumber('DEEPSEEK_FETCH_TIMEOUT_MS', 60000, 1000);
+// A completion is a long-lived SSE stream: thinking answers routinely take more
+// than a minute, so the stream is bounded by inactivity instead of total time.
+const DS_STREAM_IDLE_TIMEOUT_MS = envNumber('DEEPSEEK_STREAM_IDLE_TIMEOUT_MS', DS_FETCH_TIMEOUT_MS, 1000);
+const DS_STREAM_MAX_MS = envNumber('DEEPSEEK_STREAM_MAX_MS', 10 * 60 * 1000, 1000);
+// While a streamed request has nothing to send yet (a tool turn is buffered,
+// or DeepSeek is slow to start), an SSE comment is written after this much
+// silence so clients and proxies do not drop the idle connection.
+const STREAM_KEEPALIVE_MS = envNumber('DEEPSEEK_STREAM_KEEPALIVE_MS', 10000, 1000);
+function timeoutError(message) {
+    const error = new Error(message);
+    error.name = 'TimeoutError';
+    return error;
+}
+
+// Makes `controller` follow an outer signal (the inbound request being
+// cancelled). Works on Node 18, which lacks AbortSignal.any.
+function followSignal(controller, signal) {
+    if (!signal) return;
+    if (signal.aborted) controller.abort(signal.reason);
+    else signal.addEventListener('abort', () => controller.abort(signal.reason), { once: true });
+}
+
+function throwIfAborted(signal) {
+    if (signal?.aborted) throw signal.reason || new Error('request aborted');
+}
+
+// Short JSON request (PoW, session create): bounded by DS_FETCH_TIMEOUT_MS
+// including the body, and cancelled together with the inbound request.
 function dsFetch(url, options = {}, timeoutMs = DS_FETCH_TIMEOUT_MS) {
-    return fetch(url, { ...options, signal: options.signal || AbortSignal.timeout(timeoutMs) });
+    const controller = new AbortController();
+    followSignal(controller, options.signal);
+    followSignal(controller, AbortSignal.timeout(timeoutMs));
+    return fetch(url, { ...options, signal: controller.signal });
+}
+
+// Starts a streaming completion request. The returned controller lets the SSE
+// reader enforce an idle timeout; options.signal (the inbound request) cancels
+// the upstream generation when the client disconnects.
+async function dsFetchStream(url, options = {}) {
+    const controller = new AbortController();
+    followSignal(controller, options.signal);
+    const connectTimer = setTimeout(() => controller.abort(timeoutError(`DeepSeek did not respond within ${DS_FETCH_TIMEOUT_MS}ms`)), DS_FETCH_TIMEOUT_MS);
+    try {
+        const resp = await fetch(url, { ...options, signal: controller.signal });
+        resp.abortController = controller;
+        return resp;
+    } finally {
+        clearTimeout(connectTimer);
+    }
+}
+
+// Reads a (non-streaming) error body without trusting the upstream to finish
+// it: a stalled body must not pin the request, its session lock and its
+// concurrency slot forever.
+async function readUpstreamText(resp, timeoutMs = DS_FETCH_TIMEOUT_MS) {
+    const timer = setTimeout(() => resp.abortController?.abort(timeoutError(`DeepSeek error body not received within ${timeoutMs}ms`)), timeoutMs);
+    try {
+        return await resp.text();
+    } catch (error) {
+        return '';
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+// Iterates a response body, aborting it after DS_STREAM_IDLE_TIMEOUT_MS without
+// data or DS_STREAM_MAX_MS overall.
+async function* readStreamWithTimeouts(resp) {
+    const controller = resp.abortController;
+    const body = resp.body;
+    if (!body) return;
+    if (!controller) { yield* body; return; }
+    let idleTimer = null;
+    const armIdle = () => {
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => controller.abort(timeoutError(`DeepSeek stream was idle for ${DS_STREAM_IDLE_TIMEOUT_MS}ms`)), DS_STREAM_IDLE_TIMEOUT_MS);
+    };
+    const maxTimer = setTimeout(() => controller.abort(timeoutError(`DeepSeek stream exceeded ${DS_STREAM_MAX_MS}ms`)), DS_STREAM_MAX_MS);
+    armIdle();
+    try {
+        for await (const chunk of body) {
+            armIdle();
+            yield chunk;
+        }
+    } catch (error) {
+        throw controller.signal.aborted && controller.signal.reason ? controller.signal.reason : error;
+    } finally {
+        clearTimeout(idleTimer);
+        clearTimeout(maxTimer);
+    }
 }
 
 const SERVER_HOST = os.hostname();  // Dynamic hostname detection
@@ -87,12 +190,23 @@ function prompt(question) {
 }
 function isTruthy(value) { return typeof value === 'string' && ['1','true','yes','on'].includes(value.trim().toLowerCase()); }
 
-function isProxyAuthorized(authorization, expectedKey = PROXY_API_KEY) {
-    if (!expectedKey) return true;
-    if (typeof authorization !== 'string' || !authorization.startsWith('Bearer ')) return false;
-    const supplied = Buffer.from(authorization.slice('Bearer '.length), 'utf8');
+function isProxyKeyMatch(suppliedKey, expectedKey) {
+    if (typeof suppliedKey !== 'string') return false;
+    const supplied = Buffer.from(suppliedKey, 'utf8');
     const expected = Buffer.from(String(expectedKey), 'utf8');
     return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
+}
+
+// Accepts the proxy key as `Authorization: Bearer <key>` (OpenAI clients,
+// Claude Code's ANTHROPIC_AUTH_TOKEN) or as `x-api-key: <key>` (Anthropic
+// SDKs and ANTHROPIC_API_KEY).
+function isProxyAuthorized(authorization, expectedKey = PROXY_API_KEY, apiKeyHeader = undefined) {
+    if (!expectedKey) return true;
+    if (typeof authorization === 'string' && authorization.startsWith('Bearer ')
+        && isProxyKeyMatch(authorization.slice('Bearer '.length), expectedKey)) {
+        return true;
+    }
+    return isProxyKeyMatch(apiKeyHeader, expectedKey);
 }
 
 function isLoopbackHost(host) {
@@ -130,17 +244,19 @@ function isBrowserOriginAllowed(origin, allowedOrigins = PROXY_CORS_ORIGINS) {
 const CONTEXT_COMPACTED_HEADER = 'X-FreeDeepseek-Context-Compacted';
 function setCorsResponseHeaders(res) {
     res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta, x-agent-session');
     res.setHeader('Access-Control-Expose-Headers', CONTEXT_COMPACTED_HEADER);
 }
 function markContextCompacted(res) {
-    res.setHeader(CONTEXT_COMPACTED_HEADER, 'true');
+    // A live stream may already have sent its headers.
+    if (!res.headersSent) res.setHeader(CONTEXT_COMPACTED_HEADER, 'true');
 }
 
 // === Per-Agent Session Store ===
 const sessions = new Map();  // keyed by agent ID (from `user` field)
 const MAX_HISTORY_LENGTH = 15;
 const MAX_HISTORY_CHARS = 10000;
+const MAX_HISTORY_ENTRY_CHARS = 2000;  // per stored assistant answer
 const MAX_MESSAGE_DEPTH = 100;  // auto-reset after this many messages
 const SESSION_TTL_MS = 2 * 60 * 60 * 1000;  // 2 hours
 
@@ -165,14 +281,26 @@ const configuredPromptChars = Number(process.env.DEEPSEEK_MAX_PROMPT_CHARS);
 const MAX_UPSTREAM_PROMPT_CHARS = Number.isFinite(configuredPromptChars)
     ? Math.max(MIN_UPSTREAM_PROMPT_CHARS, Math.floor(configuredPromptChars))
     : 80000;
+// Upper bound for everything one remote DeepSeek chat has accumulated (prompts
+// plus answers). Past it the next turn starts a fresh chat with a compacted
+// prompt: very long Web chats overflow and make the model drift off the tool
+// protocol (#23, #30).
+const MAX_SESSION_CONTEXT_CHARS = Math.max(
+    MAX_UPSTREAM_PROMPT_CHARS,
+    Math.floor(envNumber('DEEPSEEK_MAX_SESSION_CHARS', MAX_UPSTREAM_PROMPT_CHARS * 3, MIN_UPSTREAM_PROMPT_CHARS)),
+);
+// Short cooldown for an account that DeepSeek throttled inside the stream
+// ("too many messages"); HTTP 401/403/429 keep DEEPSEEK_ACCOUNT_COOLDOWN_MS.
+const RATE_LIMIT_COOLDOWN_MS = envNumber('DEEPSEEK_RATE_LIMIT_COOLDOWN_MS', 60 * 1000, 1000);
+const DS_CLIENT_VERSION = process.env.DEEPSEEK_CLIENT_VERSION || '2.0.0';
 function buildBaseHeaders(config = DS_CONFIG) {
     return {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
         "x-client-platform": "web",
-        "x-client-version": "2.0.0",
+        "x-client-version": DS_CLIENT_VERSION,
         "x-client-locale": "ru",
         "x-client-timezone-offset": "14400",
-        "x-app-version": "2.0.0",
+        "x-app-version": DS_CLIENT_VERSION,
         "Authorization": `Bearer ${config.token || ''}`,
         "x-hif-dliq": config.hif_dliq || '',
         "x-hif-leim": config.hif_leim || '',
@@ -240,13 +368,16 @@ function selectAccountForSession(session) {
     if (session.accountId) {
         const sticky = accounts.find(a => a.id === session.accountId);
         if (sticky && sticky.config.token && sticky.config.cookie && sticky.cooldownUntil <= now) return sticky;
+    }
+    const ready = accounts.filter(a => a.config.token && a.config.cookie && a.cooldownUntil <= now);
+    if (ready.length > 0 && session.accountId) {
         // A DeepSeek chat_session belongs to the auth account that created it.
         // If that account disappeared, lost credentials, or is cooling down,
-        // never reuse its session id under a different account.
+        // never reuse its session id under a different account. While no
+        // other account is ready the chat is kept for when its account returns.
         resetRemoteSession(session);
         session.accountId = null;
     }
-    const ready = accounts.filter(a => a.config.token && a.config.cookie && a.cooldownUntil <= now);
     if (ready.length === 0) {
         const waiting = accounts.filter(a => a.config.token && a.config.cookie).sort((a, b) => a.cooldownUntil - b.cooldownUntil)[0];
         if (waiting) {
@@ -277,17 +408,24 @@ function parseRetryAfterMs(retryAfterRaw) {
     if (!Number.isNaN(t)) return Math.max(1000, t - Date.now());
     return null;
 }
-function markAccountFailure(account, status, reason = '', retryAfterRaw = null) {
+function markAccountFailure(account, status, reason = '', retryAfterRaw = null, fallbackCooldownMs = DEFAULT_ACCOUNT_COOLDOWN_MS) {
     if (!account) return;
     account.failures++;
     if ([401, 403, 429].includes(Number(status))) {
         // On 429, honor a valid Retry-After header (seconds or HTTP-date) when present;
         // otherwise fall back to the fixed env-configured cooldown.
         const retryMs = Number(status) === 429 ? parseRetryAfterMs(retryAfterRaw) : null;
-        const cooldownMs = retryMs != null ? retryMs : DEFAULT_ACCOUNT_COOLDOWN_MS;
+        const cooldownMs = retryMs != null ? retryMs : fallbackCooldownMs;
         account.cooldownUntil = Date.now() + cooldownMs;
         console.log(`[account:${account.id}] cooldown for ${Math.round(cooldownMs / 1000)}s after HTTP ${status}${reason ? ` (${reason})` : ''}${retryMs != null ? ' (Retry-After)' : ''}`);
     }
+}
+function hasOtherReadyAccount(accountId, now = Date.now()) {
+    return accounts.some(a => a.id !== accountId && a.config.token && a.config.cookie && a.cooldownUntil <= now);
+}
+// Errors after which the same request can be replayed on another account.
+function isAccountLevelError(error) {
+    return [401, 403, 429].includes(Number(error?.status));
 }
 async function readDeepSeekJsonResponse(resp, label, account) {
     const text = await resp.text();
@@ -315,6 +453,14 @@ function createSession() {
         accountId: null,
         history: [],
         lastActivityAt: Date.now(),
+        // Fingerprints of the client messages already present in the remote
+        // chat and of the system prompt/tools it was started with. They let a
+        // follow-up request send only its new messages (see planSessionTurn).
+        sentMessageKeys: [],
+        contextKey: null,
+        // Approximate size of everything the remote chat holds.
+        remoteChars: 0,
+        busy: false,
     };
 }
 
@@ -328,6 +474,9 @@ function resetRemoteSession(session) {
     session.parentMessageId = null;
     session.createdAt = null;
     session.messageCount = 0;
+    session.sentMessageKeys = [];
+    session.contextKey = null;
+    session.remoteChars = 0;
     // Keep local recovery history and the sticky account assignment. A remote
     // chat can be unhealthy without invalidating either of those local hints.
     return failed;
@@ -338,6 +487,7 @@ function prepareSessionForPrompt(session, now = Date.now()) {
     let reason = null;
     if (session.messageCount >= MAX_MESSAGE_DEPTH) reason = 'max_message_depth';
     else if (session.createdAt && now - session.createdAt > SESSION_TTL_MS) reason = 'session_ttl';
+    else if ((session.remoteChars || 0) >= MAX_SESSION_CONTEXT_CHARS) reason = 'max_context_chars';
     if (!reason) return null;
     return { reason, ...resetRemoteSession(session) };
 }
@@ -366,90 +516,54 @@ function sweepIdleSessions(maxIdleMs = SESSION_TTL_MS * 2) {
 // solvePOW() lives in lib/pow (compiled-module cache + WASM-fetch timeout),
 // shared with client.js. Called as solvePOW(challenge, wasmUrl).
 
+// DeepSeek Web merged its “Быстрый” (Instant), “Эксперт” (Expert) and
+// “Распознавание” (Vision) modes into a single unified mode on 2026-09-10 and
+// retired V4 Pro on 2026-09-14 (#31). Every request now goes to the same
+// model_type; only the “DeepThink” (thinking_enabled) and “Search”
+// (search_enabled) toggles remain. The old aliases stay accepted so existing
+// client configs keep working. DEEPSEEK_MODEL_TYPE overrides the model_type
+// sent upstream; set it to an empty value to omit the field entirely.
+const DEEPSEEK_MODEL_TYPE = String(process.env.DEEPSEEK_MODEL_TYPE ?? 'default').trim();
+const UNIFIED_REAL_MODEL = 'DeepSeek-V4.1-Flash (DeepSeek Web unified mode)';
+
+function unifiedModel({ thinking = false, search = false, legacy = null } = {}) {
+    let realModel = UNIFIED_REAL_MODEL;
+    if (thinking) realModel += ' + DeepThink';
+    if (search) realModel += ' + web search';
+    if (legacy) realModel += `; legacy alias: ${legacy}`;
+    return {
+        model_type: DEEPSEEK_MODEL_TYPE,
+        thinking_enabled: thinking,
+        search_enabled: search,
+        real_model: realModel,
+        capabilities: { reasoning: thinking, web_search: search, files: true },
+        supported: true,
+        deprecated: Boolean(legacy),
+    };
+}
+
 const MODEL_CONFIGS = {
-    // DeepSeek Web real model_type: default / UI name: "Быстрый".
-    // Public model family: DeepSeek-V3.2-Exp chat mode (fast, no visible reasoning).
-    'deepseek-chat': {
-        model_type: 'default', thinking_enabled: false, search_enabled: false,
-        real_model: 'DeepSeek-V4-Flash non-thinking (DeepSeek Web “Быстрый” / default)',
-        capabilities: { reasoning: false, web_search: false, files: true },
-        supported: true,
-    },
-    'deepseek-v3': {
-        model_type: 'default', thinking_enabled: false, search_enabled: false,
-        real_model: 'DeepSeek-V4-Flash non-thinking (DeepSeek Web “Быстрый” / default)',
-        capabilities: { reasoning: false, web_search: false, files: true },
-        supported: true,
-    },
-    'deepseek-default': {
-        model_type: 'default', thinking_enabled: false, search_enabled: false,
-        real_model: 'DeepSeek-V4-Flash non-thinking (DeepSeek Web “Быстрый” / default)',
-        capabilities: { reasoning: false, web_search: false, files: true },
-        supported: true,
-    },
-    // Same DeepSeek Web default model, but with thinking_enabled=true. UI exposes it as thinking/reasoning mode.
-    'deepseek-reasoner': {
-        model_type: 'default', thinking_enabled: true, search_enabled: false,
-        real_model: 'DeepSeek-V4-Flash thinking mode (DeepSeek Web “Быстрый” + thinking_enabled)',
-        capabilities: { reasoning: true, web_search: false, files: true },
-        supported: true,
-    },
-    'deepseek-r1': {
-        model_type: 'default', thinking_enabled: true, search_enabled: false,
-        real_model: 'DeepSeek-V4-Flash thinking mode; R1-compatible alias, not a separate R1 model_type in current Web API',
-        capabilities: { reasoning: true, web_search: false, files: true },
-        supported: true,
-    },
-    'deepseek-chat-search': {
-        model_type: 'default', thinking_enabled: false, search_enabled: true,
-        real_model: 'DeepSeek-V4-Flash non-thinking (DeepSeek Web “Быстрый” / default) + web search',
-        capabilities: { reasoning: false, web_search: true, files: true },
-        supported: true,
-    },
-    'deepseek-default-search': {
-        model_type: 'default', thinking_enabled: false, search_enabled: true,
-        real_model: 'DeepSeek-V4-Flash non-thinking (DeepSeek Web “Быстрый” / default) + web search',
-        capabilities: { reasoning: false, web_search: true, files: true },
-        supported: true,
-    },
-    'deepseek-reasoner-search': {
-        model_type: 'default', thinking_enabled: true, search_enabled: true,
-        real_model: 'DeepSeek-V4-Flash thinking mode + web search',
-        capabilities: { reasoning: true, web_search: true, files: true },
-        supported: true,
-    },
-    'deepseek-r1-search': {
-        model_type: 'default', thinking_enabled: true, search_enabled: true,
-        real_model: 'DeepSeek-V4-Flash thinking mode + web search; R1-compatible alias',
-        capabilities: { reasoning: true, web_search: true, files: true },
-        supported: true,
-    },
-    // DeepSeek Web UI name: “Эксперт”. Requires current web client headers (x-client-version=2.0.0).
-    'deepseek-expert': {
-        model_type: 'expert', thinking_enabled: false, search_enabled: false,
-        real_model: 'DeepSeek Web “Эксперт” (limited resources)',
-        capabilities: { reasoning: false, web_search: false, files: false },
-        supported: true,
-    },
-    'deepseek-v4-pro': {
-        model_type: 'expert', thinking_enabled: true, search_enabled: false,
-        real_model: 'DeepSeek Web “Эксперт” + thinking mode (exposed as deepseek-v4-pro alias)',
-        capabilities: { reasoning: true, web_search: false, files: false },
-        supported: true,
-    },
-    'deepseek-expert-search': {
-        model_type: 'expert', thinking_enabled: false, search_enabled: true,
-        real_model: 'DeepSeek Web “Эксперт” + search requested, but Expert has search_feature=null in remote config',
-        capabilities: { reasoning: false, web_search: false, files: false },
-        supported: false,
-        unavailable_reason: 'Expert mode is rejected; remote config says search is not available for Expert.',
-    },
+    'deepseek-chat': unifiedModel(),
+    'deepseek-default': unifiedModel(),
+    'deepseek-v4-flash': unifiedModel(),
+    'deepseek-v4.1-flash': unifiedModel(),
+    'deepseek-v3': unifiedModel({ legacy: 'V3 is no longer served by DeepSeek Web' }),
+    'deepseek-reasoner': unifiedModel({ thinking: true }),
+    'deepseek-r1': unifiedModel({ thinking: true, legacy: 'R1-compatible name for DeepThink' }),
+    'deepseek-chat-search': unifiedModel({ search: true }),
+    'deepseek-default-search': unifiedModel({ search: true }),
+    'deepseek-reasoner-search': unifiedModel({ thinking: true, search: true }),
+    'deepseek-r1-search': unifiedModel({ thinking: true, search: true, legacy: 'R1-compatible name for DeepThink' }),
+    // Expert mode and V4 Pro are gone; DeepSeek points former Expert users at
+    // DeepThink, and routes V4 Pro traffic to V4.1 Flash.
+    'deepseek-expert': unifiedModel({ thinking: true, legacy: 'Expert mode was merged into the unified mode' }),
+    'deepseek-v4-pro': unifiedModel({ thinking: true, legacy: 'V4 Pro was retired; served by V4.1 Flash' }),
+    'deepseek-expert-search': unifiedModel({ thinking: true, search: true, legacy: 'Expert mode was merged into the unified mode' }),
     'deepseek-vision': {
-        model_type: 'vision', thinking_enabled: false, search_enabled: false,
-        real_model: 'DeepSeek Web “Распознавание” / image understanding beta',
+        ...unifiedModel({ legacy: 'Vision mode was merged into the unified mode' }),
         capabilities: { reasoning: false, web_search: false, files: true, vision: true },
         supported: false,
-        unavailable_reason: 'Current Web API returns: Vision is temporarily unavailable (backend_err_by_model).',
+        unavailable_reason: 'DeepSeek Web now understands images in its unified mode, but this proxy does not upload images yet. Use deepseek-chat for text.',
     },
 };
 
@@ -462,6 +576,7 @@ const ALL_MODEL_CAPABILITIES = Object.fromEntries(Object.entries(MODEL_CONFIGS).
     search_enabled: cfg.search_enabled,
     capabilities: cfg.capabilities,
     supported: cfg.supported,
+    deprecated: cfg.deprecated === true,
     unavailable_reason: cfg.unavailable_reason || null,
 }]));
 
@@ -526,37 +641,19 @@ function resolveModelConfig(model) {
 function isKnownModel(model) { return Object.prototype.hasOwnProperty.call(MODEL_CONFIGS, String(model || '').toLowerCase()); }
 function isSupportedModel(model) { return resolveModelConfig(model).supported === true; }
 
-async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', freshSessionPrompt = prompt) {
-    const modelCfg = resolveModelConfig(model);
-    const session = getOrCreateAgentSession(agentId);
-    const hadRemoteSession = Boolean(session.id);
-    const account = selectAccountForSession(session);
-    const dsHeaders = account.headers;
-    account.lastUsedAt = Date.now();
-    const agentTag = `[${agentId}/acct:${account.id}]`;
-
-    // Normally this rollover is performed before the prompt is built, so local
-    // recovery history can be injected. Keep this guard for direct callers and
-    // concurrent requests that may have advanced the same session meanwhile.
-    const rollover = prepareSessionForPrompt(session);
-    const accountRotationReset = hadRemoteSession && !session.id;
-    const recoveredFreshSession = accountRotationReset || Boolean(rollover);
-    let effectivePrompt = recoveredFreshSession ? freshSessionPrompt : prompt;
-    if (accountRotationReset) {
-        console.log(`${agentTag} Account rotation reset the previous remote session; using recovery prompt.`);
-    }
-    if (rollover) {
-        console.log(`${agentTag} Session ${rollover.failedSessionId} reset before upstream call (${rollover.reason}).`);
-    }
-
-    const cr = await dsFetch('https://chat.deepseek.com/api/v0/chat/create_pow_challenge', {
-        method: 'POST', headers: dsHeaders,
+// A PoW answer is bound to one completion request, so every completion
+// (including the one after a session recreate) solves a fresh challenge.
+async function createPowHeader(account, signal) {
+    const cr = await dsFetch(dsUrl('/api/v0/chat/create_pow_challenge'), {
+        method: 'POST', headers: account.headers, signal,
         body: JSON.stringify({ target_path: '/api/v0/chat/completion' })
     });
     const chalText = await cr.text();
     if (!cr.ok) {
-        markAccountFailure(account, cr.status, 'pow challenge');
-        throw new Error(`DeepSeek auth/network error while creating PoW challenge: HTTP ${cr.status}. Run npm run doctor. If auth expired, run npm run auth or npm run auth:import.`);
+        markAccountFailure(account, cr.status, 'pow challenge', cr.headers.get('retry-after'));
+        const error = createUpstreamHttpError(cr.status, chalText, cr.headers.get('retry-after'));
+        error.message = `DeepSeek auth/network error while creating PoW challenge: HTTP ${cr.status}. Run npm run doctor. If auth expired, run npm run auth or npm run auth:import.`;
+        throw error;
     }
     let chalJson;
     try { chalJson = JSON.parse(chalText); }
@@ -566,93 +663,120 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
         throw new Error('DeepSeek PoW response has no data.biz_data.challenge. Auth may be expired, captcha may be required, or DeepSeek changed Web API. Run npm run doctor, then npm run auth.');
     }
     const answer = await solvePOW(challenge, account.config.wasmUrl);
-
-    if (!session.id) {
-        const sr = await dsFetch('https://chat.deepseek.com/api/v0/chat_session/create', {
-            method: 'POST', headers: dsHeaders, body: '{}'
-        });
-        const { json: sessionData, text: sessionText } = await readDeepSeekJsonResponse(sr, 'session create', account);
-        const createdSessionId = sessionData?.data?.biz_data?.chat_session?.id || sessionData?.data?.biz_data?.id;
-        if (!sr.ok || !createdSessionId) {
-            throw new Error(`Could not create DeepSeek chat session (HTTP ${sr.status}). Auth may be expired/captcha-blocked. Run npm run doctor, then npm run auth. First chars: ${String(sessionText || '').substring(0, 120)}`);
-        }
-        session.id = createdSessionId;
-        session.accountId = account.id;
-        session.parentMessageId = null;
-        session.createdAt = Date.now();
-        session.messageCount = 0;
-        console.log(`${agentTag} Created new session: ${session.id}`);
-    } else {
-        console.log(`${agentTag} Reusing session: ${session.id} (parent: ${session.parentMessageId}, msg#${session.messageCount})`);
-    }
-
-    const powB64 = Buffer.from(JSON.stringify({
+    return Buffer.from(JSON.stringify({
         algorithm: challenge.algorithm, challenge: challenge.challenge,
         salt: challenge.salt, answer: answer,
         signature: challenge.signature, target_path: '/api/v0/chat/completion'
     })).toString('base64');
-    const resp = await dsFetch('https://chat.deepseek.com/api/v0/chat/completion', {
-        method: 'POST',
-        headers: { ...dsHeaders, 'X-DS-PoW-Response': powB64 },
-        body: JSON.stringify({
-            chat_session_id: session.id,
-            parent_message_id: session.parentMessageId,
-            model_type: modelCfg.model_type,
-            prompt: effectivePrompt, ref_file_ids: [],
-            thinking_enabled: modelCfg.thinking_enabled, search_enabled: modelCfg.search_enabled,
-            action: null, preempt: false,
-        })
-    });
+}
 
-    // If session expired, reset and retry once
+async function createRemoteChat(session, account, agentTag, label = 'session create', signal) {
+    const sr = await dsFetch(dsUrl('/api/v0/chat_session/create'), {
+        method: 'POST', headers: account.headers, body: '{}', signal,
+    });
+    const { json: sessionData, text: sessionText } = await readDeepSeekJsonResponse(sr, label, account);
+    const createdSessionId = sessionData?.data?.biz_data?.chat_session?.id || sessionData?.data?.biz_data?.id;
+    if (!sr.ok || !createdSessionId) {
+        const error = sr.ok ? new Error('') : createUpstreamHttpError(sr.status, sessionText, sr.headers.get('retry-after'));
+        error.message = `Could not create DeepSeek chat session (HTTP ${sr.status}). Auth may be expired/captcha-blocked. Run npm run doctor, then npm run auth. First chars: ${String(sessionText || '').substring(0, 120)}`;
+        throw error;
+    }
+    session.id = createdSessionId;
+    session.accountId = account.id;
+    session.parentMessageId = null;
+    session.createdAt = Date.now();
+    session.messageCount = 0;
+    session.sentMessageKeys = [];
+    session.contextKey = null;
+    session.remoteChars = 0;
+    console.log(`${agentTag} Created new session: ${session.id}`);
+}
+
+async function postCompletion(session, account, modelCfg, promptText, signal) {
+    const powB64 = await createPowHeader(account, signal);
+    throwIfAborted(signal);
+    const payload = {
+        chat_session_id: session.id,
+        parent_message_id: session.parentMessageId,
+        prompt: promptText, ref_file_ids: [],
+        thinking_enabled: modelCfg.thinking_enabled, search_enabled: modelCfg.search_enabled,
+        action: null, preempt: false,
+    };
+    if (modelCfg.model_type) payload.model_type = modelCfg.model_type;
+    return dsFetchStream(dsUrl('/api/v0/chat/completion'), {
+        method: 'POST',
+        headers: { ...account.headers, 'X-DS-PoW-Response': powB64 },
+        body: JSON.stringify(payload),
+        signal,
+    });
+}
+
+// DeepSeek answers "too many messages" with HTTP 400 (not 429). Recreating the
+// chat would only burn another request: cool this account down briefly so the
+// caller can fail over or return 429. Auth failures keep their own handling.
+function throwIfRateLimited(account, status, errText, retryAfter) {
+    if ([401, 403, 429].includes(Number(status)) || !isRateLimitError(errText)) return;
+    markAccountFailure(account, 429, 'rate limited', retryAfter, RATE_LIMIT_COOLDOWN_MS);
+    throw createUpstreamHttpError(429, errText, retryAfter || String(Math.ceil(RATE_LIMIT_COOLDOWN_MS / 1000)));
+}
+
+async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', freshSessionPrompt = prompt, session = getOrCreateAgentSession(agentId), signal = null) {
+    const modelCfg = resolveModelConfig(model);
+    const hadRemoteSession = Boolean(session.id);
+    const account = selectAccountForSession(session);
+    account.lastUsedAt = Date.now();
+    const agentTag = `[${agentId}/acct:${account.id}]`;
+
+    // Normally this rollover is performed before the prompt is built, so local
+    // recovery history can be injected. Keep this guard for direct callers and
+    // concurrent requests that may have advanced the same session meanwhile.
+    const rollover = prepareSessionForPrompt(session);
+    const accountRotationReset = hadRemoteSession && !session.id && !rollover;
+    // A brand-new remote chat has no memory of earlier turns, so it always
+    // receives the self-contained prompt.
+    const startsFreshChat = !session.id;
+    let effectivePrompt = startsFreshChat ? freshSessionPrompt : prompt;
+    if (accountRotationReset) {
+        console.log(`${agentTag} Account rotation reset the previous remote session; using recovery prompt.`);
+    }
+    if (rollover) {
+        console.log(`${agentTag} Session ${rollover.failedSessionId} reset before upstream call (${rollover.reason}).`);
+    }
+
+    if (!session.id) {
+        await createRemoteChat(session, account, agentTag, 'session create', signal);
+    } else {
+        console.log(`${agentTag} Reusing session: ${session.id} (parent: ${session.parentMessageId}, msg#${session.messageCount})`);
+    }
+
+    const resp = await postCompletion(session, account, modelCfg, effectivePrompt, signal);
+
     if (resp.status !== 200) {
         // Pass Retry-After so a 429 honors the server-requested cooldown (#16).
         const retryAfter = resp.headers.get('retry-after');
         markAccountFailure(account, resp.status, 'completion', retryAfter);
-        const errText = await resp.text();
+        const errText = await readUpstreamText(resp);
+        throwIfAborted(signal);
         console.log(`${agentTag} Session error (${resp.status}): ${errText.substring(0, 100)}`);
+        throwIfRateLimited(account, resp.status, errText, retryAfter);
+        // The remote chat may have expired or overflowed: start a new one with
+        // the full prompt once. Auth and rate-limit statuses are surfaced as is.
         if (resp.status === 400 || resp.status === 404 || resp.status === 500) {
             console.log(`${agentTag} Session ${session.id} expired. Creating new session...`);
             resetRemoteSession(session);
-
-            const sr2 = await dsFetch('https://chat.deepseek.com/api/v0/chat_session/create', {
-                method: 'POST', headers: dsHeaders, body: '{}'
-            });
-            const { json: sessionData2, text: sessionText2 } = await readDeepSeekJsonResponse(sr2, 'session recreate', account);
-            const createdSessionId2 = sessionData2?.data?.biz_data?.chat_session?.id || sessionData2?.data?.biz_data?.id;
-            if (!sr2.ok || !createdSessionId2) {
-                throw new Error(`Could not recreate DeepSeek chat session (HTTP ${sr2.status}). Run npm run doctor, then npm run auth. First chars: ${String(sessionText2 || '').substring(0, 120)}`);
-            }
-            session.id = createdSessionId2;
-            session.accountId = account.id;
-            session.parentMessageId = null;
-            session.createdAt = Date.now();
-            console.log(`${agentTag} Created new session: ${session.id}`);
-
-            const newPowB64 = Buffer.from(JSON.stringify({
-                algorithm: challenge.algorithm, challenge: challenge.challenge,
-                salt: challenge.salt, answer: answer,
-                signature: challenge.signature, target_path: '/api/v0/chat/completion'
-            })).toString('base64');
-            const resp2 = await dsFetch('https://chat.deepseek.com/api/v0/chat/completion', {
-                method: 'POST',
-                headers: { ...dsHeaders, 'X-DS-PoW-Response': newPowB64 },
-                body: JSON.stringify({
-                    chat_session_id: session.id,
-                    parent_message_id: null,
-                    model_type: modelCfg.model_type,
-                    prompt: freshSessionPrompt, ref_file_ids: [],
-                    thinking_enabled: modelCfg.thinking_enabled, search_enabled: modelCfg.search_enabled,
-                    action: null, preempt: false,
-                })
-            });
+            await createRemoteChat(session, account, agentTag, 'session recreate', signal);
+            effectivePrompt = freshSessionPrompt;
+            const resp2 = await postCompletion(session, account, modelCfg, effectivePrompt, signal);
             if (!resp2.ok) {
                 const retryAfter2 = resp2.headers.get('retry-after');
                 markAccountFailure(account, resp2.status, 'completion after session recreate', retryAfter2);
-                const errText2 = await resp2.text();
+                const errText2 = await readUpstreamText(resp2);
+                resetRemoteSession(session);
+                throwIfAborted(signal);
+                throwIfRateLimited(account, resp2.status, errText2, retryAfter2);
                 throw createUpstreamHttpError(resp2.status, errText2, retryAfter2);
             }
-            effectivePrompt = freshSessionPrompt;
+            session.remoteChars += effectivePrompt.length;
             return { resp: resp2, agentId, account, promptUsed: effectivePrompt, freshSessionReset: true };
         }
         // The body was consumed for diagnostics, so returning this Response
@@ -661,7 +785,8 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
         throw createUpstreamHttpError(resp.status, errText, retryAfter);
     }
 
-    return { resp, agentId, account, promptUsed: effectivePrompt, freshSessionReset: recoveredFreshSession };
+    session.remoteChars += effectivePrompt.length;
+    return { resp, agentId, account, promptUsed: effectivePrompt, freshSessionReset: startsFreshChat };
 }
 
 // === Tool Calling Support ===
@@ -703,6 +828,8 @@ function compactToolSchema(value) {
     return compact;
 }
 
+const TOOL_CALL_FORMAT = '{"tool_call":{"name":"<function_name>","arguments":{...}}}';
+
 function formatToolDefinitions(tools) {
     if (!tools || tools.length === 0) return '';
     const rawSchemaChars = tools.reduce((total, tool) => {
@@ -712,17 +839,17 @@ function formatToolDefinitions(tools) {
     const compactSchemas = rawSchemaChars > Math.floor(MAX_UPSTREAM_PROMPT_CHARS * 0.4);
     let text = '\n\n--- TOOL REQUEST SYSTEM ---\n';
     text += 'You are an AI that ONLY REASONS and REQUESTS tool executions. You do NOT run any commands yourself.\n';
-    text += 'When you need data from the local server, REQUEST exactly one tool call. Prefer strict JSON:\n';
-    text += '{"tool_call":{"name":"<function_name>","arguments":{...}}}\n\n';
-    text += 'Legacy format is also accepted: TOOL_CALL: <function_name>\narguments: <JSON arguments>\n\n';
+    text += 'When you need data from the local server or need to change something there, REQUEST exactly one tool call using exactly this JSON format:\n';
+    text += `${TOOL_CALL_FORMAT}\n\n`;
     text += 'Your response will be sent to the local gateway, which executes the command and sends the output back in the next message.\n\n';
     text += 'RULES:\n';
     text += '1. You ONLY output the tool request — you never run anything yourself\n';
     text += '2. Do NOT simulate, guess, or fabricate command output — wait for the actual result\n';
     text += '3. The tool runs on ' + SERVER_HOST + ' (' + SERVER_PUBLIC_IP + '), the local server — NOT on DeepSeek\n';
-    text += '4. After the tool executes, the result will be sent to you as a new user/tool message\n';
-    text += '5. Never add explanation before or after the tool request when requesting a tool\n';
-    text += '6. Keep arguments compact. Do not include large file contents unless the tool schema requires it.\n\n';
+    text += '4. After the tool executes, the result will be sent to you as a new message starting with [Tool Result]\n';
+    text += '5. A tool request contains nothing but that JSON: no explanation before or after it, no Markdown code fence, one tool per response\n';
+    text += '6. Arguments must be valid JSON: escape backslashes (C:\\\\Users\\\\me), double quotes and newlines (\\n) inside strings. Keep arguments compact.\n';
+    text += '7. When no tool is needed (for example the task is finished), answer normally in plain text without any tool_call JSON\n\n';
     text += 'Available functions:\n';
     for (const tool of tools) {
         if (tool.type === 'function' && tool.function) {
@@ -736,8 +863,21 @@ function formatToolDefinitions(tools) {
         }
     }
     text += '\n--- END TOOL REQUEST SYSTEM ---\n';
-    text += '\nREMEMBER: Request tools only with strict JSON or TOOL_CALL legacy format. Never simulate results.';
+    text += `\nREMEMBER: Request a tool only with ${TOOL_CALL_FORMAT}. Never simulate results.`;
     return text;
+}
+
+// Appended to follow-up turns of a long-lived remote chat. The full tool
+// manual sits at the start of that chat; without a short refresher DeepSeek
+// gradually drifts off the protocol and answers with code blocks (#30).
+function formatToolReminder(tools) {
+    const names = (tools || [])
+        .filter(tool => tool?.type === 'function' && tool.function?.name)
+        .map(tool => tool.function.name);
+    if (names.length === 0) return '';
+    let list = names.join(', ');
+    if (list.length > 1500) list = list.substring(0, 1497) + '...';
+    return `[Tool reminder] Available tools: ${list}. To use one, reply with ONLY ${TOOL_CALL_FORMAT} (valid JSON, one tool, nothing else). Otherwise answer normally. Never invent tool results.`;
 }
 
 const MAX_TOOL_MARKUP_CHARS = 256 * 1024;
@@ -768,7 +908,10 @@ function extractBalancedJsonAt(text, startIndex) {
     return null;
 }
 
-function extractBalancedJsonObjects(text, maxObjects = MAX_TOOL_JSON_CANDIDATES) {
+// Top-level balanced objects in one linear pass. `accept` filters which
+// objects count towards maxObjects, so a long answer full of code braces
+// cannot exhaust the budget before the real candidate.
+function extractBalancedJsonObjects(text, maxObjects = MAX_TOOL_JSON_CANDIDATES, accept = null) {
     const objects = [];
     let start = -1;
     let depth = 0;
@@ -793,13 +936,92 @@ function extractBalancedJsonObjects(text, maxObjects = MAX_TOOL_JSON_CANDIDATES)
         if (ch === '}') {
             depth--;
             if (depth === 0) {
-                objects.push(text.substring(start, i + 1));
-                if (objects.length >= maxObjects) return objects;
+                const object = text.substring(start, i + 1);
+                if (!accept || accept(object)) {
+                    objects.push(object);
+                    if (objects.length >= maxObjects) return objects;
+                }
                 start = -1;
             }
         }
     }
     return objects;
+}
+
+const VALID_JSON_ESCAPE = /^(?:["\\/bfnrt]|u[0-9a-fA-F]{4})/;
+const TOOL_ENVELOPE_KEY_RE = /["'](?:tool_call|tool_calls|function_call)["']\s*:/;
+
+function repairJsonStringBody(body) {
+    // Raw text such as a Windows path: then single backslashes in this string
+    // are literal, so "C:\new\tmp" keeps them instead of becoming a newline +
+    // tab. The unambiguous escapes \\, \" and \uXXXX keep their JSON meaning.
+    // Signs of raw text: an invalid escape (\g, \d, \U ...), a \b or \f
+    // escape (backspace/form feed never appear in tool arguments), or a value
+    // that starts like a drive path (C:\...).
+    let rawBackslashes = /^[A-Za-z]:\\(?!\\)/.test(body);
+    for (let k = 0; !rawBackslashes && k < body.length; k++) {
+        if (body[k] !== '\\') continue;
+        const next = body.substring(k + 1, k + 6);
+        if (!VALID_JSON_ESCAPE.test(next) || next[0] === 'b' || next[0] === 'f') rawBackslashes = true;
+        k++;
+    }
+    let result = '';
+    for (let k = 0; k < body.length; k++) {
+        const c = body[k];
+        if (c === '\\') {
+            if (rawBackslashes && !/^(?:["\\]|u[0-9a-fA-F]{4})/.test(body.substring(k + 1, k + 6))) {
+                result += '\\\\';
+            } else {
+                result += c + (body[k + 1] ?? '');
+                k++;
+            }
+            continue;
+        }
+        const code = c.charCodeAt(0);
+        if (code < 0x20) {
+            result += c === '\n' ? '\\n' : c === '\r' ? '\\r' : c === '\t' ? '\\t' : '\\u' + code.toString(16).padStart(4, '0');
+            continue;
+        }
+        result += c;
+    }
+    return result;
+}
+
+// Repairs the two mistakes DeepSeek makes in otherwise well-formed tool JSON:
+// unescaped backslashes (Windows paths, #30) and raw newlines/tabs inside
+// string values (multi-line code). Structure outside strings is never changed.
+function repairJsonText(raw) {
+    const text = String(raw || '');
+    let out = '';
+    let changed = false;
+    let i = 0;
+    while (i < text.length) {
+        if (text[i] !== '"') { out += text[i++]; continue; }
+        let j = i + 1;
+        while (j < text.length && text[j] !== '"') j += text[j] === '\\' ? 2 : 1;
+        if (j >= text.length) { out += text.substring(i); break; }
+        const body = text.substring(i + 1, j);
+        const fixed = repairJsonStringBody(body);
+        if (fixed !== body) changed = true;
+        out += `"${fixed}"`;
+        i = j + 1;
+    }
+    return changed ? out : text;
+}
+
+// Even syntactically valid JSON is repaired when a string is clearly a raw
+// Windows path ("C:\files\bin" parses, but into a form feed and a backspace).
+function parseJsonLenient(raw) {
+    let parsed;
+    let error = null;
+    try { parsed = JSON.parse(raw); } catch (e) { error = e; }
+    const repaired = repairJsonText(raw);
+    if (repaired !== raw) {
+        try { return JSON.parse(repaired); }
+        catch (e) { /* fall back to the strict result or error */ }
+    }
+    if (error) throw error;
+    return parsed;
 }
 
 function buildToolCall(name, args = {}) {
@@ -808,7 +1030,7 @@ function buildToolCall(name, args = {}) {
     let parsedArgs = args;
     if (typeof parsedArgs === 'string') {
         if (parsedArgs.length > MAX_TOOL_ARGUMENT_CHARS) return null;
-        try { parsedArgs = JSON.parse(parsedArgs); } catch (e) { return null; }
+        try { parsedArgs = parseJsonLenient(parsedArgs); } catch (e) { return null; }
     }
     if (parsedArgs === null || parsedArgs === undefined) parsedArgs = {};
     if (typeof parsedArgs !== 'object' || Array.isArray(parsedArgs)) return null;
@@ -844,14 +1066,18 @@ function coerceToolCallObject(obj, { allowBare = false } = {}) {
 function parseJsonToolCandidate(raw, label = 'json', options = {}) {
     if (!raw) return null;
     try {
-        const parsed = JSON.parse(raw);
+        const parsed = parseJsonLenient(raw);
         const tc = coerceToolCallObject(parsed, options);
         if (tc) {
             console.log(`[parseToolCall] SUCCESS ${label}: ${tc.name} (args=${tc.arguments.length} chars)`);
             return tc;
         }
     } catch (e) {
-        console.log(`[parseToolCall] ${label} JSON.parse failed: ${e.message.substring(0, 100)}`);
+        // Answers with source code are full of braces. Only report candidates
+        // that were meant to be tool calls, not every C#/JS block (#30).
+        if (options.allowBare || TOOL_ENVELOPE_KEY_RE.test(raw)) {
+            console.log(`[parseToolCall] ${label} JSON.parse failed: ${e.message.substring(0, 100)}`);
+        }
     }
     return null;
 }
@@ -996,7 +1222,7 @@ function parseDsmlParameter(attrs, rawBody, args, seenNames) {
     if (rawValue.length > MAX_TOOL_ARGUMENT_CHARS) return false;
     let value = rawValue;
     if (stringMode && stringMode.toLowerCase() === 'false') {
-        try { value = JSON.parse(rawValue.trim()); } catch (e) { return false; }
+        try { value = parseJsonLenient(rawValue.trim()); } catch (e) { return false; }
     }
     args[parameterName] = value;
     return true;
@@ -1031,7 +1257,7 @@ function parseDsmlInvoke(name, body) {
     if (!decodedBody) return buildToolCall(name, {});
     const objects = extractBalancedJsonObjects(decodedBody, 2);
     if (objects.length !== 1 || decodedBody !== objects[0]) return null;
-    try { return buildToolCall(name, JSON.parse(objects[0])); }
+    try { return buildToolCall(name, parseJsonLenient(objects[0])); }
     catch (e) { return null; }
 }
 
@@ -1096,8 +1322,22 @@ function parseDsmlToolCall(text) {
     return null;
 }
 
-function looksLikeToolCallMarkup(text) {
+function looksLikeToolCallMarkup(rawText) {
+    // Examples inside foreign code fences are documentation, not broken calls.
+    const text = stripForeignCodeFences(rawText);
     return /TOOL_CALL:\s*[\w-]+|<\s*tool_call\b|[|｜]+\s*DSML\s*[|｜]+|[<＜]\s*\/?\s*(?:DSML)?(?:[\w.-]+:)?(?:tool[\s_-]*calls|function[\s_-]*calls|invoke)\b|["'](?:tool_call|tool_calls|function_call)["']\s*:/i.test(String(text || ''));
+}
+
+// A fence closes with the same number of backticks it opened with, so a
+// ````markdown block can quote a ```json example without exposing it.
+const CODE_FENCE_RE = /(`{3,})([\w+.-]*)[^\S\r\n]*\r?\n?([\s\S]*?)\1(?!`)/;
+
+function isJsonFenceLanguage(language) {
+    return !language || /^(?:json[c5]?|tool_?calls?|tool|text|plaintext|txt)$/i.test(language);
+}
+
+function stripForeignCodeFences(text) {
+    return String(text || '').replace(new RegExp(CODE_FENCE_RE.source, 'g'), (whole, ticks, language) => (isJsonFenceLanguage(language) ? whole : '\n'));
 }
 
 function parseToolCall(text) {
@@ -1107,40 +1347,54 @@ function parseToolCall(text) {
         return null;
     }
 
-    if (/[|｜]+\s*DSML\s*[|｜]+|[<＜]\s*\/?\s*(?:DSML)?(?:[\w.-]+:)?(?:tool[\s_-]*calls|function[\s_-]*calls|invoke)\b/i.test(text)) {
-        const dsml = parseDsmlToolCall(text);
+    // Code blocks in another language (```csharp, ```javascript, ```xml ...)
+    // are source code. Tool-call examples inside them must never execute, so
+    // all searches except the JSON-fence one run on the text without them.
+    const scanText = stripForeignCodeFences(text);
+
+    if (/[|｜]+\s*DSML\s*[|｜]+|[<＜]\s*\/?\s*(?:DSML)?(?:[\w.-]+:)?(?:tool[\s_-]*calls|function[\s_-]*calls|invoke)\b/i.test(scanText)) {
+        const dsml = parseDsmlToolCall(scanText);
         if (dsml) return dsml;
         console.log('[parseToolCall] Tool markup found but wrapper/invoke was incomplete or malformed');
         return null;
     }
 
     // XML-ish wrappers used by some agent prompts.
-    const xmlMatch = text.match(/<tool_call[^>]*>([\s\S]*?)<\/tool_call>/i);
+    const xmlMatch = scanText.match(/<tool_call[^>]*>([\s\S]*?)<\/tool_call>/i);
     if (xmlMatch) {
         const inner = xmlMatch[1].trim();
-        const tc = parseJsonToolCandidate(inner, 'xml', { allowBare: true });
+        let tc = parseJsonToolCandidate(inner, 'xml', { allowBare: true });
+        if (!tc) {
+            // Tolerate stray text around the JSON inside the wrapper.
+            const objectStart = inner.indexOf('{');
+            const object = objectStart === -1 ? null : extractBalancedJsonAt(inner, objectStart);
+            if (object && object !== inner) tc = parseJsonToolCandidate(object, 'xml-object', { allowBare: true });
+        }
         if (tc) return tc;
     }
 
-    // Fenced JSON blocks.
-    const fenceRe = /```(?:json)?\s*([\s\S]*?)```/gi;
+    // Fenced JSON blocks (untagged or tagged json).
+    const fenceRe = new RegExp(CODE_FENCE_RE.source, 'g');
     let fence;
     while ((fence = fenceRe.exec(text)) !== null) {
-        const tc = parseJsonToolCandidate(fence[1].trim(), 'fenced');
+        if (!isJsonFenceLanguage(fence[2])) continue;
+        const body = fence[3].trim();
+        if (!body.startsWith('{')) continue;
+        const tc = parseJsonToolCandidate(body, 'fenced');
         if (tc) return tc;
     }
 
     // Legacy TOOL_CALL: name + first balanced JSON object after it.
-    const match = text.match(/TOOL_CALL:\s*([\w-]+)\s*/i);
+    const match = scanText.match(/TOOL_CALL:\s*([\w-]+)\s*/i);
     if (match) {
         const name = match[1];
-        const afterMatch = text.substring(match.index + match[0].length);
+        const afterMatch = scanText.substring(match.index + match[0].length);
         const braceIdx = afterMatch.indexOf('{');
         if (braceIdx !== -1) {
             const rawJson = extractBalancedJsonAt(afterMatch, braceIdx);
             if (rawJson) {
                 try {
-                    const args = JSON.parse(rawJson);
+                    const args = parseJsonLenient(rawJson);
                     const tc = buildToolCall(name, args);
                     if (tc) {
                         console.log(`[parseToolCall] SUCCESS legacy: ${name} (args=${rawJson.length} chars)`);
@@ -1158,8 +1412,9 @@ function parseToolCall(text) {
     }
 
     // Scan each top-level balanced object once (linear time). Only explicit
-    // tool-call envelopes are executable; bare {name, arguments} examples are not.
-    for (const rawJson of extractBalancedJsonObjects(text)) {
+    // top-level tool-call envelopes are executable; bare {name, arguments}
+    // examples and envelopes nested inside other JSON are not.
+    for (const rawJson of extractBalancedJsonObjects(scanText, MAX_TOOL_JSON_CANDIDATES, object => TOOL_ENVELOPE_KEY_RE.test(object))) {
         const tc = parseJsonToolCandidate(rawJson, 'inline');
         if (tc) return tc;
     }
@@ -1173,7 +1428,9 @@ function parseToolCall(text) {
  * to prevent httpx/urlencode crashes when the gateway sends to Telegram.
  */
 function sanitizeContent(text) {
-    return text.replace(/[\ud800-\udfff]/g, '');
+    // Only lone (unpaired) surrogates are invalid. Valid pairs are emoji and
+    // other astral characters and must survive.
+    return String(text || '').replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, '');
 }
 
 function estimateTokens(text) {
@@ -1243,6 +1500,17 @@ function buildTextResponse(content, prompt, model = 'deepseek-default', reasonin
     };
 }
 
+// Images and files are not uploaded to DeepSeek. Keep a short marker so the
+// model knows something was attached, but never inline base64 payloads: one
+// screenshot would otherwise blow the prompt budget.
+function describeAttachment(kind, reference) {
+    const value = typeof reference === 'string' ? reference.trim() : '';
+    if (!value || value.startsWith('data:') || value.length > 512 || !/^(?:https?:\/\/|[\w.-]+$)/i.test(value)) {
+        return `[${kind} attached; not visible through this proxy]`;
+    }
+    return `[${kind}: ${value}]`;
+}
+
 function normalizeMessageContent(content) {
     if (content === null || content === undefined) return '';
     if (typeof content === 'string') return content;
@@ -1252,8 +1520,18 @@ function normalizeMessageContent(content) {
             if (!part || typeof part !== 'object') return '';
             if (part.type === 'text' || part.type === 'input_text' || part.type === 'output_text') return part.text || '';
             if (part.type === 'tool_result') return `[Tool Result ${part.tool_use_id || ''}]\n${normalizeMessageContent(part.content)}`;
-            if (part.type === 'image_url') return `[Image: ${part.image_url?.url || ''}]`;
-            return part.text || part.content || JSON.stringify(part);
+            // Earlier reasoning blocks (Anthropic thinking, Responses reasoning)
+            // carry signatures/encrypted payloads, not conversation text.
+            if (part.type === 'thinking' || part.type === 'redacted_thinking' || part.type === 'reasoning') return '';
+            if (part.type === 'image_url' || part.type === 'input_image' || part.type === 'image') {
+                return describeAttachment('Image', part.image_url?.url ?? part.image_url ?? part.url ?? part.source?.url ?? part.source?.data);
+            }
+            if (part.type === 'file' || part.type === 'input_file' || part.type === 'document') {
+                return describeAttachment('File', part.file?.filename ?? part.filename ?? part.title ?? part.file_url ?? part.source?.url ?? part.source?.data);
+            }
+            if (typeof part.text === 'string') return part.text;
+            if (part.content !== undefined) return normalizeMessageContent(part.content);
+            return JSON.stringify(part);
         }).filter(Boolean).join('\n');
     }
     return String(content);
@@ -1290,8 +1568,16 @@ function normalizeResponsesInput(input) {
             messages.push({ role: item.role || 'user', content: normalizeMessageContent(item.content) });
         } else if (item.role) {
             messages.push({ role: item.role, content: normalizeMessageContent(item.content) });
+        } else if (item.type === 'function_call') {
+            // The assistant's earlier tool request. Without it the following
+            // function_call_output has no visible cause in the prompt.
+            messages.push({ role: 'assistant', content: null, tool_calls: [{
+                id: item.call_id || item.id,
+                type: 'function',
+                function: { name: item.name, arguments: typeof item.arguments === 'string' ? item.arguments : JSON.stringify(item.arguments || {}) },
+            }] });
         } else if (item.type === 'function_call_output') {
-            messages.push({ role: 'tool', tool_call_id: item.call_id, content: item.output || '' });
+            messages.push({ role: 'tool', tool_call_id: item.call_id, content: normalizeMessageContent(item.output) });
         } else if (item.type === 'input_text') {
             messages.push({ role: 'user', content: item.text || '' });
         }
@@ -1371,7 +1657,7 @@ function toAnthropicResponse(openaiResp) {
         role: 'assistant',
         model: openaiResp.model,
         content,
-        stop_reason: choice.finish_reason === 'tool_calls' ? 'tool_use' : 'end_turn',
+        stop_reason: choice.finish_reason === 'tool_calls' ? 'tool_use' : (choice.finish_reason === 'length' ? 'max_tokens' : 'end_turn'),
         stop_sequence: null,
         usage: {
             input_tokens: openaiResp.usage?.prompt_tokens || 0,
@@ -1383,66 +1669,30 @@ function toAnthropicResponse(openaiResp) {
     return response;
 }
 
-function writeSse(res, event, data) {
-    if (event) res.write(`event: ${event}\n`);
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
+// Splits text into stream deltas by code point. Cutting by UTF-16 units would
+// split an emoji into lone surrogates, which strict UTF-8 clients (Python
+// httpx, Telegram gateways) reject.
+function chunkText(text, size) {
+    return String(text || '').match(new RegExp(`[\\s\\S]{1,${size}}`, 'gu')) || [];
 }
 
-function sendAnthropicStream(res, openaiResp) {
-    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
-    const choice = openaiResp.choices[0];
-    const msg = choice.message || {};
-    const message = toAnthropicResponse(openaiResp);
-    const hasToolCalls = msg.tool_calls && msg.tool_calls.length > 0;
-    writeSse(res, 'message_start', { type: 'message_start', message: { ...message, content: [] } });
-
-    // Anthropic-compatible clients expect a tool turn to be made of tool_use
-    // content blocks. If we emit DeepSeek reasoning as a text block before the
-    // tool_use block, some agents treat the turn as a normal text answer and do
-    // not execute the tool. Keep tool streaming clean: tool_use blocks only.
-    if (hasToolCalls) {
-        msg.tool_calls.forEach((tc, i) => {
-            writeSse(res, 'content_block_start', { type: 'content_block_start', index: i, content_block: { type: 'tool_use', id: tc.id, name: tc.function.name, input: {} } });
-            writeSse(res, 'content_block_delta', { type: 'content_block_delta', index: i, delta: { type: 'input_json_delta', partial_json: tc.function.arguments || '{}' } });
-            writeSse(res, 'content_block_stop', { type: 'content_block_stop', index: i });
-        });
-        writeSse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: 'tool_use', stop_sequence: null }, usage: message.usage });
-    } else {
-        if (msg.reasoning_content) {
-            writeSse(res, 'content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
-            writeSse(res, 'content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: `[reasoning]\n${msg.reasoning_content}\n[/reasoning]\n` } });
-            writeSse(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
-        }
-        const offset = msg.reasoning_content ? 1 : 0;
-        writeSse(res, 'content_block_start', { type: 'content_block_start', index: offset, content_block: { type: 'text', text: '' } });
-        const text = msg.content || '';
-        for (let i = 0; i < text.length; i += 80) {
-            writeSse(res, 'content_block_delta', { type: 'content_block_delta', index: offset, delta: { type: 'text_delta', text: text.substring(i, i + 80) } });
-        }
-        writeSse(res, 'content_block_stop', { type: 'content_block_stop', index: offset });
-        writeSse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: message.usage });
-    }
-    writeSse(res, 'message_stop', { type: 'message_stop' });
-    res.end();
-}
-
-function toResponsesResponse(openaiResp) {
+function toResponsesResponse(openaiResp, ids = {}) {
     const choice = openaiResp.choices[0];
     const msg = choice.message || {};
     const hasToolCalls = msg.tool_calls && msg.tool_calls.length > 0;
     const output = [];
     if (!hasToolCalls && msg.reasoning_content) {
-        output.push({ id: 'rs_' + Date.now(), type: 'reasoning', summary: [{ type: 'summary_text', text: msg.reasoning_content }] });
+        output.push({ id: ids.reasoning || 'rs_' + Date.now(), type: 'reasoning', summary: [{ type: 'summary_text', text: msg.reasoning_content }], status: 'completed' });
     }
     if (hasToolCalls) {
         for (const tc of msg.tool_calls) {
             output.push({ type: 'function_call', id: 'fc_' + tc.id, call_id: tc.id, name: tc.function.name, arguments: tc.function.arguments || '{}' });
         }
     } else {
-        output.push({ id: 'msg_' + Date.now(), type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: msg.content || '', annotations: [] }] });
+        output.push({ id: ids.message || 'msg_' + Date.now(), type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: msg.content || '', annotations: [] }] });
     }
     return {
-        id: openaiResp.id.replace(/^ds-/, 'resp_'),
+        id: ids.response || openaiResp.id.replace(/^ds-/, 'resp_'),
         object: 'response',
         created_at: openaiResp.created,
         status: 'completed',
@@ -1459,83 +1709,311 @@ function toResponsesResponse(openaiResp) {
     };
 }
 
-function sendResponsesStream(res, openaiResp) {
-    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
-    const response = toResponsesResponse(openaiResp);
-    const choice = openaiResp.choices[0];
-    const msg = choice.message || {};
-    const hasToolCalls = msg.tool_calls && msg.tool_calls.length > 0;
-    writeSse(res, 'response.created', { type: 'response.created', response: { ...response, status: 'in_progress', output: [] } });
-    writeSse(res, 'response.in_progress', { type: 'response.in_progress', response: { ...response, status: 'in_progress', output: [] } });
-    let outputIndex = 0;
-    if (!hasToolCalls && msg.reasoning_content) {
-        const reasoningItem = { id: 'rs_' + Date.now(), type: 'reasoning', summary: [], status: 'completed' };
-        writeSse(res, 'response.output_item.added', { type: 'response.output_item.added', output_index: outputIndex, item: { ...reasoningItem, status: 'in_progress' } });
-        writeSse(res, 'response.reasoning_summary_text.delta', { type: 'response.reasoning_summary_text.delta', output_index: outputIndex, summary_index: 0, delta: msg.reasoning_content });
-        writeSse(res, 'response.output_item.done', { type: 'response.output_item.done', output_index: outputIndex, item: { ...reasoningItem, summary: [{ type: 'summary_text', text: msg.reasoning_content }] } });
-        outputIndex++;
+function sendJsonError(res, status, message, type, extra = {}, headers = {}) {
+    if (res.headersSent) { if (!res.writableEnded) res.end(); return; }
+    res.writeHead(status, { 'Content-Type': 'application/json', ...headers });
+    res.end(JSON.stringify({ error: { message, type, ...extra } }));
+}
+
+function sendCompletion(res, apiMode, stream, openaiResponse) {
+    if (stream) {
+        if (apiMode === 'anthropic') sendAnthropicStream(res, openaiResponse);
+        else if (apiMode === 'responses') sendResponsesStream(res, openaiResponse);
+        else sendOpenAIStream(res, openaiResponse);
+        return;
     }
-    if (hasToolCalls) {
-        msg.tool_calls.forEach((tc) => {
-            const item = { type: 'function_call', id: 'fc_' + tc.id, call_id: tc.id, name: tc.function.name, arguments: tc.function.arguments || '{}', status: 'completed' };
-            writeSse(res, 'response.output_item.added', { type: 'response.output_item.added', output_index: outputIndex, item: { ...item, arguments: '', status: 'in_progress' } });
-            writeSse(res, 'response.function_call_arguments.delta', { type: 'response.function_call_arguments.delta', output_index: outputIndex, item_id: item.id, delta: item.arguments });
-            writeSse(res, 'response.function_call_arguments.done', { type: 'response.function_call_arguments.done', output_index: outputIndex, item_id: item.id, arguments: item.arguments });
-            writeSse(res, 'response.output_item.done', { type: 'response.output_item.done', output_index: outputIndex, item });
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    if (apiMode === 'anthropic') res.end(JSON.stringify(toAnthropicResponse(openaiResponse)));
+    else if (apiMode === 'responses') res.end(JSON.stringify(toResponsesResponse(openaiResponse)));
+    else res.end(JSON.stringify(openaiResponse));
+}
+
+function writeSse(res, event, data) {
+    if (event) res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+const SSE_HEADERS = { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' };
+
+function anthropicErrorType(type, status) {
+    if (status === 429 || /rate/i.test(String(type))) return 'rate_limit_error';
+    if (status === 401 || status === 403) return 'authentication_error';
+    if (status === 400 || status === 413) return 'invalid_request_error';
+    if (status === 503) return 'overloaded_error';
+    return 'api_error';
+}
+
+// Writes one streamed completion in the client's protocol (OpenAI chat
+// chunks, Anthropic message events or Responses events).
+//
+// Live use: source('reasoning' | 'content') returns a function that takes the
+// cumulative text of one DeepSeek call and forwards only the new part, so
+// clients see the answer while DeepSeek is still writing it. finish() then
+// emits whatever was not streamed yet (or the whole answer when nothing was)
+// and closes the stream; fail() reports an error, as an HTTP status while no
+// byte was sent and as an in-stream error event afterwards. Headers are sent
+// lazily, on the first delta or keepAlive(), so fast failures keep their
+// real status codes.
+function createStreamWriter(res, apiMode, { model = 'deepseek-chat', promptTokens = 0, id = 'ds-' + Date.now(), created = Math.floor(Date.now() / 1000) } = {}) {
+    const state = { started: false, ended: false, lastWriteAt: 0, reasoning: '', content: '', section: null, reasoningSource: null, pendingWhitespace: '', sources: 0 };
+    const itemIds = { response: id.replace(/^ds-/, 'resp_'), reasoning: `rs_${id}`, message: `msg_${id}` };
+    let roleSent = false;
+    let blockIndex = -1;
+    let outputIndex = -1;
+
+    const sse = (event, data) => { writeSse(res, event, data); state.lastWriteAt = Date.now(); };
+    const chunk = (delta, finishReason = null) => sse(null, { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta, finish_reason: finishReason }] });
+    const responseSkeleton = () => ({ id: itemIds.response, object: 'response', created_at: created, status: 'in_progress', model, output: [], watermark: FORGETMEAI_WATERMARK });
+
+    function start() {
+        if (state.started) return;
+        state.started = true;
+        res.writeHead(200, SSE_HEADERS);
+        state.lastWriteAt = Date.now();
+        if (apiMode === 'anthropic') {
+            sse('message_start', { type: 'message_start', message: { id: 'msg_' + id, type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: promptTokens, output_tokens: 0 }, watermark: FORGETMEAI_WATERMARK } });
+        } else if (apiMode === 'responses') {
+            sse('response.created', { type: 'response.created', response: responseSkeleton() });
+            sse('response.in_progress', { type: 'response.in_progress', response: responseSkeleton() });
+        }
+    }
+
+    // The first OpenAI chunk announces the role, as OpenAI streams do.
+    function openaiRole(toolTurn) {
+        if (roleSent) return;
+        roleSent = true;
+        chunk({ role: 'assistant', content: toolTurn ? null : '' });
+    }
+
+    function openSection(kind) {
+        if (state.section === kind) return;
+        closeSection();
+        state.section = kind;
+        if (apiMode === 'openai') {
+            openaiRole(false);
+        } else if (apiMode === 'anthropic') {
+            blockIndex++;
+            sse('content_block_start', { type: 'content_block_start', index: blockIndex, content_block: { type: 'text', text: '' } });
+            if (kind === 'reasoning') sse('content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text: '[reasoning]\n' } });
+        } else {
             outputIndex++;
-        });
-    } else {
-        const text = msg.content || '';
-        const item = { id: 'msg_' + Date.now(), type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text, annotations: [] }] };
-        writeSse(res, 'response.output_item.added', { type: 'response.output_item.added', output_index: outputIndex, item: { ...item, status: 'in_progress', content: [] } });
-        writeSse(res, 'response.content_part.added', { type: 'response.content_part.added', output_index: outputIndex, content_index: 0, item_id: item.id, part: { type: 'output_text', text: '', annotations: [] } });
-        for (let i = 0; i < text.length; i += 80) {
-            writeSse(res, 'response.output_text.delta', { type: 'response.output_text.delta', output_index: outputIndex, content_index: 0, item_id: item.id, delta: text.substring(i, i + 80) });
+            if (kind === 'reasoning') {
+                sse('response.output_item.added', { type: 'response.output_item.added', output_index: outputIndex, item: { id: itemIds.reasoning, type: 'reasoning', summary: [], status: 'in_progress' } });
+                sse('response.reasoning_summary_part.added', { type: 'response.reasoning_summary_part.added', item_id: itemIds.reasoning, output_index: outputIndex, summary_index: 0, part: { type: 'summary_text', text: '' } });
+            } else {
+                sse('response.output_item.added', { type: 'response.output_item.added', output_index: outputIndex, item: { id: itemIds.message, type: 'message', role: 'assistant', status: 'in_progress', content: [] } });
+                sse('response.content_part.added', { type: 'response.content_part.added', item_id: itemIds.message, output_index: outputIndex, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } });
+            }
         }
-        writeSse(res, 'response.output_text.done', { type: 'response.output_text.done', output_index: outputIndex, content_index: 0, item_id: item.id, text });
-        writeSse(res, 'response.content_part.done', { type: 'response.content_part.done', output_index: outputIndex, content_index: 0, item_id: item.id, part: item.content[0] });
-        writeSse(res, 'response.output_item.done', { type: 'response.output_item.done', output_index: outputIndex, item });
     }
-    writeSse(res, 'response.completed', { type: 'response.completed', response });
-    res.write('data: [DONE]\n\n');
-    res.end();
+
+    function closeSection() {
+        const kind = state.section;
+        if (!kind) return;
+        state.section = null;
+        if (apiMode === 'openai') return;
+        if (apiMode === 'anthropic') {
+            if (kind === 'reasoning') sse('content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text: '\n[/reasoning]\n' } });
+            sse('content_block_stop', { type: 'content_block_stop', index: blockIndex });
+            return;
+        }
+        if (kind === 'reasoning') {
+            const part = { type: 'summary_text', text: state.reasoning };
+            sse('response.reasoning_summary_text.done', { type: 'response.reasoning_summary_text.done', item_id: itemIds.reasoning, output_index: outputIndex, summary_index: 0, text: state.reasoning });
+            sse('response.reasoning_summary_part.done', { type: 'response.reasoning_summary_part.done', item_id: itemIds.reasoning, output_index: outputIndex, summary_index: 0, part });
+            sse('response.output_item.done', { type: 'response.output_item.done', output_index: outputIndex, item: { id: itemIds.reasoning, type: 'reasoning', summary: [part], status: 'completed' } });
+        } else {
+            const part = { type: 'output_text', text: state.content, annotations: [] };
+            sse('response.output_text.done', { type: 'response.output_text.done', item_id: itemIds.message, output_index: outputIndex, content_index: 0, text: state.content });
+            sse('response.content_part.done', { type: 'response.content_part.done', item_id: itemIds.message, output_index: outputIndex, content_index: 0, part });
+            sse('response.output_item.done', { type: 'response.output_item.done', output_index: outputIndex, item: { id: itemIds.message, type: 'message', role: 'assistant', status: 'completed', content: [part] } });
+        }
+    }
+
+    function emit(kind, text) {
+        if (!text) return;
+        start();
+        openSection(kind);
+        for (const piece of chunkText(text, apiMode === 'openai' ? 50 : 80)) {
+            if (apiMode === 'openai') chunk(kind === 'reasoning' ? { reasoning_content: piece } : { content: piece });
+            else if (apiMode === 'anthropic') sse('content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text: piece } });
+            else if (kind === 'reasoning') sse('response.reasoning_summary_text.delta', { type: 'response.reasoning_summary_text.delta', item_id: itemIds.reasoning, output_index: outputIndex, summary_index: 0, delta: piece });
+            else sse('response.output_text.delta', { type: 'response.output_text.delta', item_id: itemIds.message, output_index: outputIndex, content_index: 0, delta: piece });
+        }
+        state[kind] += text;
+    }
+
+    function pushReasoning(text, sourceId = null) {
+        // Reasoning belongs before the answer and comes from one DeepSeek
+        // call; reasoning of retries and continuations is not streamed.
+        if (state.ended || state.content || state.section === 'content') return;
+        if (sourceId !== null) {
+            if (state.reasoningSource !== null && state.reasoningSource !== sourceId) return;
+            if (text) state.reasoningSource = sourceId;
+        }
+        emit('reasoning', text);
+    }
+
+    function pushContent(text) {
+        if (state.ended) return;
+        // Do not open the answer on leading whitespace: an all-whitespace
+        // answer counts as empty and is retried.
+        if (!state.content) {
+            const combined = state.pendingWhitespace + text;
+            if (!combined.trim()) { state.pendingWhitespace = combined; return; }
+            state.pendingWhitespace = '';
+            text = combined;
+        }
+        emit('content', text);
+    }
+
+    return {
+        get started() { return state.started; },
+        get lastWriteAt() { return state.lastWriteAt; },
+        get streamedContent() { return state.content; },
+        source(kind) {
+            const sourceId = ++state.sources;
+            // Whitespace held back from an earlier (empty, retried) call
+            // must not be prepended to this call's answer.
+            if (kind === 'content' && !state.content) state.pendingWhitespace = '';
+            let consumed = 0;
+            let carry = '';
+            return (cumulative) => {
+                const raw = String(cumulative || '');
+                if (raw.length <= consumed) return;
+                let piece = carry + raw.slice(consumed);
+                consumed = raw.length;
+                carry = '';
+                // Keep a trailing high surrogate until its pair arrives.
+                if (/[\ud800-\udbff]$/.test(piece)) { carry = piece.slice(-1); piece = piece.slice(0, -1); }
+                piece = sanitizeContent(piece);
+                if (kind === 'reasoning') pushReasoning(piece, sourceId);
+                else pushContent(piece);
+            };
+        },
+        keepAlive() {
+            if (state.ended) return;
+            start();
+            res.write(': keep-alive\n\n');
+            state.lastWriteAt = Date.now();
+        },
+        finish(openaiResp) {
+            if (state.ended) return;
+            const choice = openaiResp.choices[0];
+            const msg = choice.message || {};
+            const toolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0 ? msg.tool_calls : null;
+            const usage = { input_tokens: openaiResp.usage?.prompt_tokens || 0, output_tokens: openaiResp.usage?.completion_tokens || 0 };
+            start();
+            if (toolCalls) {
+                // Agent clients expect a tool turn to contain only the tool
+                // call: no reasoning or text that could read as a final answer.
+                closeSection();
+                if (apiMode === 'openai') {
+                    openaiRole(true);
+                    // Streaming tool-call deltas must carry their position:
+                    // SDKs accumulate arguments by `index`.
+                    chunk({ tool_calls: toolCalls.map((tc, index) => ({ index, ...tc })) });
+                    chunk({}, 'tool_calls');
+                } else if (apiMode === 'anthropic') {
+                    for (const tc of toolCalls) {
+                        blockIndex++;
+                        sse('content_block_start', { type: 'content_block_start', index: blockIndex, content_block: { type: 'tool_use', id: tc.id, name: tc.function.name, input: {} } });
+                        sse('content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'input_json_delta', partial_json: tc.function.arguments || '{}' } });
+                        sse('content_block_stop', { type: 'content_block_stop', index: blockIndex });
+                    }
+                    sse('message_delta', { type: 'message_delta', delta: { stop_reason: 'tool_use', stop_sequence: null }, usage });
+                } else {
+                    for (const tc of toolCalls) {
+                        outputIndex++;
+                        const item = { type: 'function_call', id: 'fc_' + tc.id, call_id: tc.id, name: tc.function.name, arguments: tc.function.arguments || '{}', status: 'completed' };
+                        sse('response.output_item.added', { type: 'response.output_item.added', output_index: outputIndex, item: { ...item, arguments: '', status: 'in_progress' } });
+                        sse('response.function_call_arguments.delta', { type: 'response.function_call_arguments.delta', output_index: outputIndex, item_id: item.id, delta: item.arguments });
+                        sse('response.function_call_arguments.done', { type: 'response.function_call_arguments.done', output_index: outputIndex, item_id: item.id, arguments: item.arguments });
+                        sse('response.output_item.done', { type: 'response.output_item.done', output_index: outputIndex, item });
+                    }
+                }
+            } else {
+                const reasoning = String(msg.reasoning_content || '');
+                if (reasoning && !state.content && reasoning.startsWith(state.reasoning)) pushReasoning(reasoning.slice(state.reasoning.length));
+                const content = String(msg.content || '');
+                let rest = content;
+                if (state.content) {
+                    if (content.startsWith(state.content)) {
+                        rest = content.slice(state.content.length);
+                    } else {
+                        let common = 0;
+                        while (common < state.content.length && content[common] === state.content[common]) common++;
+                        console.log(`[stream] final answer diverged from the streamed text after ${common} chars`);
+                        rest = content.slice(common);
+                    }
+                }
+                start();
+                openSection('content');
+                if (rest) emit('content', rest);
+                closeSection();
+                if (apiMode === 'openai') {
+                    chunk({}, choice.finish_reason === 'length' ? 'length' : 'stop');
+                } else if (apiMode === 'anthropic') {
+                    sse('message_delta', { type: 'message_delta', delta: { stop_reason: choice.finish_reason === 'length' ? 'max_tokens' : 'end_turn', stop_sequence: null }, usage });
+                }
+            }
+            if (apiMode === 'anthropic') {
+                sse('message_stop', { type: 'message_stop' });
+            } else if (apiMode === 'responses') {
+                // Describe exactly the items that were streamed.
+                const streamed = toolCalls ? openaiResp : {
+                    ...openaiResp,
+                    choices: [{ ...choice, message: { ...msg, reasoning_content: state.reasoning || undefined, content: state.content } }],
+                };
+                sse('response.completed', { type: 'response.completed', response: toResponsesResponse(streamed, itemIds) });
+                res.write('data: [DONE]\n\n');
+            } else {
+                res.write('data: [DONE]\n\n');
+            }
+            state.ended = true;
+            res.end();
+        },
+        fail(status, error, headers = {}) {
+            if (state.ended) return;
+            state.ended = true;
+            if (!state.started) {
+                if (res.headersSent) { if (!res.writableEnded) res.end(); return; }
+                res.writeHead(status, { 'Content-Type': 'application/json', ...headers });
+                res.end(JSON.stringify({ error }));
+                return;
+            }
+            const message = error?.message || 'DeepSeek request failed';
+            if (apiMode === 'anthropic') {
+                writeSse(res, 'error', { type: 'error', error: { type: anthropicErrorType(error?.type, status), message } });
+            } else if (apiMode === 'responses') {
+                writeSse(res, 'error', { type: 'error', code: error?.type || 'server_error', message, param: null, error: { ...error, status } });
+            } else {
+                writeSse(res, null, { error: { ...error, code: status } });
+                res.write('data: [DONE]\n\n');
+            }
+            res.end();
+        },
+    };
 }
 
-function sendOpenAIStream(res, openaiResp) {
-    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
-    const choice = openaiResp.choices[0];
-    const msg = choice.message || {};
-    const id = openaiResp.id;
-    const created = openaiResp.created;
-    const model = openaiResp.model;
-    const hasToolCalls = msg.tool_calls && msg.tool_calls.length > 0;
-    if (!hasToolCalls && msg.reasoning_content) {
-        for (let i = 0; i < msg.reasoning_content.length; i += 50) {
-            const chunk = msg.reasoning_content.substring(i, i + 50);
-            res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { reasoning_content: chunk }, finish_reason: null }] })}\n\n`);
-        }
-    }
-    if (hasToolCalls) {
-        res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { role: 'assistant', content: null, tool_calls: msg.tool_calls }, finish_reason: null }] })}\n\n`);
-        res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })}\n\ndata: [DONE]\n\n`);
-    } else {
-        for (let i = 0; i < (msg.content || '').length; i += 50) {
-            const chunk = msg.content.substring(i, i + 50);
-            res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: chunk }, finish_reason: null }] })}\n\n`);
-        }
-        res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
-    }
-    res.end();
+function sendStreamedCompletion(res, apiMode, openaiResp) {
+    createStreamWriter(res, apiMode, { model: openaiResp.model, promptTokens: openaiResp.usage?.prompt_tokens || 0, id: openaiResp.id, created: openaiResp.created }).finish(openaiResp);
 }
 
-function storeHistory(agentId, prompt, content, toolCall) {
-    const session = getOrCreateAgentSession(agentId);
+function sendAnthropicStream(res, openaiResp) { sendStreamedCompletion(res, 'anthropic', openaiResp); }
+function sendResponsesStream(res, openaiResp) { sendStreamedCompletion(res, 'responses', openaiResp); }
+function sendOpenAIStream(res, openaiResp) { sendStreamedCompletion(res, 'openai', openaiResp); }
+
+function storeHistory(session, prompt, content, toolCall) {
     const assistantResponse = toolCall
-        ? `TOOL_CALL: ${toolCall.name}\narguments: ${toolCall.arguments}`
+        ? toolCallAsPromptText({ function: toolCall })
         : content;
     // Save last 500 chars of the prompt for history context
     const shortPrompt = prompt.length > 500 ? '...' + prompt.substring(prompt.length - 500) : prompt;
-    session.history.push({ user: shortPrompt, assistant: assistantResponse });
+    // One huge answer must not crowd every earlier turn out of the bounded
+    // recovery history (or get the whole history dropped as too long).
+    const shortAnswer = truncatePromptMiddle(assistantResponse, MAX_HISTORY_ENTRY_CHARS, 0.6);
+    session.history.push({ user: shortPrompt, assistant: shortAnswer });
     while (session.history.length > MAX_HISTORY_LENGTH) session.history.shift();
     let historyChars = session.history.reduce((sum, e) => sum + e.user.length + e.assistant.length, 0);
     while (historyChars > MAX_HISTORY_CHARS && session.history.length > 1) {
@@ -1544,44 +2022,39 @@ function storeHistory(agentId, prompt, content, toolCall) {
     }
 }
 
-// Extract MEDIA: paths from tool results that contain screenshot paths
+// Extract MEDIA: paths for screenshots produced during the current turn, so a
+// Hermes/Telegram gateway delivers the file. Only messages since the latest
+// user message are scanned; older screenshots were delivered with earlier
+// answers. Paths are attached only if the file actually exists (DeepSeek
+// hallucinates paths).
 function extractScreenshotPaths(messages) {
     const paths = [];
-    const fs = require('fs');
-    for (const msg of messages) {
-        if (msg.role === 'tool' && msg.content) {
-            // Look for screenshot_path or path fields in JSON tool results
-            // These come DIRECTLY from browser_vision — always the real path
-            const pngMatch = msg.content.match(/["'](screenshot_path|path)["']\s*:\s*["']([^"']+\.(?:png|jpg|jpeg|webp|gif))["']/i);
-            if (pngMatch) {
-                const filePath = pngMatch[2];
-                if (filePath.startsWith('/') && fs.existsSync(filePath)) {
-                    paths.push(`MEDIA:${filePath}`);
-                }
-            }
-            // Also catch plain MEDIA: tags
-            const mediaMatch = msg.content.match(/MEDIA:(\S+)/g);
-            if (mediaMatch) {
-                for (const tag of mediaMatch) {
-                    const extractedPath = tag.replace(/^MEDIA:/, '');
-                    if (fs.existsSync(extractedPath) && !paths.includes(tag)) {
-                        paths.push(tag);
-                    }
-                }
-            }
+    const list = Array.isArray(messages) ? messages : [];
+    let start = 0;
+    for (let i = list.length - 1; i >= 0; i--) {
+        if (list[i]?.role === 'user') { start = i; break; }
+    }
+    const addPath = (filePath) => {
+        const tag = `MEDIA:${filePath}`;
+        if (paths.includes(tag)) return;
+        try {
+            if (fs.statSync(filePath).isFile()) paths.push(tag);
+        } catch (e) { /* missing or unreadable: skip */ }
+    };
+    for (const msg of list.slice(start)) {
+        if (!msg) continue;
+        const content = normalizeMessageContent(msg.content);
+        if (!content) continue;
+        if (msg.role === 'tool') {
+            // screenshot_path/path fields come directly from browser_vision.
+            const pngMatch = content.match(/["'](screenshot_path|path)["']\s*:\s*["']([^"']+\.(?:png|jpg|jpeg|webp|gif))["']/i);
+            if (pngMatch && pngMatch[2].startsWith('/')) addPath(pngMatch[2]);
+            for (const tag of content.match(/MEDIA:(\S+)/g) || []) addPath(tag.replace(/^MEDIA:/, ''));
         }
-        // Check user/assistant messages for paths mentioned in conversation text
-        // Only include if the file ACTUALLY EXISTS (DeepSeek hallucinates paths)
-        if ((msg.role === 'user' || msg.role === 'assistant') && msg.content) {
-            const content = typeof msg.content === 'string' ? msg.content : '';
+        if (msg.role === 'user' || msg.role === 'assistant') {
             const pathRegex = /(\/[^\s<>"']+\.(?:png|jpg|jpeg|webp|gif))/gi;
             let match;
-            while ((match = pathRegex.exec(content)) !== null) {
-                const filePath = match[1];
-                if (filePath.startsWith('/') && fs.existsSync(filePath) && !paths.includes(`MEDIA:${filePath}`)) {
-                    paths.push(`MEDIA:${filePath}`);
-                }
-            }
+            while ((match = pathRegex.exec(content)) !== null) addPath(match[1]);
         }
     }
     return paths;
@@ -1600,9 +2073,11 @@ function truncatePromptMiddle(text, maxChars, headRatio = 0.35) {
     return value.substring(0, headChars) + PROMPT_COMPACTION_MARKER + value.substring(value.length - tailChars);
 }
 
+// A client sends its own history when it replays earlier assistant turns.
+// Requests with only new input (one user message, or just a tool result for
+// a previous answer) rely on the proxy's remote chat and local history.
 function hasExplicitConversationHistory(messages) {
-    const turns = (messages || []).filter(msg => msg && msg.role !== 'system');
-    return turns.length > 1 || turns.some(msg => msg.role === 'assistant' || msg.role === 'tool');
+    return (messages || []).some(msg => msg && msg.role === 'assistant');
 }
 
 function buildRecoveryHistoryPrefix(history) {
@@ -1700,8 +2175,16 @@ function normalizeRetryResponse(result) {
     };
 }
 
+function isRateLimitError(error) {
+    const message = typeof error === 'string'
+        ? error
+        : `${error?.content || ''} ${error?.message || ''} ${error?.type || ''}`;
+    return /too\s+many\s+(?:messages|requests)|rate[\s_-]?limit|过于频繁|слишком\s+(?:много\s+(?:сообщений|запросов)|частые\s+сообщения)/i.test(message);
+}
+
 function classifyRecoveryFailure(modelError, timedOut = false) {
     if (isContextTooLongError(modelError)) return { status: 400, type: 'context_length_exceeded' };
+    if (isRateLimitError(modelError)) return { status: 429, type: 'rate_limit_error' };
     if (timedOut) return { status: 504, type: 'request_timeout' };
     return { status: 502, type: modelError?.type || 'empty_response' };
 }
@@ -1712,41 +2195,136 @@ function isTimeoutError(error) {
     return name === 'TimeoutError' || name === 'AbortError' || /(?:timed?\s*out|timeout)/i.test(message);
 }
 
+function isSystemRole(role) {
+    // OpenAI's newer "developer" role carries system instructions.
+    return role === 'system' || role === 'developer';
+}
+
+// Earlier tool requests are replayed in the same JSON envelope the model is
+// asked to produce, so the transcript never teaches it a second format.
+function toolCallAsPromptText(toolCall) {
+    const name = toolCall?.function?.name || toolCall?.name || '';
+    let args = toolCall?.function?.arguments ?? toolCall?.arguments ?? {};
+    if (typeof args === 'string') {
+        try { args = JSON.parse(args || '{}'); } catch (e) { /* keep the raw string */ }
+    }
+    return JSON.stringify({ tool_call: { name, arguments: args } });
+}
+
+function buildToolNameIndex(messages) {
+    const names = new Map();
+    for (const msg of messages || []) {
+        if (msg?.role !== 'assistant' || !Array.isArray(msg.tool_calls)) continue;
+        for (const tc of msg.tool_calls) {
+            if (tc?.id && tc.function?.name) names.set(tc.id, tc.function.name);
+        }
+    }
+    return names;
+}
+
+function formatConversation(messages, toolNames = buildToolNameIndex(messages)) {
+    let conversation = '';
+    for (const msg of messages || []) {
+        if (!msg || isSystemRole(msg.role)) continue;
+        if (msg.role === 'user') {
+            const text = normalizeMessageContent(msg.content);
+            if (text) conversation += `User: ${text}\n\n`;
+        } else if (msg.role === 'assistant') {
+            const text = normalizeMessageContent(msg.content);
+            if (text) conversation += `Assistant: ${text}\n\n`;
+            for (const tc of Array.isArray(msg.tool_calls) ? msg.tool_calls : []) {
+                conversation += `Assistant: ${toolCallAsPromptText(tc)}\n\n`;
+            }
+        } else if (msg.role === 'tool' || msg.role === 'function') {
+            // Tool execution result. Do not impose a per-result limit: one
+            // large result may be the essential input. buildBoundedPrompt
+            // applies the single global cap while preserving the latest tail.
+            const name = msg.name || toolNames.get(msg.tool_call_id) || '';
+            conversation += `[Tool Result${name ? `: ${name}` : ''}]\n${normalizeMessageContent(msg.content)}\n\n`;
+        }
+    }
+    return conversation.trim();
+}
+
 function formatMessages(messages, tools) {
     let systemPrompt = '';
-    for (const msg of messages) {
-        if (msg.role === 'system' && msg.content) {
+    for (const msg of messages || []) {
+        if (msg && isSystemRole(msg.role) && msg.content) {
             systemPrompt += normalizeMessageContent(msg.content) + '\n';
         }
     }
     systemPrompt += formatToolDefinitions(tools);
+    return {
+        prompt: formatConversation(messages),
+        systemPrompt: systemPrompt.trim(),
+        toolReminder: formatToolReminder(tools),
+    };
+}
 
-    // Build full conversation history for DeepSeek's context
-    let conversation = '';
-    for (const msg of messages) {
-        if (msg.role === 'system') continue;  // already in systemPrompt
-        if (msg.role === 'user' && msg.content) {
-            conversation += `User: ${normalizeMessageContent(msg.content)}\n\n`;
-        } else if (msg.role === 'assistant') {
-            if (msg.tool_calls && msg.tool_calls.length > 0) {
-                // This was a tool call response from a previous turn
-                for (const tc of msg.tool_calls) {
-                    conversation += `Assistant: TOOL_CALL: ${tc.function.name}\narguments: ${tc.function.arguments}\n\n`;
-                }
-            } else if (msg.content) {
-                conversation += `Assistant: ${normalizeMessageContent(msg.content)}\n\n`;
-            }
-        } else if (msg.role === 'tool' && msg.content) {
-            // Tool execution result — send back to DeepSeek as context
-            const toolContent = normalizeMessageContent(msg.content);
-            // Do not impose a second, per-result 8k limit: one large tool result
-            // may be the essential input. buildBoundedPrompt applies the single
-            // global request cap while preserving the latest conversation tail.
-            conversation += `[Tool Result]\n${toolContent}\n\n`;
-        }
+function hashText(value) {
+    return crypto.createHash('sha256').update(String(value)).digest('base64');
+}
+
+// Identity of one client message as it is replayed in later requests. The
+// assistant's reasoning is excluded: clients often drop it when echoing.
+function conversationMessageKey(msg) {
+    const toolCalls = Array.isArray(msg?.tool_calls)
+        ? msg.tool_calls.map(tc => [tc?.function?.name || '', String(tc?.function?.arguments ?? ''), tc?.id || ''])
+        : [];
+    return hashText(JSON.stringify([
+        msg?.role || '',
+        normalizeMessageContent(msg?.content),
+        toolCalls,
+        msg?.tool_call_id || '',
+    ]));
+}
+
+// Decides what a request must send to DeepSeek.
+//  - 'delta': the remote chat already holds the earlier turns of this
+//    conversation, so only the new messages go up (plus a tool reminder).
+//  - 'full':  a fresh remote chat receives the complete (bounded) prompt.
+// Re-sending the whole history into an existing chat made the remote context
+// grow quadratically until DeepSeek returned empty answers or "content too
+// long" and lost the tool protocol (#23, #30).
+function planSessionTurn(session, messages, contextKey) {
+    const conversation = (messages || []).filter(msg => msg && !isSystemRole(msg.role));
+    const keys = conversation.map(conversationMessageKey);
+    if (!session?.id) return { mode: 'full', reason: null, keys };
+    // contextKey is recorded after the first successful turn. Without it the
+    // remote chat is empty (its first request failed), so it must receive the
+    // self-contained prompt, including local recovery history.
+    if (!session.contextKey) return { mode: 'full', reason: 'remote chat has no completed turn yet', keys };
+    const sent = Array.isArray(session.sentMessageKeys) ? session.sentMessageKeys : [];
+    // Clients without explicit history send only their new input (a user
+    // message, or a tool result for the previous answer) and rely on the
+    // remote chat to remember earlier turns. A changed system prompt (e.g. a
+    // timestamp) is sent along instead of discarding that memory.
+    if (!conversation.some(msg => msg.role === 'assistant')) {
+        return { mode: 'delta', messages: conversation, keys, includeSystem: session.contextKey !== contextKey };
     }
-    // The last user message + full conversation context
-    return { prompt: conversation.trim(), systemPrompt: systemPrompt.trim() };
+    if (session.contextKey !== contextKey) return { mode: 'full', reason: 'system prompt or tools changed', keys };
+    if (sent.length > 0 && sent.length < keys.length && sent.every((key, index) => keys[index] === key)) {
+        // The client echoes the assistant turn DeepSeek just produced; the
+        // remote chat already contains it.
+        let start = sent.length;
+        while (start < conversation.length && conversation[start].role === 'assistant') start++;
+        const delta = conversation.slice(start);
+        if (delta.some(msg => msg.role !== 'assistant')) return { mode: 'delta', messages: delta, keys };
+        return { mode: 'full', reason: 'no new input after the last answer', keys };
+    }
+    return { mode: 'full', reason: 'conversation history diverged', keys };
+}
+
+function buildDeltaPrompt(deltaMessages, allMessages, toolReminder, maxChars = MAX_UPSTREAM_PROMPT_CHARS, systemPrompt = '') {
+    const body = formatConversation(deltaMessages, buildToolNameIndex(allMessages));
+    const suffix = toolReminder ? `\n\n${toolReminder}` : '';
+    const budget = Math.max(0, maxChars - suffix.length);
+    if (systemPrompt) {
+        const bounded = buildBoundedPrompt(systemPrompt, '', body, budget);
+        return { prompt: bounded.prompt + suffix, compacted: bounded.compacted };
+    }
+    const bounded = truncatePromptMiddle(body, budget, 0.25);
+    return { prompt: bounded + suffix, compacted: bounded.length < body.length };
 }
 
 // === HTTP Server ===
@@ -1764,7 +2342,7 @@ const server = http.createServer(async (req, res) => {
 
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     const isPublicProbe = req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health' || url.pathname === '/readyz');
-    if (!isPublicProbe && !isProxyAuthorized(req.headers.authorization)) {
+    if (!isPublicProbe && !isProxyAuthorized(req.headers.authorization, PROXY_API_KEY, req.headers['x-api-key'])) {
         res.writeHead(401, {
             'Content-Type': 'application/json',
             'WWW-Authenticate': 'Bearer',
@@ -1775,7 +2353,7 @@ const server = http.createServer(async (req, res) => {
 
     // Health check
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
-        const includePrivateStatus = !PROXY_API_KEY || isProxyAuthorized(req.headers.authorization);
+        const includePrivateStatus = !PROXY_API_KEY || isProxyAuthorized(req.headers.authorization, PROXY_API_KEY, req.headers['x-api-key']);
         const health = { status: 'ok', service: 'FreeDeepseekAPI', watermark: FORGETMEAI_WATERMARK };
         if (includePrivateStatus) Object.assign(health, {
             models: SUPPORTED_MODEL_IDS,
@@ -1825,6 +2403,9 @@ const server = http.createServer(async (req, res) => {
                 message_count: session.messageCount,
                 account: session.accountId,
                 history_size: session.history.length,
+                tracked_messages: (session.sentMessageKeys || []).length,
+                remote_chars: session.remoteChars || 0,
+                busy: session.busy === true,
                 age_min: session.createdAt ? Math.round((Date.now() - session.createdAt) / 60000) : 0,
             });
         }
@@ -1851,10 +2432,7 @@ const server = http.createServer(async (req, res) => {
         }
         const historyCount = session.history.length;
         const historyPreview = session.history.map(e => e.user.substring(0, 40)).join(' | ');
-        session.id = null;
-        session.parentMessageId = null;
-        session.createdAt = null;
-        session.messageCount = 0;
+        resetRemoteSession(session);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status: 'session_reset', agent: agentId, history_preserved: historyCount, history: historyPreview }));
         return;
@@ -1875,28 +2453,77 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    let body = '';
-    let bodyTooLarge = false;
     const MAX_BODY_BYTES = 10 * 1024 * 1024;  // chat payloads are small; cap memory before JSON.parse
-    req.on('data', chunk => { body += chunk; if (body.length > MAX_BODY_BYTES) { bodyTooLarge = true; req.destroy(); } });
-    req.on('end', async () => {
-        if (bodyTooLarge) {
-            res.writeHead(413, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: { message: 'Request body too large', type: 'payload_too_large' } }));
+    // Collect raw bytes and decode once: decoding chunk by chunk corrupts any
+    // multi-byte character (Cyrillic, CJK, emoji) split across TCP chunks.
+    const bodyChunks = [];
+    let bodyBytes = 0;
+    let bodyTooLarge = false;
+    req.on('data', chunk => {
+        if (bodyTooLarge) return;
+        bodyBytes += chunk.length;
+        if (bodyBytes > MAX_BODY_BYTES) {
+            bodyTooLarge = true;
+            bodyChunks.length = 0;
+            sendJsonError(res, 413, 'Request body too large', 'payload_too_large', {}, { 'Connection': 'close' });
             return;
         }
+        bodyChunks.push(chunk);
+    });
+    req.on('end', async () => {
+        if (bodyTooLarge) return;
+        const body = Buffer.concat(bodyChunks).toString('utf8');
         inFlight++;
         let clientGone = false;
-        res.on('close', () => { clientGone = true; });
+        // Cancels every upstream call of this request (PoW, chat creation,
+        // the answer stream) once nobody is waiting for the result.
+        const requestAbort = new AbortController();
+        // Every upstream call of this request listens to this signal; retries
+        // can exceed the default EventTarget listener warning threshold.
+        events.setMaxListeners(0, requestAbort.signal);
+        res.on('close', () => {
+            if (res.writableFinished) return;
+            clientGone = true;
+            requestAbort.abort(new Error('client disconnected'));
+        });
         const requestStartedAt = Date.now();
         const deadlineHit = () => Date.now() - requestStartedAt > REQUEST_DEADLINE_MS;
         let activeSession = null;
         let activeAgentId = null;
+        let lockedSession = null;
+        let live = null;
+        let keepAliveTimer = null;
+        // Error response in the client's protocol: a JSON error while nothing
+        // was streamed, an in-stream error event once the stream has started.
+        const respondError = (status, error, headers = {}) => {
+            if (live) { live.fail(status, error, headers); return; }
+            if (res.headersSent) { if (!res.writableEnded) res.end(); return; }
+            res.writeHead(status, { 'Content-Type': 'application/json', ...headers });
+            res.end(JSON.stringify({ error }));
+        };
+        // Set once DeepSeek accepted a completion in this request; only then
+        // can the remote chat contain turns the client does not know about.
+        let remoteTouched = false;
         try {
-            const rawParams = JSON.parse(body || '{}');
+            let rawParams;
+            try { rawParams = JSON.parse(body || '{}'); }
+            catch (e) {
+                sendJsonError(res, 400, `Request body is not valid JSON: ${e.message}`, 'invalid_request_error');
+                return;
+            }
+            if (!rawParams || typeof rawParams !== 'object' || Array.isArray(rawParams)) {
+                sendJsonError(res, 400, 'Request body must be a JSON object', 'invalid_request_error');
+                return;
+            }
             const params = normalizeApiParams(rawParams, apiMode);
-            const messages = params.messages || [];
-            const tools = params.tools || [];
+            const messages = Array.isArray(params.messages)
+                ? params.messages.filter(m => m && typeof m === 'object')
+                : [];
+            if (messages.length === 0) {
+                sendJsonError(res, 400, 'messages must be a non-empty array', 'invalid_request_error');
+                return;
+            }
+            const tools = Array.isArray(params.tools) ? params.tools : [];
             const stream = params.stream === true;
             const requestedModel = String(params.model || 'deepseek-chat').toLowerCase();
             if (!isKnownModel(requestedModel)) {
@@ -1921,83 +2548,122 @@ const server = http.createServer(async (req, res) => {
 
             // "/new" command: if the latest user message is exactly "/new" (whitespace-insensitive),
             // reset this agent's DeepSeek session/history instead of forwarding anything to DeepSeek.
-            const lastUserMessage = [...messages].reverse().find(m => m && m.role === 'user');
-            const lastUserText = lastUserMessage && typeof lastUserMessage.content === 'string'
-                ? lastUserMessage.content.trim()
-                : '';
+            const lastUserMessage = [...messages].reverse().find(m => m.role === 'user');
+            const lastUserText = lastUserMessage ? normalizeMessageContent(lastUserMessage.content).trim() : '';
             if (lastUserText === '/new') {
                 const existing = sessions.get(agentId);
                 const historyCount = existing ? existing.history.length : 0;
                 sessions.set(agentId, createSession());
                 console.log(`${agentTag} /new received — session reset (history cleared: ${historyCount})`);
                 const confirmation = buildTextResponse('Started a new chat. Session and history have been reset.', '/new', requestedModel);
-                if (stream) {
-                    if (apiMode === 'anthropic') {
-                        sendAnthropicStream(res, confirmation);
-                    } else if (apiMode === 'responses') {
-                        sendResponsesStream(res, confirmation);
-                    } else {
-                        sendOpenAIStream(res, confirmation);
-                    }
-                } else {
-                    res.writeHead(200, { 'Content-Type': 'application/json' });
-                    if (apiMode === 'anthropic') {
-                        res.end(JSON.stringify(toAnthropicResponse(confirmation)));
-                    } else if (apiMode === 'responses') {
-                        res.end(JSON.stringify(toResponsesResponse(confirmation)));
-                    } else {
-                        res.end(JSON.stringify(confirmation));
-                    }
-                }
+                sendCompletion(res, apiMode, stream, confirmation);
                 return;
             }
 
-            const { prompt, systemPrompt } = formatMessages(messages, tools);
+            const { prompt, systemPrompt, toolReminder } = formatMessages(messages, tools);
             // For usage accounting, count the CLIENT's original input — not the
             // proxy-expanded fullPrompt (system + injected tools + history) — so
             // prompt_tokens reflects what the caller actually sent.
             const clientPromptText = messages.map(m => normalizeMessageContent(m.content)).join('\n');
+            const allowedToolNames = new Set(tools
+                .filter(tool => tool?.type === 'function' && tool.function?.name)
+                .map(tool => tool.function.name));
 
-            const session = getOrCreateAgentSession(agentId);
+            // stream=true: plain answers go to the client while DeepSeek is
+            // still writing them. With tools the answer may turn out to be a
+            // tool call, so it is buffered and only keep-alives are sent.
+            if (stream) {
+                live = createStreamWriter(res, apiMode, { model: requestedModel, promptTokens: estimateTokens(clientPromptText) });
+                keepAliveTimer = setInterval(() => {
+                    if (Date.now() - Math.max(requestStartedAt, live.lastWriteAt) >= STREAM_KEEPALIVE_MS) live.keepAlive();
+                }, 1000);
+                keepAliveTimer.unref();
+            }
+            const liveProgress = () => {
+                if (!live || allowedToolNames.size > 0) return null;
+                const pushReasoning = live.source('reasoning');
+                const pushContent = live.source('content');
+                return (content, reasoning) => { pushReasoning(reasoning); pushContent(content); };
+            };
+
+            // One DeepSeek chat generates one answer at a time, and a second
+            // turn sent meanwhile would land on the wrong parent message. The
+            // first request owns the agent's chat; overlapping requests (e.g.
+            // Hermes background reviews from the same host) run in a private,
+            // throwaway chat instead of corrupting it (#23).
+            const agentSession = getOrCreateAgentSession(agentId);
+            const ephemeral = agentSession.busy === true;
+            const session = ephemeral ? createSession() : agentSession;
+            if (ephemeral) {
+                console.log(`${agentTag} Agent session is busy; serving this concurrent request in a separate DeepSeek chat.`);
+            } else {
+                agentSession.busy = true;
+                lockedSession = agentSession;
+            }
             activeSession = session;
 
-            // Roll over TTL/depth-limited sessions before deciding whether to
-            // inject local recovery history into the newly built prompt.
+            // Roll over TTL/depth/size-limited sessions before deciding what to
+            // send, so a replacement chat receives the complete prompt.
             const promptRollover = prepareSessionForPrompt(session);
             if (promptRollover) {
                 console.log(`${agentTag} Session ${promptRollover.failedSessionId} reset before prompt build (${promptRollover.reason}); recovery history preserved.`);
             }
 
-            // Keep a recovery prompt available even while the upstream session
-            // is healthy. If that remote chat expires mid-request, its opaque
-            // state disappears and the replacement must receive local history.
+            // Clients that send only their latest message rely on local
+            // recovery history whenever a new remote chat has to be started.
             const recoveryHistoryPrefix = hasExplicitConversationHistory(messages)
                 ? ''
-                : buildRecoveryHistoryPrefix(session.history);
-            const historyPrefix = !session.id ? recoveryHistoryPrefix : '';
-
-            const promptBuild = buildBoundedPrompt(systemPrompt, historyPrefix, prompt);
+                : buildRecoveryHistoryPrefix(agentSession.history);
             const freshPromptBuild = buildBoundedPrompt(systemPrompt, recoveryHistoryPrefix, prompt);
-            let fullPrompt = promptBuild.prompt;
-            let promptCompacted = promptBuild.compacted;
-            if (promptBuild.compacted) {
-                markContextCompacted(res);
-                console.log(`${agentTag} Compacted upstream prompt ${promptBuild.originalChars} -> ${promptBuild.promptChars} chars${promptBuild.historyDropped ? ' (recovery history dropped)' : ''}`);
-            }
-
-            const startTime = Date.now();
-            const initialCall = await askDeepSeekStream(fullPrompt, agentId, requestedModel, freshPromptBuild.prompt);
-            const dsResp = initialCall.resp;
-            if (initialCall.promptUsed !== fullPrompt) {
-                fullPrompt = initialCall.promptUsed;
+            const contextKey = hashText(systemPrompt);
+            const plan = planSessionTurn(session, messages, contextKey);
+            let fullPrompt;
+            let promptCompacted;
+            if (plan.mode === 'delta') {
+                const delta = buildDeltaPrompt(plan.messages, messages, toolReminder, MAX_UPSTREAM_PROMPT_CHARS, plan.includeSystem ? systemPrompt : '');
+                fullPrompt = delta.prompt;
+                promptCompacted = delta.compacted;
+                console.log(`${agentTag} Sending ${plan.messages.length} new message(s) to the existing DeepSeek chat (${fullPrompt.length} chars${delta.compacted ? ', compacted' : ''})`);
+            } else {
+                if (session.id) {
+                    console.log(`${agentTag} Starting a fresh DeepSeek chat: ${plan.reason}.`);
+                    resetRemoteSession(session);
+                }
+                fullPrompt = freshPromptBuild.prompt;
+                promptCompacted = freshPromptBuild.compacted;
                 if (freshPromptBuild.compacted) {
-                    promptCompacted = true;
-                    markContextCompacted(res);
+                    console.log(`${agentTag} Compacted upstream prompt ${freshPromptBuild.originalChars} -> ${freshPromptBuild.promptChars} chars${freshPromptBuild.historyDropped ? ' (recovery history dropped)' : ''}`);
                 }
             }
+            if (promptCompacted) markContextCompacted(res);
 
-            // Process streaming response from DeepSeek — returns { content, reasoningContent, messageId, finishReason }
-            async function readDeepSeekResponse(readable) {
+            let lastAccount = null;
+            // Calls DeepSeek, replaying the request on another account when the
+            // current one is rejected (401/403) or throttled (429). A replay
+            // always starts a fresh chat, so it gets the self-contained prompt.
+            const callDeepSeek = async (promptText, freshPrompt = promptText) => {
+                for (let attempt = 0; ; attempt++) {
+                    throwIfAborted(requestAbort.signal);
+                    try {
+                        const call = await askDeepSeekStream(promptText, agentId, requestedModel, freshPrompt, session, requestAbort.signal);
+                        remoteTouched = true;
+                        lastAccount = call.account;
+                        return call;
+                    } catch (error) {
+                        const failedAccountId = session.accountId;
+                        if (!isAccountLevelError(error) || attempt + 1 >= accounts.length
+                            || !hasOtherReadyAccount(failedAccountId) || requestAbort.signal.aborted || deadlineHit()) {
+                            throw error;
+                        }
+                        console.log(`${agentTag} Account ${failedAccountId} failed (HTTP ${error.status}); retrying on another account.`);
+                        resetRemoteSession(session);
+                        promptText = freshPrompt;
+                    }
+                }
+            };
+
+            // Reads the DeepSeek SSE stream — returns { content, reasoningContent, messageId, finishReason, modelError }
+            async function readDeepSeekResponse(call, onProgress = null) {
                 let buffer = '';
                 let lastPath = null;
                 const fragments = [];
@@ -2005,6 +2671,7 @@ const server = http.createServer(async (req, res) => {
                 let reasoningContent = '';
                 let newMessageId = null;
                 let finishReason = null;
+                let responseStatus = null;
                 let modelError = null;
 
                 const rebuildFragmentState = () => {
@@ -2021,64 +2688,77 @@ const server = http.createServer(async (req, res) => {
                     rebuildFragmentState();
                 };
 
+                const handleLine = (rawLine) => {
+                    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+                    if (!line.startsWith('data:')) return;
+                    const payload = line.slice(5).trimStart();
+                    if (!payload || payload === '[DONE]') return;
+                    let d;
+                    try { d = JSON.parse(payload); } catch (e) { return; }
+                    if (!d || typeof d !== 'object') return;
+                    if (d.response_message_id !== undefined && !newMessageId) newMessageId = d.response_message_id;
+                    if (isDeepSeekModelErrorEvent(d)) {
+                        modelError = { type: d.type || 'error', content: d.content || '', finish_reason: d.finish_reason || null };
+                    }
+                    if (d.finish_reason) {
+                        finishReason = d.finish_reason;
+                    }
+                    if (d.p !== undefined) lastPath = d.p;
+                    if (d.v && typeof d.v === 'object' && d.v.response) {
+                        if (d.v.response.message_id !== undefined) {
+                            newMessageId = d.v.response.message_id;
+                        }
+                        if (d.v.response.content !== undefined) {
+                            fullContent = d.v.response.content;
+                        }
+                        if (Array.isArray(d.v.response.fragments)) {
+                            fragments.length = 0;
+                            appendFragments(d.v.response.fragments);
+                        }
+                        if (d.v.response.finish_reason !== undefined) {
+                            finishReason = d.v.response.finish_reason;
+                        }
+                        if (typeof d.v.response.status === 'string') responseStatus = d.v.response.status;
+                    }
+                    if (lastPath === 'response/fragments' && d.v !== undefined) {
+                        appendFragments(d.v);
+                    }
+                    if (lastPath === 'response' && d.v !== undefined) {
+                        applyResponsePatchOperations(d.v, appendFragments);
+                    }
+                    if (lastPath === 'response/fragments/-1/content' && d.v !== undefined && typeof d.v !== 'object') {
+                        if (fragments.length > 0) {
+                            const lastFragment = fragments[fragments.length - 1];
+                            lastFragment.content = `${lastFragment.content || ''}${d.v}`;
+                            rebuildFragmentState();
+                        }
+                    }
+                    if (lastPath === 'response/content' && d.v !== undefined && typeof d.v !== 'object') {
+                        fullContent += d.v;
+                    }
+                    if (lastPath === 'response/finish_reason' && d.v !== undefined) {
+                        finishReason = d.v;
+                    }
+                    if (lastPath === 'response/status' && typeof d.v === 'string') {
+                        responseStatus = d.v;
+                    }
+                };
+
                 const decoder = new TextDecoder();  // one instance: preserves multi-byte (Cyrillic/emoji) split across chunks
-                for await (const chunk of readable) {
+                for await (const chunk of readStreamWithTimeouts(call.resp)) {
                     buffer += decoder.decode(chunk, { stream: true });
                     const lines = buffer.split('\n');
                     buffer = lines.pop() || '';
-                    for (const line of lines) {
-                        if (line.startsWith('data: ')) {
-                            try {
-                                const d = JSON.parse(line.slice(6));
-                                if (d.response_message_id !== undefined && !newMessageId) newMessageId = d.response_message_id;
-                                if (isDeepSeekModelErrorEvent(d)) {
-                                    modelError = { type: d.type || 'error', content: d.content || '', finish_reason: d.finish_reason || null };
-                                }
-                                if (d.finish_reason) {
-                                    finishReason = d.finish_reason;
-                                }
-                                if (d.p !== undefined) lastPath = d.p;
-                                if (d.v && typeof d.v === 'object' && d.v.response) {
-                                    if (d.v.response.message_id !== undefined) {
-                                        newMessageId = d.v.response.message_id;
-                                    }
-                                    if (d.v.response.content !== undefined) {
-                                        fullContent = d.v.response.content;
-                                    }
-                                    if (Array.isArray(d.v.response.fragments)) {
-                                        fragments.length = 0;
-                                        appendFragments(d.v.response.fragments);
-                                    }
-                                    if (d.v.response.finish_reason !== undefined) {
-                                        finishReason = d.v.response.finish_reason;
-                                    }
-                                }
-                                if (lastPath === 'response/fragments' && d.v !== undefined) {
-                                    appendFragments(d.v);
-                                }
-                                if (lastPath === 'response' && d.v !== undefined) {
-                                    applyResponsePatchOperations(d.v, appendFragments);
-                                }
-                                if (lastPath === 'response/fragments/-1/content' && d.v !== undefined && typeof d.v !== 'object') {
-                                    if (fragments.length > 0) {
-                                        const lastFragment = fragments[fragments.length - 1];
-                                        lastFragment.content = `${lastFragment.content || ''}${d.v}`;
-                                        rebuildFragmentState();
-                                    }
-                                }
-                                if (lastPath === 'response/content' && d.v !== undefined && typeof d.v !== 'object') {
-                                    fullContent += d.v;
-                                }
-                                if (lastPath === 'response/finish_reason' && d.v !== undefined) {
-                                    finishReason = d.v;
-                                }
-                                if (lastPath === 'response/status' && d.v !== undefined && d.v !== 'FINISHED') {
-                                    finishReason = d.v;
-                                }
-                            } catch (e) { }
-                        }
-                    }
+                    for (const line of lines) handleLine(line);
+                    if (onProgress) onProgress(fullContent, reasoningContent);
                 }
+                buffer += decoder.decode();
+                if (buffer) handleLine(buffer);
+                if (onProgress) onProgress(fullContent, reasoningContent);
+
+                // DeepSeek marks an answer cut off at its output limit as
+                // INCOMPLETE; expose it as 'length' so continuation kicks in.
+                if (!finishReason && /^INCOMPLETE$/i.test(String(responseStatus || ''))) finishReason = 'length';
 
                 if (newMessageId) {
                     session.parentMessageId = newMessageId;
@@ -2086,26 +2766,66 @@ const server = http.createServer(async (req, res) => {
                 } else {
                     console.log(`${agentTag} WARNING: could not extract message_id`);
                 }
+                session.remoteChars = (session.remoteChars || 0) + fullContent.length + reasoningContent.length;
+
+                if (fullContent.trim() && isRateLimitError(modelError)) {
+                    const retryAfter = String(Math.ceil(RATE_LIMIT_COOLDOWN_MS / 1000));
+                    markAccountFailure(call.account, 429, 'rate limited in stream', retryAfter, RATE_LIMIT_COOLDOWN_MS);
+                    throw createUpstreamHttpError(429, modelError.content, retryAfter);
+                }
 
                 return { content: fullContent, reasoningContent, messageId: newMessageId, finishReason, modelError };
             }
 
-            let { content: fullContent, reasoningContent, finishReason, modelError } = await readDeepSeekResponse(dsResp.body);
-            fullContent = sanitizeContent(fullContent);
-            reasoningContent = sanitizeContent(reasoningContent || '');
+            const startTime = Date.now();
+            let firstResult;
+            try {
+                const initialCall = await callDeepSeek(fullPrompt, freshPromptBuild.prompt);
+                if (initialCall.promptUsed !== fullPrompt) {
+                    // The planned delta could not be used (account rotation or
+                    // session rollover): the new chat got the full prompt.
+                    fullPrompt = initialCall.promptUsed;
+                    if (freshPromptBuild.compacted) {
+                        promptCompacted = true;
+                        markContextCompacted(res);
+                    }
+                }
+                firstResult = await readDeepSeekResponse(initialCall, liveProgress());
+            } catch (error) {
+                // A remote chat that overflowed is rejected with HTTP 400 even
+                // after one fresh-chat attempt. Let the compaction loop below
+                // retry with smaller prompts instead of failing immediately.
+                if (!isContextTooLongError(error)) throw error;
+                console.log(`${agentTag} DeepSeek rejected the prompt as too long; retrying with a compacted prompt.`);
+                resetRemoteSession(session);
+                firstResult = { content: '', reasoningContent: '', finishReason: null, modelError: { type: 'error', content: error.message } };
+            }
+            let fullContent = sanitizeContent(firstResult.content || '');
+            let reasoningContent = sanitizeContent(firstResult.reasoningContent || '');
+            let { finishReason, modelError } = firstResult;
             const elapsed = Date.now() - startTime;
             console.log(`${agentTag} Got ${fullContent.length} chars (+${reasoningContent.length} reasoning chars) in ${elapsed}ms (msg#${session.messageCount})`);
 
-            // Empty/context-overflow recovery. Each retry gets a smaller prompt
-            // and a fresh remote session; bounded attempts prevent retry storms.
+            // Empty/context-overflow/rate-limit recovery. Each retry gets a
+            // fresh remote session and, for overflows, a smaller prompt;
+            // bounded attempts prevent retry storms.
             let retryAttempt = 0;
             while (!fullContent || fullContent.trim().length === 0) {
                 // Stop early if the client hung up or we've blown the request budget —
                 // no point burning more PoW solves + account quota for a dead socket.
-                if (clientGone) { console.log(`${agentTag} client disconnected; abandoning empty-retry loop`); return; }
+                if (clientGone) {
+                    console.log(`${agentTag} client disconnected; abandoning empty-retry loop`);
+                    resetRemoteSession(session);
+                    return;
+                }
                 if (deadlineHit()) { console.log(`${agentTag} request deadline hit; stopping empty-retry loop`); break; }
                 const contextTooLong = isContextTooLongError(modelError);
-                if (modelError && !contextTooLong) break;
+                if (!contextTooLong && isRateLimitError(modelError)) {
+                    markAccountFailure(lastAccount, 429, 'rate limited in stream', null, RATE_LIMIT_COOLDOWN_MS);
+                    if (!hasOtherReadyAccount(lastAccount?.id)) break;
+                } else if (modelError && !contextTooLong) {
+                    break;
+                }
                 if (retryAttempt >= MAX_EMPTY_RETRIES) break;
                 retryAttempt++;
 
@@ -2113,20 +2833,19 @@ const server = http.createServer(async (req, res) => {
                     ? Math.max(0.35, 0.8 - retryAttempt * 0.2)
                     : Math.max(0.5, 1 - retryAttempt * 0.2);
                 const retryBudget = Math.max(MIN_UPSTREAM_PROMPT_CHARS, Math.floor(MAX_UPSTREAM_PROMPT_CHARS * retryRatio));
-                const retryBuild = buildRetryPrompt(systemPrompt, recoveryHistoryPrefix, prompt, fullPrompt, retryBudget);
+                const retryBuild = buildRetryPrompt(systemPrompt, recoveryHistoryPrefix, prompt, freshPromptBuild.prompt, retryBudget);
                 const retryPrompt = retryBuild.prompt;
                 if (retryBuild.compacted) {
                     promptCompacted = true;
                     markContextCompacted(res);
                 }
-                const reason = contextTooLong ? 'context-too-long response' : 'empty response';
+                const reason = contextTooLong ? 'context-too-long response' : (modelError ? 'rate-limited response' : 'empty response');
                 console.log(`${agentTag} ${reason} (msg#${session.messageCount}, retry ${retryAttempt}/${MAX_EMPTY_RETRIES}, prompt=${retryPrompt.length} chars). Resetting session...`);
                 resetRemoteSession(session);
                 // Brief delay before retry to let DeepSeek breathe
                 await new Promise(r => setTimeout(r, Math.min(500 * retryAttempt, 1500)));
-                const { resp: retryResp } = await askDeepSeekStream(retryPrompt, agentId, requestedModel);
-                const retryResult = await readDeepSeekResponse(retryResp.body);
-                const retryState = normalizeRetryResponse(retryResult);
+                const retryCall = await callDeepSeek(retryPrompt);
+                const retryState = normalizeRetryResponse(await readDeepSeekResponse(retryCall, liveProgress()));
                 fullPrompt = retryPrompt;
                 modelError = retryState.modelError;
                 // A previous empty response may have carried finish_reason=length.
@@ -2149,31 +2868,32 @@ const server = http.createServer(async (req, res) => {
                         ? 'DeepSeek request deadline reached while recovering an empty response'
                         : `DeepSeek returned empty content after ${retryAttempt} retr${retryAttempt === 1 ? 'y' : 'ies'}`);
                 console.log(`${agentTag} ${errorType} after ${retryAttempt} retr${retryAttempt === 1 ? 'y' : 'ies'}. Giving up.`);
-                res.writeHead(failureClass.status, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({
-                    error: {
+                const headers = {};
+                if (failureClass.status === 429) headers['Retry-After'] = String(Math.ceil(RATE_LIMIT_COOLDOWN_MS / 1000));
+                respondError(failureClass.status, {
                         message: errorMessage,
                         type: errorType,
                         agent: agentId,
                         failed_session_id: failure.failedSessionId,
                         message_count: failure.failedMessageCount,
-                        history_length: session.history.length,
+                        history_length: agentSession.history.length,
                         account: failure.accountId,
                         retry_attempts: retryAttempt,
                         upstream_prompt_chars: fullPrompt.length,
                         prompt_compacted: promptCompacted,
                         model: requestedModel,
                         real_model: resolveModelConfig(requestedModel).real_model,
-                    }
-                }));
+                }, headers);
                 return;
             }
 
-            // Auto-continuation: if finish_reason is 'length' or content is very long (>25000 chars),
-            // send a continuation request to get the rest of the response
+            // Auto-continuation: DeepSeek stopped at its output limit
+            // (finish_reason 'length' / status INCOMPLETE), so ask for the rest.
+            // Complete answers are never "continued", however long they are:
+            // appending extra text would corrupt large tool-call arguments.
             let continuationRounds = 0;
             const MAX_CONTINUATION = 2;
-            while ((finishReason === 'length' || fullContent.length > 25000) && continuationRounds < MAX_CONTINUATION) {
+            while (finishReason === 'length' && continuationRounds < MAX_CONTINUATION) {
                 if (clientGone || deadlineHit()) break;
                 continuationRounds++;
                 console.log(`${agentTag} Response ${fullContent.length} chars (finish=${finishReason}). Auto-continuing (${continuationRounds}/${MAX_CONTINUATION})...`);
@@ -2183,27 +2903,49 @@ const server = http.createServer(async (req, res) => {
                     `${freshPromptBuild.prompt}\n\n[Assistant response so far]\n${fullContent}`,
                     'Continue the assistant response from exactly where it stopped. Do not restart or repeat completed sections.'
                 );
-                const continuationCall = await askDeepSeekStream(
-                    'continue',
-                    agentId,
-                    requestedModel,
-                    continuationRecoveryPrompt
-                );
-                const { resp: contResp, account: contAccount } = continuationCall;
+                let continuationCall;
+                try {
+                    continuationCall = await callDeepSeek('continue', continuationRecoveryPrompt);
+                } catch (error) {
+                    // The answer so far is still useful: return it as truncated
+                    // (finish_reason 'length') instead of failing the request.
+                    if (requestAbort.signal.aborted) throw error;
+                    console.log(`${agentTag} Continuation failed (${error.message}); returning the partial answer`);
+                    // The call may have left an empty replacement chat behind.
+                    resetRemoteSession(session);
+                    break;
+                }
+                const { account: contAccount } = continuationCall;
                 // A cross-account continuation is valid only when the call
                 // detected that reset and sent the full recovery prompt. If an
                 // unexpected rotation ever bypasses that guard, discard the new
                 // remote session before returning to the client (#20).
                 if (!isContinuationRecoverySafe(contBeforeId, continuationCall)) {
                     console.log(`${agentTag} continuation rotated to ${contAccount.id} ≠ ${contBeforeId} — skipping (foreign session)`);
+                    continuationCall.resp.abortController?.abort(new Error('foreign session'));
                     resetRemoteSession(session);
                     break;
                 }
-                const contResult = await readDeepSeekResponse(contResp.body);
+                let contResult;
+                try {
+                    // Not streamed live: the continuation is only kept if it
+                    // passes the checks below; finish() sends the kept part.
+                    contResult = await readDeepSeekResponse(continuationCall);
+                    if (isRateLimitError(contResult.modelError)) {
+                        const retryAfter = String(Math.ceil(RATE_LIMIT_COOLDOWN_MS / 1000));
+                        markAccountFailure(continuationCall.account, 429, 'rate limited in continuation', retryAfter, RATE_LIMIT_COOLDOWN_MS);
+                        throw createUpstreamHttpError(429, contResult.modelError.content, retryAfter);
+                    }
+                } catch (error) {
+                    if (requestAbort.signal.aborted || (Number(error?.status) === 429 && error?.type === 'rate_limit_error')) throw error;
+                    console.log(`${agentTag} Continuation stream failed (${error.message}); returning the partial answer`);
+                    resetRemoteSession(session);
+                    break;
+                }
                 const contContent = contResult && contResult.content ? sanitizeContent(contResult.content) : '';
                 const contReasoning = contResult && contResult.reasoningContent ? sanitizeContent(contResult.reasoningContent) : '';
                 if (contContent && contContent.trim().length > 0 && !contContent.includes('I am an AI')) {
-                    fullContent += '\n' + contContent;
+                    fullContent += contContent;
                     if (contReasoning) reasoningContent += (reasoningContent ? '\n' : '') + contReasoning;
                     finishReason = contResult.finishReason;
                     console.log(`${agentTag} Continuation added ${contContent.length} chars (total: ${fullContent.length})`);
@@ -2213,15 +2955,12 @@ const server = http.createServer(async (req, res) => {
                 }
             }
 
-            const allowedToolNames = new Set(tools
-                .filter(tool => tool?.type === 'function' && tool.function?.name)
-                .map(tool => tool.function.name));
             let toolCall = allowedToolNames.size > 0 ? parseToolCall(fullContent) : null;
             if (toolCall && !allowedToolNames.has(toolCall.name)) {
                 console.log(`${agentTag} Model requested unknown tool ${toolCall.name}; attempting format repair.`);
                 toolCall = null;
             }
-            
+
             // Retry once if legacy, XML, or DSML tool markup was truncated or
             // malformed. Never pass raw DSML through as a normal assistant turn.
             if (allowedToolNames.size > 0 && !toolCall && looksLikeToolCallMarkup(fullContent) && !clientGone && !deadlineHit()) {
@@ -2230,10 +2969,10 @@ const server = http.createServer(async (req, res) => {
                 await new Promise(r => setTimeout(r, 1000));
                 const strictPrompt = appendPromptInstruction(
                     freshPromptBuild.prompt,
-                    '[STRICT INSTRUCTION] Your previous response contained incomplete tool-call markup. Keep arguments short and output ONLY strict JSON: {"tool_call":{"name":"<function>","arguments":{...}}}'
+                    `[STRICT INSTRUCTION] Your previous response contained incomplete or invalid tool-call markup. Keep arguments short and output ONLY strict JSON: ${TOOL_CALL_FORMAT} (escape backslashes and newlines inside strings). Available tools: ${[...allowedToolNames].join(', ').substring(0, 1500)}`
                 );
-                const { resp: retryResp2 } = await askDeepSeekStream(strictPrompt, agentId, requestedModel);
-                const retryResult2 = await readDeepSeekResponse(retryResp2.body);
+                const retryCall2 = await callDeepSeek(strictPrompt);
+                const retryResult2 = await readDeepSeekResponse(retryCall2);
                 const retryContent2 = retryResult2 && retryResult2.content ? sanitizeContent(retryResult2.content) : '';
                 if (retryContent2 && retryContent2.trim()) {
                     const retryTc = parseToolCall(retryContent2);
@@ -2242,6 +2981,12 @@ const server = http.createServer(async (req, res) => {
                         fullContent = retryContent2;
                         reasoningContent = retryResult2.reasoningContent ? sanitizeContent(retryResult2.reasoningContent) : '';
                         toolCall = retryTc;
+                    } else if (!looksLikeToolCallMarkup(retryContent2)) {
+                        // The model chose to answer in plain text this time.
+                        console.log(`${agentTag} Strict retry returned a plain answer instead of tool markup.`);
+                        fullContent = retryContent2;
+                        reasoningContent = retryResult2.reasoningContent ? sanitizeContent(retryResult2.reasoningContent) : '';
+                        finishReason = retryResult2.finishReason;
                     } else {
                         console.log(`${agentTag} Retry still has broken tool markup. Returning a safe error instead of leaking it as text.`);
                         reasoningContent = retryResult2.reasoningContent ? sanitizeContent(retryResult2.reasoningContent) : reasoningContent;
@@ -2251,26 +2996,25 @@ const server = http.createServer(async (req, res) => {
 
             if (allowedToolNames.size > 0 && !toolCall && looksLikeToolCallMarkup(fullContent)) {
                 const failure = resetRemoteSession(session);
-                res.writeHead(502, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: {
+                respondError(502, {
                     message: 'DeepSeek returned malformed tool-call markup after one repair attempt',
                     type: 'malformed_tool_call',
                     agent: agentId,
                     failed_session_id: failure.failedSessionId,
                     message_count: failure.failedMessageCount,
-                    history_length: session.history.length,
+                    history_length: agentSession.history.length,
                     account: failure.accountId,
                     prompt_compacted: promptCompacted,
                     model: requestedModel,
                     real_model: resolveModelConfig(requestedModel).real_model,
-                } }));
+                });
                 return;
             }
-            
-            // Check if any tool results in the current conversation contained a screenshot path.
+
+            // Check if tool results of the current turn contained a screenshot path.
             // If so, and the response doesn't already have MEDIA:, inject it so the gateway
             // delivers the file to Telegram.
-            if (!fullContent.includes('MEDIA:')) {
+            if (!toolCall && !fullContent.includes('MEDIA:')) {
                 const screenshotPaths = extractScreenshotPaths(messages);
                 if (screenshotPaths.length > 0) {
                     fullContent += '\n\n' + screenshotPaths.join('\n');
@@ -2278,44 +3022,42 @@ const server = http.createServer(async (req, res) => {
                 }
             }
 
-            storeHistory(agentId, prompt, fullContent, toolCall);
+            if (clientGone) {
+                // The answer will never reach the client, so the remote chat
+                // now holds a turn the client does not know about.
+                resetRemoteSession(session);
+                console.log(`${agentTag} client disconnected before the answer was sent; discarding it`);
+                return;
+            }
+            if (!ephemeral) storeHistory(agentSession, prompt, fullContent, toolCall);
+            // Remember what the remote chat now holds, so the next request of
+            // this conversation sends only its new messages.
+            if (session.id) {
+                session.sentMessageKeys = plan.keys;
+                session.contextKey = contextKey;
+            }
 
             const openaiResponse = toolCall
                 ? buildToolCallResponse(toolCall, requestedModel, clientPromptText, reasoningContent)
                 : buildTextResponse(fullContent, clientPromptText, requestedModel, reasoningContent, finishReason);
 
-            if (stream) {
-                if (apiMode === 'anthropic') {
-                    sendAnthropicStream(res, openaiResponse);
-                } else if (apiMode === 'responses') {
-                    sendResponsesStream(res, openaiResponse);
-                } else {
-                    sendOpenAIStream(res, openaiResponse);
-                }
-                console.log(`${agentTag} Streamed ${apiMode} (tool=${!!toolCall}) in ${elapsed}ms`);
-            } else {
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                if (apiMode === 'anthropic') {
-                    res.end(JSON.stringify(toAnthropicResponse(openaiResponse)));
-                } else if (apiMode === 'responses') {
-                    res.end(JSON.stringify(toResponsesResponse(openaiResponse)));
-                } else {
-                    res.end(JSON.stringify(openaiResponse));
-                }
-                console.log(`${agentTag} Response ${apiMode} (tool=${!!toolCall}, ${elapsed}ms, ${fullContent.length} chars)`);
-            }
+            if (live) live.finish(openaiResponse);
+            else sendCompletion(res, apiMode, false, openaiResponse);
+            console.log(`${agentTag} ${stream ? 'Streamed' : 'Response'} ${apiMode} (tool=${!!toolCall}, ${Date.now() - startTime}ms, ${fullContent.length} chars)`);
         } catch (e) {
             console.log('[DS-API] Error:', e.message);
-            if (res.headersSent || clientGone) return;  // streamed/aborted: nothing to send
+            // If DeepSeek accepted a completion, the remote chat may now hold a
+            // turn the client never saw. Errors before that (PoW, chat
+            // creation, throttling) leave the chat intact for the next request.
+            const failure = remoteTouched && activeSession && activeSession.id ? resetRemoteSession(activeSession) : null;
+            if (clientGone) return;
             // Pool exhaustion / no-auth carry an explicit status so integrators see
             // 429/503 (not a generic 500) and can honor Retry-After.
             const timedOut = isTimeoutError(e);
             const status = e.status || (timedOut ? 504 : 500);
-            const headers = { 'Content-Type': 'application/json' };
+            const headers = {};
             if (status === 429 && e.retryAfter) headers['Retry-After'] = String(e.retryAfter);
-            res.writeHead(status, headers);
-            const failure = timedOut && activeSession ? resetRemoteSession(activeSession) : null;
-            res.end(JSON.stringify({ error: {
+            respondError(status, {
                 message: e.message,
                 type: e.type || (timedOut ? 'request_timeout' : 'server_error'),
                 ...(failure ? {
@@ -2325,8 +3067,10 @@ const server = http.createServer(async (req, res) => {
                     history_length: activeSession.history.length,
                     account: failure.accountId,
                 } : {}),
-            } }));
+            }, headers);
         } finally {
+            if (keepAliveTimer) clearInterval(keepAliveTimer);
+            if (lockedSession) lockedSession.busy = false;
             inFlight--;
         }
     });
@@ -2453,6 +3197,24 @@ module.exports = {
         classifyRecoveryFailure,
         isTimeoutError,
         formatMessages,
+        formatConversation,
+        formatToolReminder,
+        conversationMessageKey,
+        planSessionTurn,
+        buildDeltaPrompt,
+        hashText,
+        repairJsonText,
+        parseJsonLenient,
+        sanitizeContent,
+        normalizeMessageContent,
+        normalizeApiParams,
+        extractScreenshotPaths,
+        isRateLimitError,
+        loadDotEnv,
+        MODEL_CONFIGS,
+        SUPPORTED_MODEL_IDS,
+        resolveModelConfig,
+        server,
         createSession,
         resetRemoteSession,
         prepareSessionForPrompt,

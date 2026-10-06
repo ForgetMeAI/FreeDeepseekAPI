@@ -3,8 +3,8 @@
   "name": "DeepSeek Auth Exporter",
   "version": "1.0",
   "description": "Extract DeepSeek Chat credentials from cookies + localStorage for use with the web API proxy",
-  "permissions": ["cookies", "storage", "downloads"],
-  "host_permissions": ["https://chat.deepseek.com/*"],
+  "permissions": ["cookies", "storage"],
+  "host_permissions": ["https://chat.deepseek.com/*", "https://*.deepseek.com/*"],
   "content_scripts": [
     {
       "matches": ["https://chat.deepseek.com/*"],
