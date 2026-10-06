@@ -3,7 +3,10 @@ const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 
+const { loadDotEnv } = require('../lib/env');
+
 const ROOT = path.resolve(__dirname, '..');
+if (require.main === module) loadDotEnv(path.join(ROOT, '.env'));
 const DEFAULT_WASM = 'https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm';
 
 // Where a new/updated login is written. Mirrors how server.js discovers auth

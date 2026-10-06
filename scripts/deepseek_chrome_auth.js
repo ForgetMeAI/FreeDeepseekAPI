@@ -60,7 +60,8 @@ function killExistingTestingChrome() {
     );
     for (const pattern of patterns) {
         try {
-            execFileSync('pkill', ['-f', pattern], {
+            // `--`: the port pattern starts with dashes and is not an option.
+            execFileSync('pkill', ['-f', '--', pattern], {
                 stdio: 'ignore',
             });
         } catch {}

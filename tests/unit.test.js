@@ -942,3 +942,36 @@ test('planSessionTurn sends system prompt changes along for latest-only clients'
   const prompt = serverInternals.buildDeltaPrompt(plan.messages, [], '', 5000, 'NEW SYSTEM');
   assert.match(prompt.prompt, /^NEW SYSTEM\n\nUser: hi$/);
 });
+
+test('valid-looking Windows paths keep their backslashes', () => {
+  assert.deepEqual(serverInternals.parseJsonLenient('{"p":"C:\\files\\bin\\temp"}'), { p: 'C:\\files\\bin\\temp' });
+  assert.deepEqual(serverInternals.parseJsonLenient('{"p":"C:\\new\\tmp"}'), { p: 'C:\\new\\tmp' });
+  assert.deepEqual(serverInternals.parseJsonLenient('{"p":"line\\nnext\\tcol"}'), { p: 'line\nnext\tcol' });
+});
+
+test('fences: nested quotes, text fences and foreign-language examples', () => {
+  const envelope = '{"tool_call":{"name":"read_file","arguments":{"path":"/x"}}}';
+  assert.equal(serverInternals.parseToolCall(`\`\`\`\`markdown\nExample:\n\`\`\`json\n${envelope}\n\`\`\`\n\`\`\`\``), null);
+  assert.equal(serverInternals.parseToolCall(`\`\`\`text\n${envelope}\n\`\`\``).name, 'read_file');
+  assert.equal(serverInternals.looksLikeToolCallMarkup('```python\nmsg = {"tool_call": {"name": "x"}}\n```'), false);
+  assert.equal(serverInternals.parseToolCall('```xml\n<tool_calls><invoke name="rm"></invoke></tool_calls>\n```'), null);
+});
+
+test('planSessionTurn sends a full prompt into a chat whose first turn failed', () => {
+  const session = serverInternals.createSession();
+  session.id = 'empty-chat';
+  const plan = serverInternals.planSessionTurn(session, [{ role: 'user', content: 'What is my name?' }], 'ctx');
+  assert.equal(plan.mode, 'full');
+});
+
+test('an account cooldown without a ready alternative keeps the sticky chat', (t) => {
+  const originalAccounts = serverInternals.accounts.splice(0);
+  t.after(() => serverInternals.accounts.splice(0, serverInternals.accounts.length, ...originalAccounts));
+  serverInternals.accounts.push({ id: 'only', config: { token: 't', cookie: 'c' }, cooldownUntil: Date.now() + 60_000, headers: {} });
+  const session = serverInternals.createSession();
+  session.id = 'kept-chat';
+  session.accountId = 'only';
+  assert.throws(() => serverInternals.selectAccountForSession(session), err => err.status === 429);
+  assert.equal(session.id, 'kept-chat');
+  assert.equal(session.accountId, 'only');
+});

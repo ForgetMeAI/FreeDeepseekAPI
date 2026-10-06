@@ -14,6 +14,7 @@ function startMockDeepSeek() {
     completions: [],
     openStreams: new Set(),
     respond: () => ({ text: 'OK' }),
+    powFailures: 0,
   };
   const writeJson = (res, status, payload) => {
     res.writeHead(status, { 'Content-Type': 'application/json' });
@@ -27,6 +28,11 @@ function startMockDeepSeek() {
       const body = raw ? JSON.parse(raw) : {};
       const auth = req.headers.authorization;
       if (req.url === '/api/v0/chat/create_pow_challenge') {
+        if (state.powFailures > 0) {
+          state.powFailures--;
+          writeJson(res, 500, { msg: 'pow backend error' });
+          return;
+        }
         writeJson(res, 200, { code: 0, data: { biz_code: 0, biz_data: { challenge: {
           algorithm: 'DeepSeekHashV1', challenge: 'c', salt: 's', signature: 'sig',
           difficulty: 1, expire_at: 1, target_path: '/api/v0/chat/completion',
@@ -361,6 +367,9 @@ test('a throttled turn keeps the remote chat for the next request', async () => 
   mock.state.respond = () => ({ status: 400, errorBody: JSON.stringify({ msg: 'Too many messages in a short period' }) });
   const throttled = await chat({ model: 'deepseek-chat', user: 'keep-chat', messages: [{ role: 'user', content: 'hi again' }] });
   assert.equal(throttled.status, 429, throttled.text);
+  // An immediate retry during the cooldown is refused without dropping the chat.
+  const duringCooldown = await chat({ model: 'deepseek-chat', user: 'keep-chat', messages: [{ role: 'user', content: 'hi again' }] });
+  assert.equal(duringCooldown.status, 429, duringCooldown.text);
   internals.accounts[0].cooldownUntil = 0;
   mock.state.respond = () => ({ text: 'Ann' });
   const next = await chat({ model: 'deepseek-chat', user: 'keep-chat', messages: [{ role: 'user', content: 'What is my name?' }] });
@@ -403,4 +412,22 @@ test('a client that disconnects mid-request stops further upstream calls', async
   await sleep(1500);
   assert.equal(calls, 1);
   assert.equal(internals.sessions.get('gone').busy, false);
+});
+
+test('a fresh chat whose first request failed still gets the recovery history', async () => {
+  const first = await chat({ model: 'deepseek-chat', user: 'recover', messages: [{ role: 'user', content: 'My name is Ann' }] });
+  assert.equal(first.status, 200, first.text);
+  await fetch(`${proxyUrl}/reset-session?agent=recover`, { method: 'POST' });
+  // The new chat is created, then the PoW request fails before any completion.
+  mock.state.powFailures = 1;
+  const failed = await chat({ model: 'deepseek-chat', user: 'recover', messages: [{ role: 'user', content: 'Still there?' }] });
+  assert.ok(failed.status >= 400, failed.text);
+  assert.ok(internals.sessions.get('recover').id, 'the empty chat is kept');
+  mock.state.respond = () => ({ text: 'Ann' });
+  const next = await chat({ model: 'deepseek-chat', user: 'recover', messages: [{ role: 'user', content: 'What is my name?' }] });
+  assert.equal(next.status, 200, next.text);
+  const prompt = mock.state.completions.at(-1).body.prompt;
+  assert.match(prompt, /\[Previous conversation\]/);
+  assert.match(prompt, /My name is Ann/);
+  assert.match(prompt, /What is my name\?/);
 });

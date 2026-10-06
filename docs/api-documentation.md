@@ -398,7 +398,8 @@ Auth file format (`npm run auth` / `npm run auth:import`, keep it `0600`):
 | 404 | – | Unknown endpoint |
 | 413 | `payload_too_large` | Body over 10 MB |
 | 429 | `rate_limit_error` / `rate_limit` | DeepSeek throttling or all accounts cooling down (`Retry-After` set) |
-| 502 | `empty_response` / `malformed_tool_call` / `upstream_http_error` | DeepSeek returned nothing usable |
+| 502 | `empty_response` / `malformed_tool_call` | DeepSeek returned nothing usable |
+| DeepSeek's status | `upstream_http_error` | Other DeepSeek HTTP errors are passed through with their status (e.g. 400, 404, 500) |
 | 503 | `overloaded` / `no_auth` | Too many requests in flight, or no auth configured |
 | 504 | `request_timeout` | DeepSeek stalled or the request deadline passed |
 

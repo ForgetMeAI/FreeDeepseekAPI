@@ -16,6 +16,7 @@ const os = require('os');
 const path = require('path');
 const readline = require('readline');
 const crypto = require('crypto');
+const events = require('events');
 const { spawnSync } = require('child_process');
 const { solvePOW } = require('./lib/pow');
 const { loadDotEnv } = require('./lib/env');
@@ -350,13 +351,16 @@ function selectAccountForSession(session) {
     if (session.accountId) {
         const sticky = accounts.find(a => a.id === session.accountId);
         if (sticky && sticky.config.token && sticky.config.cookie && sticky.cooldownUntil <= now) return sticky;
+    }
+    const ready = accounts.filter(a => a.config.token && a.config.cookie && a.cooldownUntil <= now);
+    if (ready.length > 0 && session.accountId) {
         // A DeepSeek chat_session belongs to the auth account that created it.
         // If that account disappeared, lost credentials, or is cooling down,
-        // never reuse its session id under a different account.
+        // never reuse its session id under a different account. While no
+        // other account is ready the chat is kept for when its account returns.
         resetRemoteSession(session);
         session.accountId = null;
     }
-    const ready = accounts.filter(a => a.config.token && a.config.cookie && a.cooldownUntil <= now);
     if (ready.length === 0) {
         const waiting = accounts.filter(a => a.config.token && a.config.cookie).sort((a, b) => a.cooldownUntil - b.cooldownUntil)[0];
         if (waiting) {
@@ -931,14 +935,17 @@ const VALID_JSON_ESCAPE = /^(?:["\\/bfnrt]|u[0-9a-fA-F]{4})/;
 const TOOL_ENVELOPE_KEY_RE = /["'](?:tool_call|tool_calls|function_call)["']\s*:/;
 
 function repairJsonStringBody(body) {
-    // One invalid escape (\g, \d, \U ...) means the model wrote raw text such
-    // as a Windows path; then single backslashes in this string are literal,
-    // so "C:\new\tmp" keeps them instead of becoming a newline + tab. The
-    // unambiguous escapes \\, \" and \uXXXX keep their JSON meaning.
-    let rawBackslashes = false;
-    for (let k = 0; k < body.length; k++) {
+    // Raw text such as a Windows path: then single backslashes in this string
+    // are literal, so "C:\new\tmp" keeps them instead of becoming a newline +
+    // tab. The unambiguous escapes \\, \" and \uXXXX keep their JSON meaning.
+    // Signs of raw text: an invalid escape (\g, \d, \U ...), a \b or \f
+    // escape (backspace/form feed never appear in tool arguments), or a value
+    // that starts like a drive path (C:\...).
+    let rawBackslashes = /^[A-Za-z]:\\(?!\\)/.test(body);
+    for (let k = 0; !rawBackslashes && k < body.length; k++) {
         if (body[k] !== '\\') continue;
-        if (!VALID_JSON_ESCAPE.test(body.substring(k + 1, k + 6))) { rawBackslashes = true; break; }
+        const next = body.substring(k + 1, k + 6);
+        if (!VALID_JSON_ESCAPE.test(next) || next[0] === 'b' || next[0] === 'f') rawBackslashes = true;
         k++;
     }
     let result = '';
@@ -985,15 +992,19 @@ function repairJsonText(raw) {
     return changed ? out : text;
 }
 
+// Even syntactically valid JSON is repaired when a string is clearly a raw
+// Windows path ("C:\files\bin" parses, but into a form feed and a backspace).
 function parseJsonLenient(raw) {
-    try {
-        return JSON.parse(raw);
-    } catch (error) {
-        const repaired = repairJsonText(raw);
-        if (repaired === raw) throw error;
+    let parsed;
+    let error = null;
+    try { parsed = JSON.parse(raw); } catch (e) { error = e; }
+    const repaired = repairJsonText(raw);
+    if (repaired !== raw) {
         try { return JSON.parse(repaired); }
-        catch (e) { throw error; }
+        catch (e) { /* fall back to the strict result or error */ }
     }
+    if (error) throw error;
+    return parsed;
 }
 
 function buildToolCall(name, args = {}) {
@@ -1294,18 +1305,22 @@ function parseDsmlToolCall(text) {
     return null;
 }
 
-function looksLikeToolCallMarkup(text) {
+function looksLikeToolCallMarkup(rawText) {
+    // Examples inside foreign code fences are documentation, not broken calls.
+    const text = stripForeignCodeFences(rawText);
     return /TOOL_CALL:\s*[\w-]+|<\s*tool_call\b|[|｜]+\s*DSML\s*[|｜]+|[<＜]\s*\/?\s*(?:DSML)?(?:[\w.-]+:)?(?:tool[\s_-]*calls|function[\s_-]*calls|invoke)\b|["'](?:tool_call|tool_calls|function_call)["']\s*:/i.test(String(text || ''));
 }
 
-const CODE_FENCE_RE = /```([\w+.-]*)[^\S\r\n]*\r?\n?([\s\S]*?)```/;
+// A fence closes with the same number of backticks it opened with, so a
+// ````markdown block can quote a ```json example without exposing it.
+const CODE_FENCE_RE = /(`{3,})([\w+.-]*)[^\S\r\n]*\r?\n?([\s\S]*?)\1(?!`)/;
 
 function isJsonFenceLanguage(language) {
-    return !language || /^(?:json[c5]?|tool_?calls?|tool)$/i.test(language);
+    return !language || /^(?:json[c5]?|tool_?calls?|tool|text|plaintext|txt)$/i.test(language);
 }
 
 function stripForeignCodeFences(text) {
-    return text.replace(new RegExp(CODE_FENCE_RE.source, 'g'), (whole, language) => (isJsonFenceLanguage(language) ? whole : '\n'));
+    return String(text || '').replace(new RegExp(CODE_FENCE_RE.source, 'g'), (whole, ticks, language) => (isJsonFenceLanguage(language) ? whole : '\n'));
 }
 
 function parseToolCall(text) {
@@ -1315,17 +1330,17 @@ function parseToolCall(text) {
         return null;
     }
 
-    if (/[|｜]+\s*DSML\s*[|｜]+|[<＜]\s*\/?\s*(?:DSML)?(?:[\w.-]+:)?(?:tool[\s_-]*calls|function[\s_-]*calls|invoke)\b/i.test(text)) {
-        const dsml = parseDsmlToolCall(text);
+    // Code blocks in another language (```csharp, ```javascript, ```xml ...)
+    // are source code. Tool-call examples inside them must never execute, so
+    // all searches except the JSON-fence one run on the text without them.
+    const scanText = stripForeignCodeFences(text);
+
+    if (/[|｜]+\s*DSML\s*[|｜]+|[<＜]\s*\/?\s*(?:DSML)?(?:[\w.-]+:)?(?:tool[\s_-]*calls|function[\s_-]*calls|invoke)\b/i.test(scanText)) {
+        const dsml = parseDsmlToolCall(scanText);
         if (dsml) return dsml;
         console.log('[parseToolCall] Tool markup found but wrapper/invoke was incomplete or malformed');
         return null;
     }
-
-    // Code blocks in another language (```csharp, ```javascript ...) are
-    // source code. Tool-call examples inside them must never execute, so all
-    // later searches run on the text without them.
-    const scanText = stripForeignCodeFences(text);
 
     // XML-ish wrappers used by some agent prompts.
     const xmlMatch = scanText.match(/<tool_call[^>]*>([\s\S]*?)<\/tool_call>/i);
@@ -1345,8 +1360,8 @@ function parseToolCall(text) {
     const fenceRe = new RegExp(CODE_FENCE_RE.source, 'g');
     let fence;
     while ((fence = fenceRe.exec(text)) !== null) {
-        if (!isJsonFenceLanguage(fence[1])) continue;
-        const body = fence[2].trim();
+        if (!isJsonFenceLanguage(fence[2])) continue;
+        const body = fence[3].trim();
         if (!body.startsWith('{')) continue;
         const tc = parseJsonToolCandidate(body, 'fenced');
         if (tc) return tc;
@@ -2096,6 +2111,10 @@ function planSessionTurn(session, messages, contextKey) {
     const conversation = (messages || []).filter(msg => msg && !isSystemRole(msg.role));
     const keys = conversation.map(conversationMessageKey);
     if (!session?.id) return { mode: 'full', reason: null, keys };
+    // contextKey is recorded after the first successful turn. Without it the
+    // remote chat is empty (its first request failed), so it must receive the
+    // self-contained prompt, including local recovery history.
+    if (!session.contextKey) return { mode: 'full', reason: 'remote chat has no completed turn yet', keys };
     const sent = Array.isArray(session.sentMessageKeys) ? session.sentMessageKeys : [];
     // Clients without explicit history send only their new input (a user
     // message, or a tool result for the previous answer) and rely on the
@@ -2280,6 +2299,9 @@ const server = http.createServer(async (req, res) => {
         // Cancels every upstream call of this request (PoW, chat creation,
         // the answer stream) once nobody is waiting for the result.
         const requestAbort = new AbortController();
+        // Every upstream call of this request listens to this signal; retries
+        // can exceed the default EventTarget listener warning threshold.
+        events.setMaxListeners(0, requestAbort.signal);
         res.on('close', () => {
             if (res.writableFinished) return;
             clientGone = true;
