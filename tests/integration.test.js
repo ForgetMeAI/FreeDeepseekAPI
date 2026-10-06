@@ -457,6 +457,48 @@ test('a late Russian SSE throttle after partial text emits an error and cools do
   assert.ok(internals.accounts[0].cooldownUntil > Date.now());
 });
 
+test('late throttle does not fail over and same-transcript retry starts a fresh chat after cooldown', async () => {
+  internals.accounts.push({
+    id: 'account_2',
+    file: 'mock-2.json',
+    config: { token: 'two', cookie: 'c2', wasmUrl: 'mock' },
+    headers: { Authorization: 'Bearer two', 'Content-Type': 'application/json' },
+    cooldownUntil: 0,
+    failures: 0,
+    lastUsedAt: 0,
+  });
+  const request = { model: 'deepseek-chat', user: 'late-throttle-retry', messages: [{ role: 'user', content: 'same full transcript' }] };
+  mock.state.respond = () => ({
+    text: 'partial answer',
+    errorAfterResponse: 'Слишком частые сообщения. Повторите попытку позже.',
+    gapMs: 25,
+  });
+  const throttled = await timedStream('/v1/chat/completions', { ...request, stream: true });
+  assert.equal(throttled.status, 200);
+  const errorEvent = throttled.events.find(e => /"error":/.test(e.part));
+  assert.ok(errorEvent, throttled.raw);
+  assert.equal(JSON.parse(errorEvent.part.slice(6)).error.type, 'rate_limit_error');
+  assert.equal(mock.state.completions.length, 1, 'the late throttle must not replay on another account');
+  const failedAuth = mock.state.completions[0].auth;
+  assert.ok(['Bearer one', 'Bearer two'].includes(failedAuth));
+  const failedIndex = failedAuth === 'Bearer one' ? 0 : 1;
+  const readyIndex = 1 - failedIndex;
+  assert.ok(internals.accounts[failedIndex].cooldownUntil > Date.now());
+  assert.equal(internals.accounts[readyIndex].cooldownUntil, 0, 'the ready account must not be cooled or used for failover');
+  const failedChatId = mock.state.completions[0].body.chat_session_id;
+
+  internals.accounts[failedIndex].cooldownUntil = Date.now() - 1;
+  mock.state.respond = () => ({ text: 'recovered from full transcript' });
+  const recovered = await chat(request);
+  assert.equal(recovered.status, 200, recovered.text);
+  assert.equal(recovered.json.choices[0].message.content, 'recovered from full transcript');
+  assert.equal(mock.state.completions.length, 2);
+  assert.notEqual(mock.state.completions[1].body.chat_session_id, failedChatId);
+  assert.equal(mock.state.completions[1].body.parent_message_id, null);
+  assert.equal(mock.state.completions[1].auth, failedAuth);
+  assert.equal(internals.accounts[readyIndex].cooldownUntil, 0);
+});
+
 test('a rate-limit error on an empty continuation fails instead of returning earlier partial text', async () => {
   mock.state.respond = (body, auth, n) => (n === 1
     ? { text: 'partial answer', finalStatus: 'INCOMPLETE' }
@@ -472,6 +514,28 @@ test('a rate-limit error on an empty continuation fails instead of returning ear
   assert.doesNotMatch(result.raw, /"finish_reason":"length"/);
   assert.equal(mock.state.completions.length, 2, 'the continuation throttle must not trigger another completion');
   assert.ok(internals.accounts[0].cooldownUntil > Date.now());
+});
+
+test('a throttled continuation clears its remote chat before a same-transcript retry', async () => {
+  const request = { model: 'deepseek-chat', user: 'continuation-throttle-retry', messages: [{ role: 'user', content: 'same continuation transcript' }] };
+  mock.state.respond = (body, auth, n) => (n === 1
+    ? { text: 'partial answer', finalStatus: 'INCOMPLETE' }
+    : { error: 'Слишком частые сообщения. Повторите попытку позже.' });
+  const throttled = await timedStream('/v1/chat/completions', { ...request, stream: true });
+  assert.equal(throttled.status, 200);
+  assert.ok(throttled.events.some(e => /"error":/.test(e.part)), throttled.raw);
+  assert.equal(mock.state.completions.length, 2);
+  assert.ok(internals.accounts[0].cooldownUntil > Date.now());
+  const failedChatId = mock.state.completions[0].body.chat_session_id;
+
+  internals.accounts[0].cooldownUntil = Date.now() - 1;
+  mock.state.respond = () => ({ text: 'recovered continuation transcript' });
+  const recovered = await chat(request);
+  assert.equal(recovered.status, 200, recovered.text);
+  assert.equal(recovered.json.choices[0].message.content, 'recovered continuation transcript');
+  assert.equal(mock.state.completions.length, 3);
+  assert.notEqual(mock.state.completions[2].body.chat_session_id, failedChatId);
+  assert.equal(mock.state.completions[2].body.parent_message_id, null);
 });
 
 test('latest-only clients keep their chat for tool results and changing system prompts', async () => {
