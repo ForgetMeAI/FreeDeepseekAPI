@@ -43,21 +43,26 @@ function readJson(file) {
   const raw = fs.readFileSync(file, 'utf8');
   return JSON.parse(raw);
 }
+// Strips CR/LF (and other control chars) to prevent HTTP header/response
+// splitting and cookie injection when this value is later sent as a header.
+function stripCrlf(value) {
+  return String(value).replace(/[\r\n\x00-\x1f\x7f]+/g, '').trim();
+}
 function cookieArrayToHeader(cookies) {
   return cookies
     // Only deepseek.com and its subdomains; never look-alike domains.
     .filter(c => c && c.name && c.value && /(^|\.)deepseek\.com$/i.test(String(c.domain || '').trim()))
-    .map(c => `${String(c.name).trim()}=${String(c.value).trim()}`)
+    .map(c => `${stripCrlf(c.name)}=${stripCrlf(c.value)}`)
     .filter(Boolean)
     .join('; ');
 }
 function normalizeCookieInput(input) {
   if (!input) return '';
-  if (typeof input === 'string') return input.trim();
+  if (typeof input === 'string') return stripCrlf(input);
   if (Array.isArray(input)) return cookieArrayToHeader(input);
   if (Array.isArray(input.cookies)) return cookieArrayToHeader(input.cookies);
-  if (typeof input.cookie === 'string') return input.cookie.trim();
-  if (typeof input.cookies === 'string') return input.cookies.trim();
+  if (typeof input.cookie === 'string') return stripCrlf(input.cookie);
+  if (typeof input.cookies === 'string') return stripCrlf(input.cookies);
   return '';
 }
 function normalizeAuth(input, extra = {}) {
