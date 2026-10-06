@@ -871,9 +871,12 @@ test('every supported model alias targets the unified DeepSeek Web mode (#31)', 
 
 test('rate-limit detector recognizes DeepSeek throttling messages', () => {
   assert.equal(serverInternals.isRateLimitError({ content: 'Too many messages in a short period' }), true);
+  assert.equal(serverInternals.isRateLimitError({ content: 'Слишком частые сообщения. Повторите попытку позже.' }), true);
   assert.equal(serverInternals.isRateLimitError('rate_limit_reached'), true);
+  assert.equal(serverInternals.isRateLimitError({ content: 'Повторите попытку позже: сервер обновляется.' }), false);
   assert.equal(serverInternals.isRateLimitError({ content: 'Содержание слишком длинное' }), false);
   assert.deepEqual(serverInternals.classifyRecoveryFailure({ content: 'Too many messages' }, false), { status: 429, type: 'rate_limit_error' });
+  assert.deepEqual(serverInternals.classifyRecoveryFailure({ content: 'Слишком частые сообщения. Повторите попытку позже.' }, false), { status: 429, type: 'rate_limit_error' });
 });
 
 test('.env loader fills only unset variables', () => {

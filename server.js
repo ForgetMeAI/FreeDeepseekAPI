@@ -2179,7 +2179,7 @@ function isRateLimitError(error) {
     const message = typeof error === 'string'
         ? error
         : `${error?.content || ''} ${error?.message || ''} ${error?.type || ''}`;
-    return /too\s+many\s+(?:messages|requests)|rate[\s_-]?limit|过于频繁|слишком\s+много\s+(?:сообщений|запросов)/i.test(message);
+    return /too\s+many\s+(?:messages|requests)|rate[\s_-]?limit|过于频繁|слишком\s+(?:много\s+(?:сообщений|запросов)|частые\s+сообщения)/i.test(message);
 }
 
 function classifyRecoveryFailure(modelError, timedOut = false) {
@@ -2768,6 +2768,12 @@ const server = http.createServer(async (req, res) => {
                 }
                 session.remoteChars = (session.remoteChars || 0) + fullContent.length + reasoningContent.length;
 
+                if (fullContent.trim() && isRateLimitError(modelError)) {
+                    const retryAfter = String(Math.ceil(RATE_LIMIT_COOLDOWN_MS / 1000));
+                    markAccountFailure(call.account, 429, 'rate limited in stream', retryAfter, RATE_LIMIT_COOLDOWN_MS);
+                    throw createUpstreamHttpError(429, modelError.content, retryAfter);
+                }
+
                 return { content: fullContent, reasoningContent, messageId: newMessageId, finishReason, modelError };
             }
 
@@ -2925,8 +2931,13 @@ const server = http.createServer(async (req, res) => {
                     // Not streamed live: the continuation is only kept if it
                     // passes the checks below; finish() sends the kept part.
                     contResult = await readDeepSeekResponse(continuationCall);
+                    if (isRateLimitError(contResult.modelError)) {
+                        const retryAfter = String(Math.ceil(RATE_LIMIT_COOLDOWN_MS / 1000));
+                        markAccountFailure(continuationCall.account, 429, 'rate limited in continuation', retryAfter, RATE_LIMIT_COOLDOWN_MS);
+                        throw createUpstreamHttpError(429, contResult.modelError.content, retryAfter);
+                    }
                 } catch (error) {
-                    if (requestAbort.signal.aborted) throw error;
+                    if (requestAbort.signal.aborted || (Number(error?.status) === 429 && error?.type === 'rate_limit_error')) throw error;
                     console.log(`${agentTag} Continuation stream failed (${error.message}); returning the partial answer`);
                     resetRemoteSession(session);
                     break;
