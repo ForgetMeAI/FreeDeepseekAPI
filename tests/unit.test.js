@@ -235,7 +235,7 @@ test('Containerfile keeps the rootless Podman runtime minimal and fail-closed', 
 
   assert.deepEqual(copyLines, [
     'COPY --chown=1000:1000 package.json server.js ./',
-    'COPY --chown=1000:1000 lib/pow.js ./lib/pow.js',
+    'COPY --chown=1000:1000 lib/pow.js lib/env.js ./lib/',
   ]);
   assert.doesNotMatch(containerfile, /^\s*(?:COPY|ADD)\s+\.\s/m);
   assert.match(containerfile, /^USER 1000:1000$/m);
@@ -732,4 +732,167 @@ test('stream helpers preserve the request-level exact CORS origin', () => {
     send(res, response);
     assert.equal(Object.hasOwn(writeHeadHeaders, 'Access-Control-Allow-Origin'), false);
   }
+});
+
+test('parseToolCall repairs raw Windows backslashes and newlines inside JSON strings (#30)', () => {
+  const issue30 = '{"tool_call":{"name":"read_files","arguments":{"files":[{"path":"c:\\git\\dsh-local-llm\\src\\index.ts","start_line":240,"end_line":350},{"path":"c:\\git\\dsh-local-llm\\src\\server-manager.ts"}]}}}';
+  const call = serverInternals.parseToolCall(issue30);
+  assert.equal(call.name, 'read_files');
+  assert.deepEqual(JSON.parse(call.arguments).files.map(f => f.path), [
+    'c:\\git\\dsh-local-llm\\src\\index.ts',
+    'c:\\git\\dsh-local-llm\\src\\server-manager.ts',
+  ]);
+
+  // A raw path whose segments happen to look like \n and \t stays literal.
+  assert.deepEqual(serverInternals.parseJsonLenient('{"p":"C:\\new\\tmp\\x"}'), { p: 'C:\\new\\tmp\\x' });
+  // Correctly escaped JSON is never changed.
+  assert.deepEqual(serverInternals.parseJsonLenient('{"p":"a\\nb","q":"C:\\\\dir"}'), { p: 'a\nb', q: 'C:\\dir' });
+
+  const legacy = serverInternals.parseToolCall('TOOL_CALL: read_file\narguments: {"path":"D:\\Projects\\app\\main.cs"}');
+  assert.deepEqual(JSON.parse(legacy.arguments), { path: 'D:\\Projects\\app\\main.cs' });
+
+  const multiline = serverInternals.parseToolCall('{"tool_call":{"name":"write_file","arguments":{"path":"/tmp/a.py","content":"def f():\n\treturn 1\n"}}}');
+  assert.deepEqual(JSON.parse(multiline.arguments), { path: '/tmp/a.py', content: 'def f():\n\treturn 1\n' });
+});
+
+test('parseToolCall ignores source-code fences and finds an envelope after them (#30)', () => {
+  const code = Array.from({ length: 40 }, (_, i) => `public void M${i}() { if (x) { y(); } }`).join('\n');
+  const answer = `Here is the class:\n\`\`\`csharp\n${code}\n\`\`\`\n{"tool_call":{"name":"write_file","arguments":{"path":"/tmp/A.cs","content":"class A {}"}}}`;
+  const call = serverInternals.parseToolCall(answer);
+  assert.equal(call.name, 'write_file');
+  assert.equal(serverInternals.parseToolCall(`\`\`\`csharp\n${code}\n\`\`\``), null);
+
+  const fenced = serverInternals.parseToolCall('```json\n{"tool_call":{"name":"read_file","arguments":{"path":"/tmp/x"}}}\n```');
+  assert.deepEqual(JSON.parse(fenced.arguments), { path: '/tmp/x' });
+});
+
+test('sanitizeContent keeps emoji and drops only lone surrogates', () => {
+  assert.equal(serverInternals.sanitizeContent('ok 😀 ✅'), 'ok 😀 ✅');
+  assert.equal(serverInternals.sanitizeContent('a\ud800b\udc00c'), 'abc');
+});
+
+test('message normalization omits inline images and earlier reasoning blocks', () => {
+  const base64 = 'data:image/png;base64,' + 'A'.repeat(200000);
+  const text = serverInternals.normalizeMessageContent([
+    { type: 'text', text: 'look' },
+    { type: 'image_url', image_url: { url: base64 } },
+    { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'B'.repeat(1000) } },
+    { type: 'thinking', thinking: 'secret', signature: 'sig' },
+    { type: 'image_url', image_url: { url: 'https://example.com/cat.png' } },
+  ]);
+  assert.ok(text.length < 300, text);
+  assert.match(text, /look/);
+  assert.match(text, /\[Image attached; not visible through this proxy\]/);
+  assert.match(text, /\[Image: https:\/\/example\.com\/cat\.png\]/);
+  assert.doesNotMatch(text, /secret|sig/);
+});
+
+test('conversation formatting replays tool calls in the requested JSON format', () => {
+  const formatted = serverInternals.formatMessages([
+    { role: 'developer', content: 'DEV RULES' },
+    { role: 'user', content: 'go' },
+    { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read_file', arguments: '{"path":"/a"}' } }] },
+    { role: 'tool', tool_call_id: 'c1', content: [{ type: 'text', text: 'data' }] },
+  ], []);
+  assert.match(formatted.systemPrompt, /DEV RULES/);
+  assert.match(formatted.prompt, /Assistant: \{"tool_call":\{"name":"read_file","arguments":\{"path":"\/a"\}\}\}/);
+  assert.match(formatted.prompt, /\[Tool Result: read_file\]\ndata/);
+  assert.doesNotMatch(formatted.prompt, /TOOL_CALL:/);
+});
+
+test('Responses API input keeps earlier function calls in the transcript', () => {
+  const params = serverInternals.normalizeApiParams({
+    model: 'deepseek-chat',
+    input: [
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'list' }] },
+      { type: 'function_call', call_id: 'call_1', name: 'ls', arguments: '{"dir":"/"}' },
+      { type: 'function_call_output', call_id: 'call_1', output: 'bin etc' },
+    ],
+  }, 'responses');
+  const formatted = serverInternals.formatMessages(params.messages, []);
+  assert.match(formatted.prompt, /Assistant: \{"tool_call":\{"name":"ls"/);
+  assert.match(formatted.prompt, /\[Tool Result: ls\]\nbin etc/);
+});
+
+test('planSessionTurn sends deltas only for an exact continuation of the tracked history', () => {
+  const messages = [
+    { role: 'system', content: 'S' },
+    { role: 'user', content: 'task' },
+    { role: 'assistant', content: 'calling', tool_calls: [{ id: 'c1', function: { name: 'ls', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 'c1', content: 'out' },
+  ];
+  const session = serverInternals.createSession();
+  assert.equal(serverInternals.planSessionTurn(session, messages, 'ctx').mode, 'full');
+
+  session.id = 'chat';
+  session.contextKey = 'ctx';
+  session.sentMessageKeys = [serverInternals.conversationMessageKey(messages[1])];
+  const delta = serverInternals.planSessionTurn(session, messages, 'ctx');
+  assert.equal(delta.mode, 'delta');
+  assert.deepEqual(delta.messages.map(m => m.role), ['tool']);
+  assert.equal(delta.keys.length, 3);
+
+  assert.equal(serverInternals.planSessionTurn(session, messages, 'other-system-prompt').mode, 'full');
+  session.sentMessageKeys = ['something else'];
+  assert.equal(serverInternals.planSessionTurn(session, messages, 'ctx').mode, 'full');
+  session.sentMessageKeys = delta.keys;
+  assert.equal(serverInternals.planSessionTurn(session, messages, 'ctx').mode, 'full', 'a replayed request has no new input');
+
+  const deltaPrompt = serverInternals.buildDeltaPrompt(delta.messages, messages, serverInternals.formatToolReminder([{ type: 'function', function: { name: 'ls' } }]));
+  assert.match(deltaPrompt.prompt, /^\[Tool Result: ls\]\nout\n\n\[Tool reminder\] Available tools: ls\./);
+});
+
+test('remote sessions roll over once their accumulated context gets too large', () => {
+  const session = serverInternals.createSession();
+  session.id = 'big-chat';
+  session.sentMessageKeys = ['k'];
+  session.remoteChars = 10 * 1000 * 1000;
+  const reset = serverInternals.prepareSessionForPrompt(session, Date.now());
+  assert.equal(reset.reason, 'max_context_chars');
+  assert.equal(session.id, null);
+  assert.deepEqual(session.sentMessageKeys, []);
+  assert.equal(session.remoteChars, 0);
+});
+
+test('every supported model alias targets the unified DeepSeek Web mode (#31)', () => {
+  for (const id of serverInternals.SUPPORTED_MODEL_IDS) {
+    assert.equal(serverInternals.MODEL_CONFIGS[id].model_type, 'default', id);
+  }
+  assert.equal(serverInternals.resolveModelConfig('deepseek-expert').thinking_enabled, true);
+  assert.equal(serverInternals.resolveModelConfig('deepseek-v4-pro').thinking_enabled, true);
+  assert.equal(serverInternals.resolveModelConfig('deepseek-v4-flash').thinking_enabled, false);
+  assert.equal(serverInternals.resolveModelConfig('deepseek-expert-search').supported, true);
+  assert.equal(serverInternals.resolveModelConfig('deepseek-vision').supported, false);
+});
+
+test('rate-limit detector recognizes DeepSeek throttling messages', () => {
+  assert.equal(serverInternals.isRateLimitError({ content: 'Too many messages in a short period' }), true);
+  assert.equal(serverInternals.isRateLimitError('rate_limit_reached'), true);
+  assert.equal(serverInternals.isRateLimitError({ content: 'Содержание слишком длинное' }), false);
+  assert.deepEqual(serverInternals.classifyRecoveryFailure({ content: 'Too many messages' }, false), { status: 429, type: 'rate_limit_error' });
+});
+
+test('.env loader fills only unset variables', () => {
+  const dir = tmpdir();
+  const file = path.join(dir, '.env');
+  fs.writeFileSync(file, '# comment\nPORT=1234\nexport HOST="0.0.0.0"\nKEEP=from-file # trailing comment\nEMPTY=\n');
+  const env = { PORT: '9655' };
+  assert.equal(serverInternals.loadDotEnv(file, env), 3);
+  assert.deepEqual(env, { PORT: '9655', HOST: '0.0.0.0', KEEP: 'from-file', EMPTY: '' });
+  assert.equal(serverInternals.loadDotEnv(path.join(dir, 'missing'), env), 0);
+});
+
+test('screenshot extraction handles array content and only scans the current turn', () => {
+  const dir = tmpdir();
+  const oldShot = path.join(dir, 'old.png');
+  const newShot = path.join(dir, 'new.png');
+  fs.writeFileSync(oldShot, 'x');
+  fs.writeFileSync(newShot, 'x');
+  const paths = serverInternals.extractScreenshotPaths([
+    { role: 'user', content: 'first' },
+    { role: 'tool', content: JSON.stringify({ screenshot_path: oldShot }) },
+    { role: 'user', content: [{ type: 'text', text: 'second' }] },
+    { role: 'tool', content: [{ type: 'text', text: JSON.stringify({ screenshot_path: newShot }) }] },
+  ]);
+  assert.deepEqual(paths, [`MEDIA:${newShot}`]);
 });
