@@ -165,8 +165,14 @@ Non-stream response:
 `content` is `null` and `reasoning_content` is omitted on tool-call turns.
 Token counts are estimates (characters / 4); DeepSeek Web reports no usage.
 
-Streaming (`stream: true`) — the proxy streams after the upstream answer is
-complete:
+Streaming (`stream: true`): requests **without tools** are streamed live while
+DeepSeek generates (reasoning first, then the answer). Requests **with tools**
+are buffered until the answer is known to be a tool call or text; meanwhile the
+proxy writes `: keep-alive` SSE comments after `DEEPSEEK_STREAM_KEEPALIVE_MS` of
+silence. Headers are sent with the first event, so failures before that keep
+their HTTP status; later failures arrive as an in-stream error
+(`data: {"error": {...}}` here, `event: error` for Anthropic and Responses),
+which the OpenAI and Anthropic SDKs raise as exceptions.
 
 ```
 data: {"object":"chat.completion.chunk","choices":[{"delta":{"role":"assistant","content":""}}]}
@@ -365,6 +371,7 @@ loaded automatically (see `.env.example` for the full list).
 | `DEEPSEEK_FETCH_TIMEOUT_MS` | `60000` | Connect/response-header timeout |
 | `DEEPSEEK_STREAM_IDLE_TIMEOUT_MS` | `60000` | Max silence inside an answer stream |
 | `DEEPSEEK_STREAM_MAX_MS` | `600000` | Max duration of one answer stream |
+| `DEEPSEEK_STREAM_KEEPALIVE_MS` | `10000` | Silence before a `: keep-alive` comment on streamed responses |
 | `DEEPSEEK_REQUEST_DEADLINE_MS` | `120000` | Budget for retry/continuation loops |
 | `DEEPSEEK_MAX_CONCURRENT` | `24` | In-flight completions before 503 |
 | `NON_INTERACTIVE` / `SKIP_ACCOUNT_MENU` | `0` | Start without the menu |

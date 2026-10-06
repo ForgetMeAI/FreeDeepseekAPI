@@ -41,6 +41,10 @@ const DS_FETCH_TIMEOUT_MS = envNumber('DEEPSEEK_FETCH_TIMEOUT_MS', 60000, 1000);
 // than a minute, so the stream is bounded by inactivity instead of total time.
 const DS_STREAM_IDLE_TIMEOUT_MS = envNumber('DEEPSEEK_STREAM_IDLE_TIMEOUT_MS', DS_FETCH_TIMEOUT_MS, 1000);
 const DS_STREAM_MAX_MS = envNumber('DEEPSEEK_STREAM_MAX_MS', 10 * 60 * 1000, 1000);
+// While a streamed request has nothing to send yet (a tool turn is buffered,
+// or DeepSeek is slow to start), an SSE comment is written after this much
+// silence so clients and proxies do not drop the idle connection.
+const STREAM_KEEPALIVE_MS = envNumber('DEEPSEEK_STREAM_KEEPALIVE_MS', 10000, 1000);
 function timeoutError(message) {
     const error = new Error(message);
     error.name = 'TimeoutError';
@@ -244,7 +248,8 @@ function setCorsResponseHeaders(res) {
     res.setHeader('Access-Control-Expose-Headers', CONTEXT_COMPACTED_HEADER);
 }
 function markContextCompacted(res) {
-    res.setHeader(CONTEXT_COMPACTED_HEADER, 'true');
+    // A live stream may already have sent its headers.
+    if (!res.headersSent) res.setHeader(CONTEXT_COMPACTED_HEADER, 'true');
 }
 
 // === Per-Agent Session Store ===
@@ -1670,65 +1675,23 @@ function chunkText(text, size) {
     return String(text || '').match(new RegExp(`[\\s\\S]{1,${size}}`, 'gu')) || [];
 }
 
-function writeSse(res, event, data) {
-    if (event) res.write(`event: ${event}\n`);
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
-}
-
-function sendAnthropicStream(res, openaiResp) {
-    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
-    const choice = openaiResp.choices[0];
-    const msg = choice.message || {};
-    const message = toAnthropicResponse(openaiResp);
-    const hasToolCalls = msg.tool_calls && msg.tool_calls.length > 0;
-    writeSse(res, 'message_start', { type: 'message_start', message: { ...message, content: [] } });
-
-    // Anthropic-compatible clients expect a tool turn to be made of tool_use
-    // content blocks. If we emit DeepSeek reasoning as a text block before the
-    // tool_use block, some agents treat the turn as a normal text answer and do
-    // not execute the tool. Keep tool streaming clean: tool_use blocks only.
-    if (hasToolCalls) {
-        msg.tool_calls.forEach((tc, i) => {
-            writeSse(res, 'content_block_start', { type: 'content_block_start', index: i, content_block: { type: 'tool_use', id: tc.id, name: tc.function.name, input: {} } });
-            writeSse(res, 'content_block_delta', { type: 'content_block_delta', index: i, delta: { type: 'input_json_delta', partial_json: tc.function.arguments || '{}' } });
-            writeSse(res, 'content_block_stop', { type: 'content_block_stop', index: i });
-        });
-        writeSse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: 'tool_use', stop_sequence: null }, usage: message.usage });
-    } else {
-        if (msg.reasoning_content) {
-            writeSse(res, 'content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
-            writeSse(res, 'content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: `[reasoning]\n${msg.reasoning_content}\n[/reasoning]\n` } });
-            writeSse(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
-        }
-        const offset = msg.reasoning_content ? 1 : 0;
-        writeSse(res, 'content_block_start', { type: 'content_block_start', index: offset, content_block: { type: 'text', text: '' } });
-        for (const piece of chunkText(msg.content, 80)) {
-            writeSse(res, 'content_block_delta', { type: 'content_block_delta', index: offset, delta: { type: 'text_delta', text: piece } });
-        }
-        writeSse(res, 'content_block_stop', { type: 'content_block_stop', index: offset });
-        writeSse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: message.stop_reason, stop_sequence: null }, usage: message.usage });
-    }
-    writeSse(res, 'message_stop', { type: 'message_stop' });
-    res.end();
-}
-
-function toResponsesResponse(openaiResp) {
+function toResponsesResponse(openaiResp, ids = {}) {
     const choice = openaiResp.choices[0];
     const msg = choice.message || {};
     const hasToolCalls = msg.tool_calls && msg.tool_calls.length > 0;
     const output = [];
     if (!hasToolCalls && msg.reasoning_content) {
-        output.push({ id: 'rs_' + Date.now(), type: 'reasoning', summary: [{ type: 'summary_text', text: msg.reasoning_content }] });
+        output.push({ id: ids.reasoning || 'rs_' + Date.now(), type: 'reasoning', summary: [{ type: 'summary_text', text: msg.reasoning_content }], status: 'completed' });
     }
     if (hasToolCalls) {
         for (const tc of msg.tool_calls) {
             output.push({ type: 'function_call', id: 'fc_' + tc.id, call_id: tc.id, name: tc.function.name, arguments: tc.function.arguments || '{}' });
         }
     } else {
-        output.push({ id: 'msg_' + Date.now(), type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: msg.content || '', annotations: [] }] });
+        output.push({ id: ids.message || 'msg_' + Date.now(), type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: msg.content || '', annotations: [] }] });
     }
     return {
-        id: openaiResp.id.replace(/^ds-/, 'resp_'),
+        id: ids.response || openaiResp.id.replace(/^ds-/, 'resp_'),
         object: 'response',
         created_at: openaiResp.created,
         status: 'completed',
@@ -1743,48 +1706,6 @@ function toResponsesResponse(openaiResp) {
         },
         watermark: FORGETMEAI_WATERMARK,
     };
-}
-
-function sendResponsesStream(res, openaiResp) {
-    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
-    const response = toResponsesResponse(openaiResp);
-    const choice = openaiResp.choices[0];
-    const msg = choice.message || {};
-    const hasToolCalls = msg.tool_calls && msg.tool_calls.length > 0;
-    writeSse(res, 'response.created', { type: 'response.created', response: { ...response, status: 'in_progress', output: [] } });
-    writeSse(res, 'response.in_progress', { type: 'response.in_progress', response: { ...response, status: 'in_progress', output: [] } });
-    let outputIndex = 0;
-    if (!hasToolCalls && msg.reasoning_content) {
-        const reasoningItem = { id: 'rs_' + Date.now(), type: 'reasoning', summary: [], status: 'completed' };
-        writeSse(res, 'response.output_item.added', { type: 'response.output_item.added', output_index: outputIndex, item: { ...reasoningItem, status: 'in_progress' } });
-        writeSse(res, 'response.reasoning_summary_text.delta', { type: 'response.reasoning_summary_text.delta', output_index: outputIndex, summary_index: 0, delta: msg.reasoning_content });
-        writeSse(res, 'response.output_item.done', { type: 'response.output_item.done', output_index: outputIndex, item: { ...reasoningItem, summary: [{ type: 'summary_text', text: msg.reasoning_content }] } });
-        outputIndex++;
-    }
-    if (hasToolCalls) {
-        msg.tool_calls.forEach((tc) => {
-            const item = { type: 'function_call', id: 'fc_' + tc.id, call_id: tc.id, name: tc.function.name, arguments: tc.function.arguments || '{}', status: 'completed' };
-            writeSse(res, 'response.output_item.added', { type: 'response.output_item.added', output_index: outputIndex, item: { ...item, arguments: '', status: 'in_progress' } });
-            writeSse(res, 'response.function_call_arguments.delta', { type: 'response.function_call_arguments.delta', output_index: outputIndex, item_id: item.id, delta: item.arguments });
-            writeSse(res, 'response.function_call_arguments.done', { type: 'response.function_call_arguments.done', output_index: outputIndex, item_id: item.id, arguments: item.arguments });
-            writeSse(res, 'response.output_item.done', { type: 'response.output_item.done', output_index: outputIndex, item });
-            outputIndex++;
-        });
-    } else {
-        const text = msg.content || '';
-        const item = { id: 'msg_' + Date.now(), type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text, annotations: [] }] };
-        writeSse(res, 'response.output_item.added', { type: 'response.output_item.added', output_index: outputIndex, item: { ...item, status: 'in_progress', content: [] } });
-        writeSse(res, 'response.content_part.added', { type: 'response.content_part.added', output_index: outputIndex, content_index: 0, item_id: item.id, part: { type: 'output_text', text: '', annotations: [] } });
-        for (const piece of chunkText(text, 80)) {
-            writeSse(res, 'response.output_text.delta', { type: 'response.output_text.delta', output_index: outputIndex, content_index: 0, item_id: item.id, delta: piece });
-        }
-        writeSse(res, 'response.output_text.done', { type: 'response.output_text.done', output_index: outputIndex, content_index: 0, item_id: item.id, text });
-        writeSse(res, 'response.content_part.done', { type: 'response.content_part.done', output_index: outputIndex, content_index: 0, item_id: item.id, part: item.content[0] });
-        writeSse(res, 'response.output_item.done', { type: 'response.output_item.done', output_index: outputIndex, item });
-    }
-    writeSse(res, 'response.completed', { type: 'response.completed', response });
-    res.write('data: [DONE]\n\n');
-    res.end();
 }
 
 function sendJsonError(res, status, message, type, extra = {}, headers = {}) {
@@ -1806,38 +1727,273 @@ function sendCompletion(res, apiMode, stream, openaiResponse) {
     else res.end(JSON.stringify(openaiResponse));
 }
 
-function sendOpenAIStream(res, openaiResp) {
-    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
-    const choice = openaiResp.choices[0];
-    const msg = choice.message || {};
-    const id = openaiResp.id;
-    const created = openaiResp.created;
-    const model = openaiResp.model;
-    const hasToolCalls = msg.tool_calls && msg.tool_calls.length > 0;
-    const writeChunk = (delta, finishReason = null) => {
-        res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta, finish_reason: finishReason }] })}\n\n`);
-    };
-    // The first chunk announces the role, as OpenAI streams do.
-    writeChunk({ role: 'assistant', content: hasToolCalls ? null : '' });
-    if (!hasToolCalls && msg.reasoning_content) {
-        for (const piece of chunkText(msg.reasoning_content, 50)) {
-            writeChunk({ reasoning_content: piece });
-        }
-    }
-    if (hasToolCalls) {
-        // Streaming tool-call deltas must carry their position: SDKs
-        // accumulate arguments by `index`.
-        writeChunk({ tool_calls: msg.tool_calls.map((tc, index) => ({ index, ...tc })) });
-        writeChunk({}, 'tool_calls');
-    } else {
-        for (const piece of chunkText(msg.content, 50)) {
-            writeChunk({ content: piece });
-        }
-        writeChunk({}, choice.finish_reason === 'length' ? 'length' : 'stop');
-    }
-    res.write('data: [DONE]\n\n');
-    res.end();
+function writeSse(res, event, data) {
+    if (event) res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
+
+const SSE_HEADERS = { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' };
+
+function anthropicErrorType(type, status) {
+    if (status === 429 || /rate/i.test(String(type))) return 'rate_limit_error';
+    if (status === 401 || status === 403) return 'authentication_error';
+    if (status === 400 || status === 413) return 'invalid_request_error';
+    if (status === 503) return 'overloaded_error';
+    return 'api_error';
+}
+
+// Writes one streamed completion in the client's protocol (OpenAI chat
+// chunks, Anthropic message events or Responses events).
+//
+// Live use: source('reasoning' | 'content') returns a function that takes the
+// cumulative text of one DeepSeek call and forwards only the new part, so
+// clients see the answer while DeepSeek is still writing it. finish() then
+// emits whatever was not streamed yet (or the whole answer when nothing was)
+// and closes the stream; fail() reports an error, as an HTTP status while no
+// byte was sent and as an in-stream error event afterwards. Headers are sent
+// lazily, on the first delta or keepAlive(), so fast failures keep their
+// real status codes.
+function createStreamWriter(res, apiMode, { model = 'deepseek-chat', promptTokens = 0, id = 'ds-' + Date.now(), created = Math.floor(Date.now() / 1000) } = {}) {
+    const state = { started: false, ended: false, lastWriteAt: 0, reasoning: '', content: '', section: null, reasoningSource: null, pendingWhitespace: '', sources: 0 };
+    const itemIds = { response: id.replace(/^ds-/, 'resp_'), reasoning: `rs_${id}`, message: `msg_${id}` };
+    let roleSent = false;
+    let blockIndex = -1;
+    let outputIndex = -1;
+
+    const sse = (event, data) => { writeSse(res, event, data); state.lastWriteAt = Date.now(); };
+    const chunk = (delta, finishReason = null) => sse(null, { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta, finish_reason: finishReason }] });
+    const responseSkeleton = () => ({ id: itemIds.response, object: 'response', created_at: created, status: 'in_progress', model, output: [], watermark: FORGETMEAI_WATERMARK });
+
+    function start() {
+        if (state.started) return;
+        state.started = true;
+        res.writeHead(200, SSE_HEADERS);
+        state.lastWriteAt = Date.now();
+        if (apiMode === 'anthropic') {
+            sse('message_start', { type: 'message_start', message: { id: 'msg_' + id, type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: promptTokens, output_tokens: 0 }, watermark: FORGETMEAI_WATERMARK } });
+        } else if (apiMode === 'responses') {
+            sse('response.created', { type: 'response.created', response: responseSkeleton() });
+            sse('response.in_progress', { type: 'response.in_progress', response: responseSkeleton() });
+        }
+    }
+
+    // The first OpenAI chunk announces the role, as OpenAI streams do.
+    function openaiRole(toolTurn) {
+        if (roleSent) return;
+        roleSent = true;
+        chunk({ role: 'assistant', content: toolTurn ? null : '' });
+    }
+
+    function openSection(kind) {
+        if (state.section === kind) return;
+        closeSection();
+        state.section = kind;
+        if (apiMode === 'openai') {
+            openaiRole(false);
+        } else if (apiMode === 'anthropic') {
+            blockIndex++;
+            sse('content_block_start', { type: 'content_block_start', index: blockIndex, content_block: { type: 'text', text: '' } });
+            if (kind === 'reasoning') sse('content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text: '[reasoning]\n' } });
+        } else {
+            outputIndex++;
+            if (kind === 'reasoning') {
+                sse('response.output_item.added', { type: 'response.output_item.added', output_index: outputIndex, item: { id: itemIds.reasoning, type: 'reasoning', summary: [], status: 'in_progress' } });
+                sse('response.reasoning_summary_part.added', { type: 'response.reasoning_summary_part.added', item_id: itemIds.reasoning, output_index: outputIndex, summary_index: 0, part: { type: 'summary_text', text: '' } });
+            } else {
+                sse('response.output_item.added', { type: 'response.output_item.added', output_index: outputIndex, item: { id: itemIds.message, type: 'message', role: 'assistant', status: 'in_progress', content: [] } });
+                sse('response.content_part.added', { type: 'response.content_part.added', item_id: itemIds.message, output_index: outputIndex, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } });
+            }
+        }
+    }
+
+    function closeSection() {
+        const kind = state.section;
+        if (!kind) return;
+        state.section = null;
+        if (apiMode === 'openai') return;
+        if (apiMode === 'anthropic') {
+            if (kind === 'reasoning') sse('content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text: '\n[/reasoning]\n' } });
+            sse('content_block_stop', { type: 'content_block_stop', index: blockIndex });
+            return;
+        }
+        if (kind === 'reasoning') {
+            const part = { type: 'summary_text', text: state.reasoning };
+            sse('response.reasoning_summary_text.done', { type: 'response.reasoning_summary_text.done', item_id: itemIds.reasoning, output_index: outputIndex, summary_index: 0, text: state.reasoning });
+            sse('response.reasoning_summary_part.done', { type: 'response.reasoning_summary_part.done', item_id: itemIds.reasoning, output_index: outputIndex, summary_index: 0, part });
+            sse('response.output_item.done', { type: 'response.output_item.done', output_index: outputIndex, item: { id: itemIds.reasoning, type: 'reasoning', summary: [part], status: 'completed' } });
+        } else {
+            const part = { type: 'output_text', text: state.content, annotations: [] };
+            sse('response.output_text.done', { type: 'response.output_text.done', item_id: itemIds.message, output_index: outputIndex, content_index: 0, text: state.content });
+            sse('response.content_part.done', { type: 'response.content_part.done', item_id: itemIds.message, output_index: outputIndex, content_index: 0, part });
+            sse('response.output_item.done', { type: 'response.output_item.done', output_index: outputIndex, item: { id: itemIds.message, type: 'message', role: 'assistant', status: 'completed', content: [part] } });
+        }
+    }
+
+    function emit(kind, text) {
+        if (!text) return;
+        start();
+        openSection(kind);
+        for (const piece of chunkText(text, apiMode === 'openai' ? 50 : 80)) {
+            if (apiMode === 'openai') chunk(kind === 'reasoning' ? { reasoning_content: piece } : { content: piece });
+            else if (apiMode === 'anthropic') sse('content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text: piece } });
+            else if (kind === 'reasoning') sse('response.reasoning_summary_text.delta', { type: 'response.reasoning_summary_text.delta', item_id: itemIds.reasoning, output_index: outputIndex, summary_index: 0, delta: piece });
+            else sse('response.output_text.delta', { type: 'response.output_text.delta', item_id: itemIds.message, output_index: outputIndex, content_index: 0, delta: piece });
+        }
+        state[kind] += text;
+    }
+
+    function pushReasoning(text, sourceId = null) {
+        // Reasoning belongs before the answer and comes from one DeepSeek
+        // call; reasoning of retries and continuations is not streamed.
+        if (state.ended || state.content || state.section === 'content') return;
+        if (sourceId !== null) {
+            if (state.reasoningSource !== null && state.reasoningSource !== sourceId) return;
+            if (text) state.reasoningSource = sourceId;
+        }
+        emit('reasoning', text);
+    }
+
+    function pushContent(text) {
+        if (state.ended) return;
+        // Do not open the answer on leading whitespace: an all-whitespace
+        // answer counts as empty and is retried.
+        if (!state.content) {
+            const combined = state.pendingWhitespace + text;
+            if (!combined.trim()) { state.pendingWhitespace = combined; return; }
+            state.pendingWhitespace = '';
+            text = combined;
+        }
+        emit('content', text);
+    }
+
+    return {
+        get started() { return state.started; },
+        get lastWriteAt() { return state.lastWriteAt; },
+        get streamedContent() { return state.content; },
+        source(kind) {
+            const sourceId = ++state.sources;
+            let consumed = 0;
+            let carry = '';
+            return (cumulative) => {
+                const raw = String(cumulative || '');
+                if (raw.length <= consumed) return;
+                let piece = carry + raw.slice(consumed);
+                consumed = raw.length;
+                carry = '';
+                // Keep a trailing high surrogate until its pair arrives.
+                if (/[\ud800-\udbff]$/.test(piece)) { carry = piece.slice(-1); piece = piece.slice(0, -1); }
+                piece = sanitizeContent(piece);
+                if (kind === 'reasoning') pushReasoning(piece, sourceId);
+                else pushContent(piece);
+            };
+        },
+        keepAlive() {
+            if (state.ended) return;
+            start();
+            res.write(': keep-alive\n\n');
+            state.lastWriteAt = Date.now();
+        },
+        finish(openaiResp) {
+            if (state.ended) return;
+            const choice = openaiResp.choices[0];
+            const msg = choice.message || {};
+            const toolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0 ? msg.tool_calls : null;
+            const usage = { input_tokens: openaiResp.usage?.prompt_tokens || 0, output_tokens: openaiResp.usage?.completion_tokens || 0 };
+            start();
+            if (toolCalls) {
+                // Agent clients expect a tool turn to contain only the tool
+                // call: no reasoning or text that could read as a final answer.
+                closeSection();
+                if (apiMode === 'openai') {
+                    openaiRole(true);
+                    // Streaming tool-call deltas must carry their position:
+                    // SDKs accumulate arguments by `index`.
+                    chunk({ tool_calls: toolCalls.map((tc, index) => ({ index, ...tc })) });
+                    chunk({}, 'tool_calls');
+                } else if (apiMode === 'anthropic') {
+                    for (const tc of toolCalls) {
+                        blockIndex++;
+                        sse('content_block_start', { type: 'content_block_start', index: blockIndex, content_block: { type: 'tool_use', id: tc.id, name: tc.function.name, input: {} } });
+                        sse('content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'input_json_delta', partial_json: tc.function.arguments || '{}' } });
+                        sse('content_block_stop', { type: 'content_block_stop', index: blockIndex });
+                    }
+                    sse('message_delta', { type: 'message_delta', delta: { stop_reason: 'tool_use', stop_sequence: null }, usage });
+                } else {
+                    for (const tc of toolCalls) {
+                        outputIndex++;
+                        const item = { type: 'function_call', id: 'fc_' + tc.id, call_id: tc.id, name: tc.function.name, arguments: tc.function.arguments || '{}', status: 'completed' };
+                        sse('response.output_item.added', { type: 'response.output_item.added', output_index: outputIndex, item: { ...item, arguments: '', status: 'in_progress' } });
+                        sse('response.function_call_arguments.delta', { type: 'response.function_call_arguments.delta', output_index: outputIndex, item_id: item.id, delta: item.arguments });
+                        sse('response.function_call_arguments.done', { type: 'response.function_call_arguments.done', output_index: outputIndex, item_id: item.id, arguments: item.arguments });
+                        sse('response.output_item.done', { type: 'response.output_item.done', output_index: outputIndex, item });
+                    }
+                }
+            } else {
+                const reasoning = String(msg.reasoning_content || '');
+                if (reasoning && !state.content && reasoning.startsWith(state.reasoning)) pushReasoning(reasoning.slice(state.reasoning.length));
+                const content = String(msg.content || '');
+                let rest = content;
+                if (state.content) {
+                    if (content.startsWith(state.content)) {
+                        rest = content.slice(state.content.length);
+                    } else {
+                        let common = 0;
+                        while (common < state.content.length && content[common] === state.content[common]) common++;
+                        console.log(`[stream] final answer diverged from the streamed text after ${common} chars`);
+                        rest = content.slice(common);
+                    }
+                }
+                start();
+                openSection('content');
+                if (rest) emit('content', rest);
+                closeSection();
+                if (apiMode === 'openai') {
+                    chunk({}, choice.finish_reason === 'length' ? 'length' : 'stop');
+                } else if (apiMode === 'anthropic') {
+                    sse('message_delta', { type: 'message_delta', delta: { stop_reason: choice.finish_reason === 'length' ? 'max_tokens' : 'end_turn', stop_sequence: null }, usage });
+                }
+            }
+            if (apiMode === 'anthropic') {
+                sse('message_stop', { type: 'message_stop' });
+            } else if (apiMode === 'responses') {
+                sse('response.completed', { type: 'response.completed', response: toResponsesResponse(openaiResp, itemIds) });
+                res.write('data: [DONE]\n\n');
+            } else {
+                res.write('data: [DONE]\n\n');
+            }
+            state.ended = true;
+            res.end();
+        },
+        fail(status, error, headers = {}) {
+            if (state.ended) return;
+            state.ended = true;
+            if (!state.started) {
+                if (res.headersSent) { if (!res.writableEnded) res.end(); return; }
+                res.writeHead(status, { 'Content-Type': 'application/json', ...headers });
+                res.end(JSON.stringify({ error }));
+                return;
+            }
+            const message = error?.message || 'DeepSeek request failed';
+            if (apiMode === 'anthropic') {
+                writeSse(res, 'error', { type: 'error', error: { type: anthropicErrorType(error?.type, status), message } });
+            } else if (apiMode === 'responses') {
+                writeSse(res, 'error', { type: 'error', code: error?.type || 'server_error', message, param: null, error: { ...error, status } });
+            } else {
+                writeSse(res, null, { error: { ...error, code: status } });
+                res.write('data: [DONE]\n\n');
+            }
+            res.end();
+        },
+    };
+}
+
+function sendStreamedCompletion(res, apiMode, openaiResp) {
+    createStreamWriter(res, apiMode, { model: openaiResp.model, promptTokens: openaiResp.usage?.prompt_tokens || 0, id: openaiResp.id, created: openaiResp.created }).finish(openaiResp);
+}
+
+function sendAnthropicStream(res, openaiResp) { sendStreamedCompletion(res, 'anthropic', openaiResp); }
+function sendResponsesStream(res, openaiResp) { sendStreamedCompletion(res, 'responses', openaiResp); }
+function sendOpenAIStream(res, openaiResp) { sendStreamedCompletion(res, 'openai', openaiResp); }
 
 function storeHistory(session, prompt, content, toolCall) {
     const assistantResponse = toolCall
@@ -2323,6 +2479,16 @@ const server = http.createServer(async (req, res) => {
         let activeSession = null;
         let activeAgentId = null;
         let lockedSession = null;
+        let live = null;
+        let keepAliveTimer = null;
+        // Error response in the client's protocol: a JSON error while nothing
+        // was streamed, an in-stream error event once the stream has started.
+        const respondError = (status, error, headers = {}) => {
+            if (live) { live.fail(status, error, headers); return; }
+            if (res.headersSent) { if (!res.writableEnded) res.end(); return; }
+            res.writeHead(status, { 'Content-Type': 'application/json', ...headers });
+            res.end(JSON.stringify({ error }));
+        };
         // Set once DeepSeek accepted a completion in this request; only then
         // can the remote chat contain turns the client does not know about.
         let remoteTouched = false;
@@ -2387,6 +2553,26 @@ const server = http.createServer(async (req, res) => {
             // proxy-expanded fullPrompt (system + injected tools + history) — so
             // prompt_tokens reflects what the caller actually sent.
             const clientPromptText = messages.map(m => normalizeMessageContent(m.content)).join('\n');
+            const allowedToolNames = new Set(tools
+                .filter(tool => tool?.type === 'function' && tool.function?.name)
+                .map(tool => tool.function.name));
+
+            // stream=true: plain answers go to the client while DeepSeek is
+            // still writing them. With tools the answer may turn out to be a
+            // tool call, so it is buffered and only keep-alives are sent.
+            if (stream) {
+                live = createStreamWriter(res, apiMode, { model: requestedModel, promptTokens: estimateTokens(clientPromptText) });
+                keepAliveTimer = setInterval(() => {
+                    if (Date.now() - Math.max(requestStartedAt, live.lastWriteAt) >= STREAM_KEEPALIVE_MS) live.keepAlive();
+                }, 1000);
+                keepAliveTimer.unref();
+            }
+            const liveProgress = () => {
+                if (!live || allowedToolNames.size > 0) return null;
+                const pushReasoning = live.source('reasoning');
+                const pushContent = live.source('content');
+                return (content, reasoning) => { pushReasoning(reasoning); pushContent(content); };
+            };
 
             // One DeepSeek chat generates one answer at a time, and a second
             // turn sent meanwhile would land on the wrong parent message. The
@@ -2465,7 +2651,7 @@ const server = http.createServer(async (req, res) => {
             };
 
             // Reads the DeepSeek SSE stream — returns { content, reasoningContent, messageId, finishReason, modelError }
-            async function readDeepSeekResponse(call) {
+            async function readDeepSeekResponse(call, onProgress = null) {
                 let buffer = '';
                 let lastPath = null;
                 const fragments = [];
@@ -2552,9 +2738,11 @@ const server = http.createServer(async (req, res) => {
                     const lines = buffer.split('\n');
                     buffer = lines.pop() || '';
                     for (const line of lines) handleLine(line);
+                    if (onProgress) onProgress(fullContent, reasoningContent);
                 }
                 buffer += decoder.decode();
                 if (buffer) handleLine(buffer);
+                if (onProgress) onProgress(fullContent, reasoningContent);
 
                 // DeepSeek marks an answer cut off at its output limit as
                 // INCOMPLETE; expose it as 'length' so continuation kicks in.
@@ -2584,7 +2772,7 @@ const server = http.createServer(async (req, res) => {
                         markContextCompacted(res);
                     }
                 }
-                firstResult = await readDeepSeekResponse(initialCall);
+                firstResult = await readDeepSeekResponse(initialCall, liveProgress());
             } catch (error) {
                 // A remote chat that overflowed is rejected with HTTP 400 even
                 // after one fresh-chat attempt. Let the compaction loop below
@@ -2639,7 +2827,7 @@ const server = http.createServer(async (req, res) => {
                 // Brief delay before retry to let DeepSeek breathe
                 await new Promise(r => setTimeout(r, Math.min(500 * retryAttempt, 1500)));
                 const retryCall = await callDeepSeek(retryPrompt);
-                const retryState = normalizeRetryResponse(await readDeepSeekResponse(retryCall));
+                const retryState = normalizeRetryResponse(await readDeepSeekResponse(retryCall, liveProgress()));
                 fullPrompt = retryPrompt;
                 modelError = retryState.modelError;
                 // A previous empty response may have carried finish_reason=length.
@@ -2662,11 +2850,9 @@ const server = http.createServer(async (req, res) => {
                         ? 'DeepSeek request deadline reached while recovering an empty response'
                         : `DeepSeek returned empty content after ${retryAttempt} retr${retryAttempt === 1 ? 'y' : 'ies'}`);
                 console.log(`${agentTag} ${errorType} after ${retryAttempt} retr${retryAttempt === 1 ? 'y' : 'ies'}. Giving up.`);
-                const headers = { 'Content-Type': 'application/json' };
+                const headers = {};
                 if (failureClass.status === 429) headers['Retry-After'] = String(Math.ceil(RATE_LIMIT_COOLDOWN_MS / 1000));
-                res.writeHead(failureClass.status, headers);
-                res.end(JSON.stringify({
-                    error: {
+                respondError(failureClass.status, {
                         message: errorMessage,
                         type: errorType,
                         agent: agentId,
@@ -2679,8 +2865,7 @@ const server = http.createServer(async (req, res) => {
                         prompt_compacted: promptCompacted,
                         model: requestedModel,
                         real_model: resolveModelConfig(requestedModel).real_model,
-                    }
-                }));
+                }, headers);
                 return;
             }
 
@@ -2700,7 +2885,16 @@ const server = http.createServer(async (req, res) => {
                     `${freshPromptBuild.prompt}\n\n[Assistant response so far]\n${fullContent}`,
                     'Continue the assistant response from exactly where it stopped. Do not restart or repeat completed sections.'
                 );
-                const continuationCall = await callDeepSeek('continue', continuationRecoveryPrompt);
+                let continuationCall;
+                try {
+                    continuationCall = await callDeepSeek('continue', continuationRecoveryPrompt);
+                } catch (error) {
+                    // The answer so far is still useful: return it as truncated
+                    // (finish_reason 'length') instead of failing the request.
+                    if (requestAbort.signal.aborted) throw error;
+                    console.log(`${agentTag} Continuation failed (${error.message}); returning the partial answer`);
+                    break;
+                }
                 const { account: contAccount } = continuationCall;
                 // A cross-account continuation is valid only when the call
                 // detected that reset and sent the full recovery prompt. If an
@@ -2712,7 +2906,15 @@ const server = http.createServer(async (req, res) => {
                     resetRemoteSession(session);
                     break;
                 }
-                const contResult = await readDeepSeekResponse(continuationCall);
+                let contResult;
+                try {
+                    contResult = await readDeepSeekResponse(continuationCall, liveProgress());
+                } catch (error) {
+                    if (requestAbort.signal.aborted) throw error;
+                    console.log(`${agentTag} Continuation stream failed (${error.message}); returning the partial answer`);
+                    resetRemoteSession(session);
+                    break;
+                }
                 const contContent = contResult && contResult.content ? sanitizeContent(contResult.content) : '';
                 const contReasoning = contResult && contResult.reasoningContent ? sanitizeContent(contResult.reasoningContent) : '';
                 if (contContent && contContent.trim().length > 0 && !contContent.includes('I am an AI')) {
@@ -2726,9 +2928,6 @@ const server = http.createServer(async (req, res) => {
                 }
             }
 
-            const allowedToolNames = new Set(tools
-                .filter(tool => tool?.type === 'function' && tool.function?.name)
-                .map(tool => tool.function.name));
             let toolCall = allowedToolNames.size > 0 ? parseToolCall(fullContent) : null;
             if (toolCall && !allowedToolNames.has(toolCall.name)) {
                 console.log(`${agentTag} Model requested unknown tool ${toolCall.name}; attempting format repair.`);
@@ -2770,8 +2969,7 @@ const server = http.createServer(async (req, res) => {
 
             if (allowedToolNames.size > 0 && !toolCall && looksLikeToolCallMarkup(fullContent)) {
                 const failure = resetRemoteSession(session);
-                res.writeHead(502, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: {
+                respondError(502, {
                     message: 'DeepSeek returned malformed tool-call markup after one repair attempt',
                     type: 'malformed_tool_call',
                     agent: agentId,
@@ -2782,7 +2980,7 @@ const server = http.createServer(async (req, res) => {
                     prompt_compacted: promptCompacted,
                     model: requestedModel,
                     real_model: resolveModelConfig(requestedModel).real_model,
-                } }));
+                });
                 return;
             }
 
@@ -2816,7 +3014,8 @@ const server = http.createServer(async (req, res) => {
                 ? buildToolCallResponse(toolCall, requestedModel, clientPromptText, reasoningContent)
                 : buildTextResponse(fullContent, clientPromptText, requestedModel, reasoningContent, finishReason);
 
-            sendCompletion(res, apiMode, stream, openaiResponse);
+            if (live) live.finish(openaiResponse);
+            else sendCompletion(res, apiMode, false, openaiResponse);
             console.log(`${agentTag} ${stream ? 'Streamed' : 'Response'} ${apiMode} (tool=${!!toolCall}, ${Date.now() - startTime}ms, ${fullContent.length} chars)`);
         } catch (e) {
             console.log('[DS-API] Error:', e.message);
@@ -2825,18 +3024,13 @@ const server = http.createServer(async (req, res) => {
             // creation, throttling) leave the chat intact for the next request.
             const failure = remoteTouched && activeSession && activeSession.id ? resetRemoteSession(activeSession) : null;
             if (clientGone) return;
-            if (res.headersSent) {
-                if (!res.writableEnded) res.end();
-                return;
-            }
             // Pool exhaustion / no-auth carry an explicit status so integrators see
             // 429/503 (not a generic 500) and can honor Retry-After.
             const timedOut = isTimeoutError(e);
             const status = e.status || (timedOut ? 504 : 500);
-            const headers = { 'Content-Type': 'application/json' };
+            const headers = {};
             if (status === 429 && e.retryAfter) headers['Retry-After'] = String(e.retryAfter);
-            res.writeHead(status, headers);
-            res.end(JSON.stringify({ error: {
+            respondError(status, {
                 message: e.message,
                 type: e.type || (timedOut ? 'request_timeout' : 'server_error'),
                 ...(failure ? {
@@ -2846,8 +3040,9 @@ const server = http.createServer(async (req, res) => {
                     history_length: activeSession.history.length,
                     account: failure.accountId,
                 } : {}),
-            } }));
+            }, headers);
         } finally {
+            if (keepAliveTimer) clearInterval(keepAliveTimer);
             if (lockedSession) lockedSession.busy = false;
             inFlight--;
         }

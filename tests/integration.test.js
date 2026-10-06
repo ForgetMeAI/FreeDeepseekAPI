@@ -111,6 +111,7 @@ test.before(async () => {
   process.env.DEEPSEEK_BASE_URL = `http://127.0.0.1:${mock.server.address().port}`;
   process.env.DEEPSEEK_FETCH_TIMEOUT_MS = '1000';
   process.env.DEEPSEEK_STREAM_IDLE_TIMEOUT_MS = '1500';
+  process.env.DEEPSEEK_STREAM_KEEPALIVE_MS = '1000';
   // The real solver needs DeepSeek's WASM; the mock accepts any answer.
   require('../lib/pow').solvePOW = async () => 1;
   internals = require('../server.js').__test;
@@ -430,4 +431,80 @@ test('a fresh chat whose first request failed still gets the recovery history', 
   assert.match(prompt, /\[Previous conversation\]/);
   assert.match(prompt, /My name is Ann/);
   assert.match(prompt, /What is my name\?/);
+});
+
+// Reads an SSE response and records when each data line arrived.
+async function timedStream(path, body) {
+  const started = Date.now();
+  const response = await fetch(`${proxyUrl}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const events = [];
+  let raw = '';
+  const decoder = new TextDecoder();
+  let buffer = '';
+  for await (const chunk of response.body) {
+    const text = decoder.decode(chunk, { stream: true });
+    raw += text;
+    buffer += text;
+    const parts = buffer.split('\n\n');
+    buffer = parts.pop();
+    for (const part of parts) events.push({ at: Date.now() - started, part });
+  }
+  return { status: response.status, events, raw, total: Date.now() - started };
+}
+
+test('plain answers stream to the client while DeepSeek is still generating', async () => {
+  mock.state.respond = () => ({ thinking: 'thinking first', chunks: ['Hello', ' streaming', ' world', ' 😀', '!', ' bye'], gapMs: 250 });
+  const cases = [
+    { path: '/v1/chat/completions', body: { model: 'deepseek-reasoner', stream: true, messages: [{ role: 'user', content: 'hi' }] }, isText: p => /"content":"Hello/.test(p) },
+    { path: '/v1/messages', body: { model: 'deepseek-reasoner', stream: true, max_tokens: 100, messages: [{ role: 'user', content: 'hi' }] }, isText: p => /"text_delta","text":"Hello/.test(p) },
+    { path: '/v1/responses', body: { model: 'deepseek-reasoner', stream: true, input: 'hi' }, isText: p => /output_text\.delta[\s\S]*"delta":"Hello/.test(p) },
+  ];
+  for (const c of cases) {
+    internals.sessions.clear();
+    const result = await timedStream(c.path, { ...c.body, user: `live-${c.path}` });
+    assert.equal(result.status, 200, c.path);
+    const firstText = result.events.find(e => c.isText(e.part));
+    assert.ok(firstText, `${c.path}: no text event`);
+    assert.ok(result.total >= 1200, `${c.path}: generation should take ~1.25s, took ${result.total}`);
+    assert.ok(firstText.at < result.total - 900, `${c.path}: first text at ${firstText.at}ms of ${result.total}ms`);
+    assert.match(result.raw, /thinking first/, c.path);
+    assert.match(result.raw, /😀/, c.path);
+  }
+  // The streamed pieces add up to the full answer.
+  const openai = await timedStream('/v1/chat/completions', { model: 'deepseek-chat', stream: true, user: 'live-sum', messages: [{ role: 'user', content: 'hi' }] });
+  const text = openai.events.filter(e => e.part.startsWith('data: {')).map(e => JSON.parse(e.part.slice(6)).choices[0].delta.content || '').join('');
+  assert.equal(text, 'Hello streaming world 😀! bye');
+  assert.match(openai.raw, /data: \[DONE\]\n\n$/);
+});
+
+test('slow tool turns send keep-alives and still return a clean tool call', async () => {
+  mock.state.respond = () => ({ chunks: ['{"tool_call":', '{"name":"read_file",', '"arguments":', '{"path":"/tmp/k"}}}', '', ''], gapMs: 400 });
+  const result = await timedStream('/v1/chat/completions', { model: 'deepseek-chat', stream: true, user: 'keepalive', tools: [READ_FILE_TOOL], messages: [{ role: 'user', content: 'read' }] });
+  assert.equal(result.status, 200);
+  assert.match(result.raw, /^: keep-alive$/m);
+  assert.doesNotMatch(result.raw, /"content":"\{/);
+  const chunks = result.events.filter(e => e.part.startsWith('data: {')).map(e => JSON.parse(e.part.slice(6)));
+  const toolDelta = chunks.find(c => c.choices[0].delta.tool_calls).choices[0].delta.tool_calls[0];
+  assert.deepEqual(JSON.parse(toolDelta.function.arguments), { path: '/tmp/k' });
+});
+
+test('a failure after streaming started is reported inside the stream', async () => {
+  mock.state.respond = () => ({ text: 'partial answer', stall: true });
+  const result = await timedStream('/v1/chat/completions', { model: 'deepseek-chat', stream: true, user: 'stream-fail', messages: [{ role: 'user', content: 'hi' }] });
+  assert.equal(result.status, 200);
+  assert.match(result.raw, /"content":"partial answer"/);
+  const errorEvent = result.events.find(e => /"error":/.test(e.part));
+  assert.ok(errorEvent, result.raw);
+  assert.equal(JSON.parse(errorEvent.part.slice(6)).error.code, 504);
+  assert.match(result.raw, /data: \[DONE\]\n\n$/);
+  assert.equal(internals.sessions.get('stream-fail').busy, false);
+
+  // Before anything was streamed, failures keep their HTTP status.
+  mock.state.respond = () => ({ status: 400, errorBody: JSON.stringify({ msg: 'Too many messages in a short period' }) });
+  const limited = await timedStream('/v1/chat/completions', { model: 'deepseek-chat', stream: true, user: 'stream-429', messages: [{ role: 'user', content: 'hi' }] });
+  assert.equal(limited.status, 429);
 });
