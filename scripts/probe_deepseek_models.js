@@ -90,14 +90,15 @@ async function probe(model_type, thinking_enabled, search_enabled) {
   console.log(text.split('\n').filter(Boolean).slice(0,80).join('\n').slice(0,8000));
 }
 (async()=>{
+  // DeepSeek Web has one unified mode since 2026-09-10; only the DeepThink
+  // and Search toggles vary. 'expert' and 'vision' are probed to confirm they
+  // stay retired.
   const combos = [
     ['default', false, false],
     ['default', true, false],
     ['default', false, true],
     ['default', true, true],
     ['expert', false, false],
-    ['expert', true, false],
-    ['expert', false, true],
     ['vision', false, false],
   ];
   for (const c of combos) {

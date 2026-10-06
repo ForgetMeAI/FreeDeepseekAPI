@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-const BASE = process.env.BASE_URL || 'http://127.0.0.1:9665';
+const BASE = process.env.BASE_URL || `http://127.0.0.1:${process.env.PORT || 9655}`;
+const API_KEY = process.env.PROXY_API_KEY || '';
 const MODEL = process.env.MODEL || 'deepseek-chat';
 
 async function post(path, body, timeoutMs = 120000) {
@@ -8,7 +9,7 @@ async function post(path, body, timeoutMs = 120000) {
   try {
     const resp = await fetch(`${BASE}${path}`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: 'Bearer test' },
+      headers: { 'content-type': 'application/json', ...(API_KEY ? { authorization: `Bearer ${API_KEY}` } : {}) },
       body: JSON.stringify(body),
       signal: ctrl.signal,
     });
@@ -105,6 +106,22 @@ test('7 Anthropic streaming tool calling stays tool-only', async () => {
   assert(!/"type":"text_delta"/.test(r.text), `tool stream included text deltas before/during tool_use: ${summarizeText(r.text)}`);
   assert(!/reasoning_content|\[reasoning\]|reasoning_summary/.test(r.text), `tool stream leaked reasoning payload: ${summarizeText(r.text)}`);
   return 'tool_use block without reasoning/text deltas';
+});
+
+test('8 OpenAI multi-turn tool loop continues the same chat (#23, #30)', async () => {
+  const user = `smoke-tool-loop-${Date.now()}`;
+  const messages = [{ role: 'user', content: 'What time is it in UTC? Use the available tool, then tell me the time you got.' }];
+  const first = await post('/v1/chat/completions', { model: MODEL, user, messages, tools, stream: false }, 180000);
+  assert(first.ok, `HTTP ${first.status}: ${first.text}`);
+  const tc = first.json?.choices?.[0]?.message?.tool_calls?.[0];
+  assert(tc?.function?.name === 'get_current_time', `no/incorrect tool_call: ${first.text}`);
+  messages.push({ role: 'assistant', content: null, tool_calls: [tc] });
+  messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify({ timezone: 'UTC', time: '13:37:00' }) });
+  const second = await post('/v1/chat/completions', { model: MODEL, user, messages, tools, stream: false }, 180000);
+  assert(second.ok, `HTTP ${second.status}: ${second.text}`);
+  const content = second.json?.choices?.[0]?.message?.content || '';
+  assert(/13:37/.test(content), `final answer does not use the tool result: ${second.text}`);
+  return summarizeText(content);
 });
 
 let failed = 0;

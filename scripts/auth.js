@@ -4,8 +4,12 @@ const path = require('path');
 const readline = require('readline');
 const { spawnSync } = require('child_process');
 
+const { loadDotEnv } = require('../lib/env');
+const { defaultAuthOutputPath } = require('./auth_import');
+
 const ROOT = path.resolve(__dirname, '..');
-const AUTH_PATH = process.env.DEEPSEEK_AUTH_PATH || path.join(ROOT, 'deepseek-auth.json');
+loadDotEnv(path.join(ROOT, '.env'));
+const AUTH_PATH = defaultAuthOutputPath(process.env, ROOT);
 const PROFILE_DIR = process.env.DEEPSEEK_CHROME_PROFILE || path.join(ROOT, '.chrome-for-testing-profile-deepseek');
 const WATERMARK = 't.me/forgetmeai';
 
