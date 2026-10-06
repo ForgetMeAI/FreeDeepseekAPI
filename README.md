@@ -138,7 +138,8 @@ http://localhost:9655
 HOST=0.0.0.0 PROXY_API_KEY='replace-with-a-long-random-value' npm start
 ```
 
-После этого передавайте ключ как `Authorization: Bearer <key>`. Без
+После этого передавайте ключ как `Authorization: Bearer <key>` или
+`x-api-key: <key>` (так его отправляют Anthropic SDK). Без
 `PROXY_API_KEY` non-health endpoints остаются без авторизации, поэтому не
 публикуйте такой экземпляр в сеть.
 

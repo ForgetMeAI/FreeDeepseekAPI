@@ -186,12 +186,23 @@ function prompt(question) {
 }
 function isTruthy(value) { return typeof value === 'string' && ['1','true','yes','on'].includes(value.trim().toLowerCase()); }
 
-function isProxyAuthorized(authorization, expectedKey = PROXY_API_KEY) {
-    if (!expectedKey) return true;
-    if (typeof authorization !== 'string' || !authorization.startsWith('Bearer ')) return false;
-    const supplied = Buffer.from(authorization.slice('Bearer '.length), 'utf8');
+function isProxyKeyMatch(suppliedKey, expectedKey) {
+    if (typeof suppliedKey !== 'string') return false;
+    const supplied = Buffer.from(suppliedKey, 'utf8');
     const expected = Buffer.from(String(expectedKey), 'utf8');
     return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
+}
+
+// Accepts the proxy key as `Authorization: Bearer <key>` (OpenAI clients,
+// Claude Code's ANTHROPIC_AUTH_TOKEN) or as `x-api-key: <key>` (Anthropic
+// SDKs and ANTHROPIC_API_KEY).
+function isProxyAuthorized(authorization, expectedKey = PROXY_API_KEY, apiKeyHeader = undefined) {
+    if (!expectedKey) return true;
+    if (typeof authorization === 'string' && authorization.startsWith('Bearer ')
+        && isProxyKeyMatch(authorization.slice('Bearer '.length), expectedKey)) {
+        return true;
+    }
+    return isProxyKeyMatch(apiKeyHeader, expectedKey);
 }
 
 function isLoopbackHost(host) {
@@ -229,7 +240,7 @@ function isBrowserOriginAllowed(origin, allowedOrigins = PROXY_CORS_ORIGINS) {
 const CONTEXT_COMPACTED_HEADER = 'X-FreeDeepseek-Context-Compacted';
 function setCorsResponseHeaders(res) {
     res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta, x-agent-session');
     res.setHeader('Access-Control-Expose-Headers', CONTEXT_COMPACTED_HEADER);
 }
 function markContextCompacted(res) {
@@ -2163,7 +2174,7 @@ const server = http.createServer(async (req, res) => {
 
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     const isPublicProbe = req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health' || url.pathname === '/readyz');
-    if (!isPublicProbe && !isProxyAuthorized(req.headers.authorization)) {
+    if (!isPublicProbe && !isProxyAuthorized(req.headers.authorization, PROXY_API_KEY, req.headers['x-api-key'])) {
         res.writeHead(401, {
             'Content-Type': 'application/json',
             'WWW-Authenticate': 'Bearer',
@@ -2174,7 +2185,7 @@ const server = http.createServer(async (req, res) => {
 
     // Health check
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
-        const includePrivateStatus = !PROXY_API_KEY || isProxyAuthorized(req.headers.authorization);
+        const includePrivateStatus = !PROXY_API_KEY || isProxyAuthorized(req.headers.authorization, PROXY_API_KEY, req.headers['x-api-key']);
         const health = { status: 'ok', service: 'FreeDeepseekAPI', watermark: FORGETMEAI_WATERMARK };
         if (includePrivateStatus) Object.assign(health, {
             models: SUPPORTED_MODEL_IDS,

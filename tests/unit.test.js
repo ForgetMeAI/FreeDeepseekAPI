@@ -207,6 +207,10 @@ test('proxy API key authentication is optional and uses exact bearer tokens', ()
   assert.equal(serverInternals.isProxyAuthorized('Bearer wrong', 'secret'), false);
   assert.equal(serverInternals.isProxyAuthorized('Basic secret', 'secret'), false);
   assert.equal(serverInternals.isProxyAuthorized('Bearer secret ', 'secret'), false);
+  // Anthropic SDKs send the key as x-api-key.
+  assert.equal(serverInternals.isProxyAuthorized(undefined, 'secret', 'secret'), true);
+  assert.equal(serverInternals.isProxyAuthorized(undefined, 'secret', 'wrong'), false);
+  assert.equal(serverInternals.isProxyAuthorized('Bearer wrong', 'secret', 'secret'), true);
 });
 
 test('proxy API key can be loaded from a mounted secret and required explicitly', () => {

@@ -104,8 +104,9 @@ data: {"p":"response/status","o":"SET","v":"FINISHED"}
 ## 3. Proxy endpoints
 
 When `PROXY_API_KEY` (or `PROXY_API_KEY_FILE`) is set, every endpoint except
-`GET /`, `/health` and `/readyz` requires `Authorization: Bearer <key>`. The key
-is never forwarded to DeepSeek. Browser requests are accepted only from
+`GET /`, `/health` and `/readyz` requires `Authorization: Bearer <key>` or
+`x-api-key: <key>` (as sent by Anthropic SDKs). The key is never forwarded to
+DeepSeek. Browser requests are accepted only from
 loopback origins and the exact origins listed in `PROXY_CORS_ORIGINS`.
 
 | Method | Path | Purpose |
