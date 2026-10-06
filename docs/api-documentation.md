@@ -1,684 +1,413 @@
-# DeepSeek Web API Proxy — Complete Documentation
+# FreeDeepseekAPI — API Reference
 
 ## Overview
 
-This project reverse-engineers the **DeepSeek Web chat API** (`chat.deepseek.com`) to expose it as OpenAI/Anthropic-compatible local API endpoints. It allows compatible clients (Hermes agents, Claude Code, OpenAI SDK/Responses-style clients, custom scripts, etc.) to use DeepSeek's free web model as if it were a paid API — including tool calling, streaming, reasoning output, and multi-session support.
+FreeDeepseekAPI exposes the **DeepSeek Web chat** (`chat.deepseek.com`) as local
+OpenAI- and Anthropic-compatible endpoints. Agents and SDKs (Hermes, Cline,
+Claude Code, OpenCode, Open WebUI, the OpenAI SDK, custom scripts) can use the
+web model with tool calling, streaming, reasoning output and per-agent
+sessions.
 
-**Server:** `host2.onldigital.com` (161.97.175.214)  
-**Proxy:** Node.js HTTP server on port 9654  
-**Model exposed:** `deepseek-web-v3` (DeepSeek V3 via web)
+- **Default address:** `http://127.0.0.1:9655` (`HOST`, `PORT`)
+- **Model:** DeepSeek-V4.1-Flash in the unified DeepSeek Web mode (see [Models](#5-models))
+- **Dependencies:** none (Node.js 18+; `npm run auth` needs Node.js 22+)
 
 ---
 
 ## 1. Architecture
 
 ```
-┌──────────────┐     POST /v1/chat/completions     ┌──────────────────┐
-│              │ ──────────────────────────────►    │                  │
-│   Hermes     │    {messages, tools, user,         │  DeepSeek Proxy  │
-│   Agent      │     stream}                        │  (port 9654)     │
-│   (Client)   │ ◄──────────────────────────────    │                  │
-│              │    {choices[].message.content      │  Node.js HTTP    │
-└──────────────┘     or tool_calls}                 │  Server          │
-                                                    │                  │
-                                                     └────────┬─────────┘
-                                                              │
-                                    ┌─────────────────────────┼──────────────┐
-                                    │                         │              │
-                                    ▼                         ▼              ▼
-                          ┌──────────────────┐    ┌──────────────────┐
-                          │  PoW Challenge   │    │  Chat Completion │
-                          │  /api/v0/chat/   │    │  /api/v0/chat/   │
-                          │  create_pow_     │    │  completion      │
-                          │  challenge       │    │                  │
-                          └──────────────────┘    └──────────────────┘
-                                                         │
-                                                         ▼
-                                               ┌──────────────────┐
-                                               │  DeepSeek Web    │
-                                               │  chat.deepseek   │
-                                               │  .com            │
-                                               │  (Free V3 model) │
-                                               └──────────────────┘
+┌──────────────┐  POST /v1/chat/completions   ┌────────────────────┐
+│ Agent / SDK  │  POST /v1/messages           │  FreeDeepseekAPI   │
+│ (client)     │  POST /v1/responses          │  (Node.js, :9655)  │
+│              │ ───────────────────────────► │                    │
+│              │ ◄─────────────────────────── │  sessions, tools,  │
+└──────────────┘  JSON or SSE                 │  retries, accounts │
+                                              └─────────┬──────────┘
+                                                        │
+                      ┌─────────────────────────────────┼──────────────────────┐
+                      ▼                                 ▼                      ▼
+         /api/v0/chat/create_pow_challenge   /api/v0/chat_session/create   /api/v0/chat/completion
+                                     (chat.deepseek.com, SSE answer)
 ```
 
 ---
 
-## 2. DeepSeek Web API Endpoints (Reverse-Engineered)
+## 2. DeepSeek Web endpoints used by the proxy
 
-These are the internal endpoints the proxy calls. **Not official** — obtained by reverse-engineering the DeepSeek web app's network traffic.
+These internal endpoints are **not official** and may change without notice.
 
-### 2.1 Create PoW Challenge
+### 2.1 Create PoW challenge
 
 ```
 POST https://chat.deepseek.com/api/v0/chat/create_pow_challenge
+Authorization: Bearer <token>
+Cookie: <deepseek.com cookies>
+x-hif-dliq / x-hif-leim: <optional browser headers>
 
-Headers:
-  Authorization: Bearer <token>
-  x-hif-dliq: <hif_dliq>
-  x-hif-leim: <hif_leim>
-  Cookie: ds_session_id=<id>; smidV2=<smidV2>
-  Content-Type: application/json
+{"target_path": "/api/v0/chat/completion"}
 
-Body:
-{
-  "target_path": "/api/v0/chat/completion",
-  "scene": "completion_like"
-}
-
-Response:
-{
-  "data": {
-    "biz_data": {
-      "challenge": {
-        "algorithm": "...",
-        "challenge": "...",
-        "salt": "...",
-        "signature": "...",
-        "difficulty": <int>,
-        "expire_at": <timestamp>
-      }
-    }
-  }
-}
+→ {"data": {"biz_data": {"challenge": {"algorithm", "challenge", "salt", "signature", "difficulty", "expire_at"}}}}
 ```
 
-### 2.2 Create Chat Session
+An expired login answers HTTP 200 with `"biz_data": null`; `npm run doctor`
+reports that as a failure.
+
+### 2.2 Create chat session
 
 ```
 POST https://chat.deepseek.com/api/v0/chat_session/create
-
-Headers: Same as above
-Body: {}
-
-Response:
-{
-  "data": {
-    "biz_data": {
-      "id": "uuid-session-id"   ← used as chat_session_id
-    }
-  }
-}
+{}
+→ {"data": {"biz_data": {"id": "<uuid>"}}}   (newer builds: biz_data.chat_session.id)
 ```
 
-### 2.3 Chat Completion (Streaming SSE)
+### 2.3 Chat completion (SSE)
 
 ```
 POST https://chat.deepseek.com/api/v0/chat/completion
+X-DS-PoW-Response: <base64 JSON {algorithm, challenge, salt, answer, signature, target_path}>
 
-Headers:
-  ...same as above...
-  X-DS-PoW-Response: <base64 encoded PoW answer>
-
-Body:
 {
-  "chat_session_id": "uuid",          ← from session/create
-  "parent_message_id": <int|null>,    ← for threading (null = first message)
-  "model_type": "default",
-  "prompt": "<user message text>",
+  "chat_session_id": "<uuid>",
+  "parent_message_id": <int|null>,     // null for the first message of a chat
+  "model_type": "default",             // DEEPSEEK_MODEL_TYPE; empty = omitted
+  "prompt": "<text>",
   "ref_file_ids": [],
-  "thinking_enabled": false,
-  "search_enabled": false,
+  "thinking_enabled": false,           // DeepThink toggle
+  "search_enabled": false,             // Search toggle
   "action": null,
   "preempt": false
 }
-
-Response: Server-Sent Events (SSE)
-
-data: {"p": "response/metadata", "v": {"response": {"message_id": <int>, "content": "<first chars>"}}}
-data: {"p": "response/content", "v": "more text chars..."}
-data: {"p": "response/content", "v": "more text chars..."}
-...
-data: {"p": "response/done"}
 ```
 
-**Key Points:**
-- `parent_message_id` is an **integer**, NOT a string — tracks the conversation tree
-- On first call, `parent_message_id` is `null`
-- The first SSE event (metadata) contains the first characters of content; subsequent `response/content` events append more
-- On session reuse, the first 2 characters ("TO") arrive in the metadata content, the rest in content events
-
-### 2.4 Proof-of-Work (SHA3 Wasm)
-
-Each API call requires solving a PoW challenge using a WASM module:
+The answer streams as fragments:
 
 ```
-WASM URL: https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.<hash>.wasm
-
-Function: wasm_solve(sp, cBytes_ptr, cBytes_len, pBytes_ptr, pBytes_len, difficulty)
-Input: challenge bytes + prefix (salt + "_" + expire_at + "_" + challenge)
-Output: answer (integer via Float64 view at stack pointer + 8)
+data: {"request_message_id":1,"response_message_id":2}
+data: {"v":{"response":{"message_id":2,"fragments":[],"status":"WIP"}}}
+data: {"p":"response/fragments","o":"APPEND","v":[{"type":"THINK","content":"..."}]}
+data: {"p":"response/fragments","o":"APPEND","v":[{"type":"RESPONSE","content":"Hel"}]}
+data: {"p":"response/fragments/-1/content","o":"APPEND","v":"lo"}
+data: {"v":" world"}
+data: {"p":"response/status","o":"SET","v":"FINISHED"}
 ```
 
-Steps:
-1. Fetch the WASM binary
-2. Instantiate with `{ wbg: {} }` imports
-3. Encode challenge bytes and prefix bytes
-4. Allocate memory, copy data
-5. Call `wasm_solve()` — returns answer on success or 0 on failure
-6. Pack `{algorithm, challenge, salt, answer, signature, target_path}` into base64
+- `RESPONSE`/`SEARCH` fragments are the answer, `THINK` fragments the reasoning.
+- `status: INCOMPLETE` means the output limit was hit; the proxy asks for a continuation.
+- `{"type":"error","content":"..."}` events carry model errors such as
+  "Содержание слишком длинное" (content too long) or rate limits.
+- Each completion needs a fresh PoW answer computed with DeepSeek's SHA3 WASM
+  module (`lib/pow.js`, compiled once per WASM URL).
 
 ---
 
-## 3. Proxy Endpoints
+## 3. Proxy endpoints
 
-The proxy exposes OpenAI-compatible endpoints:
+When `PROXY_API_KEY` (or `PROXY_API_KEY_FILE`) is set, every endpoint except
+`GET /`, `/health` and `/readyz` requires `Authorization: Bearer <key>`. The key
+is never forwarded to DeepSeek. Browser requests are accepted only from
+loopback origins and the exact origins listed in `PROXY_CORS_ORIGINS`.
 
-### 3.1 Health Check
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/`, `/health` | Liveness. With a valid key (or no key configured) also models, accounts, sessions |
+| `GET` | `/readyz` | `200` when at least one account can serve now, else `503` |
+| `GET` | `/v1/models` | Supported model aliases |
+| `GET` | `/v1/model-capabilities` | All aliases with web flags, capabilities, deprecation |
+| `POST` | `/v1/chat/completions` | OpenAI Chat Completions (`stream` true/false) |
+| `POST` | `/v1/messages` | Anthropic Messages shim |
+| `POST` | `/v1/responses` | OpenAI Responses shim |
+| `GET` | `/v1/sessions` | Active agent sessions |
+| `POST` | `/reset-session?agent=<id>` | Drop one agent's remote chat (local history kept) |
+| `POST` | `/reset-session?agent=all` | Drop all sessions |
 
-```
-GET /health
-GET /
-
-Response:
-{
-  "status": "ok",
-  "model": "deepseek-web-v3",
-  "agents": <int>        ← number of active agent sessions
-}
-```
-
-### 3.2 List Models
-
-```
-GET /v1/models
-
-Response:
-{
-  "data": [
-    {
-      "id": "deepseek-web-v3",
-      "object": "model",
-      "created": <timestamp>,
-      "owned_by": "deepseek-web"
-    }
-  ]
-}
-```
-
-### 3.3 Chat Completions — Primary API
+### 3.1 Chat Completions
 
 ```
 POST /v1/chat/completions
-
-Headers:
-  Content-Type: application/json
-  Authorization: Bearer <any>    ← optional, ignored (sent to DeepSeek web)
-  Access-Control-Allow-Origin: * (CORS enabled)
-
-Body (OpenAI-compatible):
 {
+  "model": "deepseek-chat",
   "messages": [
-    {"role": "system", "content": "..."},   ← system prompt
-    {"role": "user", "content": "..."}      ← user prompt (last one used)
+    {"role": "system", "content": "..."},        // "developer" is treated as system
+    {"role": "user", "content": "..."},
+    {"role": "assistant", "content": null, "tool_calls": [...]},
+    {"role": "tool", "tool_call_id": "call_...", "content": "..."}
   ],
-  "tools": [                                 ← optional, for tool calling
-    {
-      "type": "function",
-      "function": {
-        "name": "terminal",
-        "description": "...",
-        "parameters": { ... }
-      }
-    }
-  ],
-  "stream": true|false,                      ← SSE streaming or JSON response
-  "user": "agent-id"                         ← optional, for multi-agent session isolation
+  "tools": [{"type": "function", "function": {"name": "...", "description": "...", "parameters": {...}}}],
+  "stream": false,
+  "user": "agent-id"                            // optional session key
 }
-
-Response (non-stream, stream=false):
-{
-  "id": "ds-<timestamp>",
-  "object": "chat.completion",
-  "created": <unix_ts>,
-  "model": "deepseek-web-v3",
-  "choices": [
-    {
-      "index": 0,
-      "message": {
-        "role": "assistant",
-        "content": "..." | null,                 ← null for tool calls
-        "reasoning_content": "..." | undefined,  ← present for reasoning models when DeepSeek returns THINK fragments
-        "tool_calls": [...] | undefined          ← present for tool calls
-      },
-      "finish_reason": "stop" | "tool_calls"
-    }
-  ],
-  "usage": {
-    "prompt_tokens": <int>,
-    "completion_tokens": <int>,
-    "total_tokens": <int>,
-    "completion_tokens_details": {
-      "reasoning_tokens": <int>                 ← approximate, estimated from reasoning_content length
-    }
-  }
-}
-
-Response (stream, stream=true):
-  data: {"id":"...","object":"chat.completion.chunk","choices":[{"delta":{"reasoning_content":"reasoning chunk"}}]}
-  data: {"id":"...","object":"chat.completion.chunk","choices":[{"delta":{"content":"chunk"}}]}
-  data: {"id":"...","object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"stop"}]}
-  data: [DONE]
 ```
 
-### 3.4 Anthropic Messages Shim — Claude Code / Anthropic SDK
+Non-stream response:
+
+```json
+{
+  "id": "ds-<ts>",
+  "object": "chat.completion",
+  "model": "deepseek-chat",
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": "..." ,
+      "reasoning_content": "...",
+      "tool_calls": [{"id": "call_...", "type": "function", "function": {"name": "...", "arguments": "{...}"}}]
+    },
+    "finish_reason": "stop | length | tool_calls"
+  }],
+  "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+            "completion_tokens_details": {"reasoning_tokens": 0}}
+}
+```
+
+`content` is `null` and `reasoning_content` is omitted on tool-call turns.
+Token counts are estimates (characters / 4); DeepSeek Web reports no usage.
+
+Streaming (`stream: true`) — the proxy streams after the upstream answer is
+complete:
+
+```
+data: {"object":"chat.completion.chunk","choices":[{"delta":{"role":"assistant","content":""}}]}
+data: {"object":"chat.completion.chunk","choices":[{"delta":{"reasoning_content":"..."}}]}
+data: {"object":"chat.completion.chunk","choices":[{"delta":{"content":"..."}}]}
+data: {"object":"chat.completion.chunk","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_...","type":"function","function":{...}}]}}]}
+data: {"object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"stop"}]}
+data: [DONE]
+```
+
+### 3.2 Anthropic Messages
 
 ```
 POST /v1/messages
-
-Request:
 {
   "model": "deepseek-chat",
   "max_tokens": 1024,
-  "system": "optional system prompt",
-  "messages": [{"role":"user","content":"Hello"}],
-  "tools": [
-    {
-      "name": "get_time",
-      "description": "Get current time",
-      "input_schema": {"type":"object","properties":{"timezone":{"type":"string"}}}
-    }
-  ],
-  "stream": true|false,
-  "metadata": {"user_id":"agent-session-id"}
+  "system": "optional",
+  "messages": [{"role": "user", "content": "Hello"}],
+  "tools": [{"name": "get_time", "description": "...", "input_schema": {...}}],
+  "stream": false,
+  "metadata": {"user_id": "agent-session-id"}
 }
-
-Non-stream response uses Anthropic content blocks:
-{
-  "type": "message",
-  "role": "assistant",
-  "content": [{"type":"text","text":"..."}] | [{"type":"tool_use","id":"call_...","name":"...","input":{...}}],
-  "stop_reason": "end_turn" | "tool_use",
-  "usage": {"input_tokens": <int>, "output_tokens": <int>}
-}
-
-Streaming response emits Anthropic-style SSE events:
-  event: message_start
-  event: content_block_start
-  event: content_block_delta
-  event: content_block_stop
-  event: message_delta
-  event: message_stop
 ```
 
-Claude Code direct backend example:
+Responses use Anthropic content blocks (`text` or `tool_use`) and
+`stop_reason` `end_turn`, `tool_use` or `max_tokens`. Streaming emits
+`message_start`, `content_block_*`, `message_delta`, `message_stop`; tool turns
+contain only `tool_use` blocks. Earlier `thinking` blocks and images in the
+request are not forwarded as text.
+
+Claude Code:
 
 ```bash
 export ANTHROPIC_BASE_URL="http://127.0.0.1:9655"
-export ANTHROPIC_AUTH_TOKEN="dummy-key"
+export ANTHROPIC_AUTH_TOKEN="dummy-key"   # or your PROXY_API_KEY
 export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
 claude --model deepseek-chat
 ```
 
-### 3.5 OpenAI Responses API Shim
+### 3.3 OpenAI Responses
 
 ```
 POST /v1/responses
-
-Request:
 {
   "model": "deepseek-chat",
-  "input": "Hello" | [{"role":"user","content":"Hello"}],
+  "input": "Hello" | [ {"type":"message",...}, {"type":"function_call",...}, {"type":"function_call_output",...} ],
   "instructions": "optional system prompt",
-  "tools": [{"type":"function","name":"get_time","parameters":{...}}],
-  "stream": true|false
+  "tools": [{"type": "function", "name": "get_time", "parameters": {...}}],
+  "stream": false
 }
-
-Response:
-{
-  "id": "resp_<timestamp>",
-  "object": "response",
-  "status": "completed",
-  "model": "deepseek-chat",
-  "output": [...],
-  "output_text": "...",
-  "usage": {
-    "input_tokens": <int>,
-    "output_tokens": <int>,
-    "output_tokens_details": {"reasoning_tokens": <int>}
-  }
-}
-
-Streaming response emits Responses-style events such as:
-  event: response.created
-  event: response.output_item.added
-  event: response.output_text.delta
-  event: response.output_text.done
-  event: response.completed
 ```
 
-### 3.6 Tool Calling Compatibility
+Returns `object: "response"` with `output` items (`reasoning`, `message`,
+`function_call`) and `output_text`; streaming emits `response.*` events.
 
-The proxy accepts these tool schemas:
-
-- OpenAI Chat Completions: `tools: [{type:"function", function:{name, description, parameters}}]`
-- Anthropic Messages: `tools: [{name, description, input_schema}]`
-- Responses API: `tools: [{type:"function", name, description, parameters}]`
-
-DeepSeek Web does not expose native OpenAI tool calls, so the proxy prompt-emulates them. The parser accepts:
-
-- strict JSON: `{"tool_call":{"name":"tool","arguments":{...}}}`
-- legacy format: `TOOL_CALL: tool\narguments: {...}`
-- fenced JSON blocks with an explicit `tool_call`, `tool_calls`, or `function_call` envelope
-- XML-ish `<tool_call>{...}</tool_call>` wrappers
-- DeepSeek DSML (`<｜DSML｜tool_calls>...`) and the doubled-bar Web variant
-
-### 3.7 List Active Sessions
+### 3.4 Sessions
 
 ```
 GET /v1/sessions
+→ {"agents": [{"agent": "dev-agent", "session_id": "<uuid>", "message_count": 4, "account": "account_1",
+               "history_size": 2, "tracked_messages": 7, "remote_chars": 51234, "busy": false, "age_min": 3}],
+   "total": 1}
 
-Response:
-{
-  "agents": [
-    {
-      "agent": "security-guy",
-      "session_id": "uuid",
-      "message_count": 42,
-      "history_size": 5,
-      "age_min": 23
-    }
-  ],
-  "total": 1
-}
+POST /reset-session?agent=dev-agent
+→ {"status": "session_reset", "agent": "dev-agent", "history_preserved": 2, "history": "..."}
 ```
 
-### 3.8 Reset Session
-
-```
-POST /reset-session?agent=<agent-id>
-POST /reset-session?agent=all
-
-Response (single):
-{
-  "status": "session_reset",
-  "agent": "security-guy",
-  "history_preserved": 5,
-  "history": "user msg 1 | user msg 2 | ..."
-}
-
-Response (all):
-{
-  "status": "all_sessions_cleared",
-  "count": 3
-}
-```
+A chat message whose text is exactly `/new` resets the agent's session and
+history without calling DeepSeek.
 
 ---
 
-## 4. Multi-Agent Session Isolation
+## 4. Sessions and context
 
-### 4.1 How Sessions Are Assigned
+### 4.1 Session key
 
-Each request is assigned a session key based on the **client's remote IP**:
+| Source | Session key |
+| --- | --- |
+| `x-agent-session` header | its value |
+| body `session` / `user` (Anthropic: `metadata.user_id`) | its value |
+| loopback client without a key | `dev-agent` |
+| other client without a key | the client IP |
 
-| Source IP | Session Key | Example |
-|---|---|---|
-| `127.0.0.1` (localhost) | `security-guy` | Security Guy's own gateway |
-| `::1` or `::ffff:127.0.0.1` | `security-guy` | IPv6 localhost |
-| Any external IP | `params.user` (if set) or remote IP | Agented by `user` field or IP |
+Each key owns one DeepSeek chat at a time, sticky to one auth account.
 
-**Effect:** Each agent gets its own isolated DeepSeek web session. No context leakage between agents.
+### 4.2 Sending only what is new
 
-### 4.2 Configuring Remote Agents
+Agents send their whole history with every request. For each session the
+proxy remembers fingerprints of the messages already present in the DeepSeek
+chat and the system prompt/tools that chat started with:
 
-Remote Hermes agents should set the `user` field in their requests for named sessions:
+- **Continuation** — the request repeats the known messages and adds new ones:
+  only the new messages (tool results, the next user turn) go to the existing
+  chat, followed by a short `[Tool reminder]` listing the tools and the JSON
+  call format.
+- **Divergence** — history was edited or compacted by the client, or the system
+  prompt/tools changed, or the request adds nothing new: a fresh chat receives
+  the complete prompt.
+- **Single-message clients** — clients that send only their latest user message
+  keep talking to the same chat; local recovery history is injected whenever a
+  fresh chat has to be started.
 
-```yaml
-# In remote agent config
-model:
-  base_url: http://161.97.175.214:9654/v1
-  model: deepseek-web-v3
-```
+A chat is replaced by a fresh one (with a compacted full prompt) after 100
+messages, after 2 hours, or once it holds more than `DEEPSEEK_MAX_SESSION_CHARS`
+characters. The full prompt sent to a fresh chat is bounded by
+`DEEPSEEK_MAX_PROMPT_CHARS` (default 80 000): the start of the system prompt,
+the tool manual, the start of the task and the latest turns are kept; the
+middle is replaced by `[Earlier context compacted by FreeDeepseekAPI]` and the
+response carries `X-FreeDeepseek-Context-Compacted: true`.
 
-The proxy uses `user` from the request body. If not set, it falls back to the client's IP as the session key.
+### 4.3 Concurrency
 
-### 4.3 Session Data Structure
+DeepSeek generates one answer per chat at a time. While a request of an agent
+is in flight, another request with the same session key is served in a
+separate, throw-away DeepSeek chat instead of being appended to the busy one.
 
-```javascript
-{
-  id: "uuid",                    // DeepSeek web session ID
-  parentMessageId: <int|null>,   // Last message ID for threading
-  createdAt: <timestamp>,        // Session creation time
-  messageCount: 0-100,           // Messages in this session
-  history: [                     // Last 15 exchanges for context recovery
-    { user: "...", assistant: "..." }
-  ]
-}
-```
-
----
-
-## 5. Tool Calling Implementation
-
-Since DeepSeek Web API does **not** natively support function/tool calling, the proxy implements it via **text injection + parsing**.
-
-### 5.1 Flow
-
-1. **Injection:** Tool definitions are converted to text and appended to the system prompt:
-
-```
---- AVAILABLE TOOLS ---
-When you need to perform an action, respond with EXACTLY this format:
-TOOL_CALL: <function_name>
-arguments: <JSON arguments>
-
-Available functions:
-## terminal
-Execute shell commands
-Parameters: { "command": { "type": "string" } }
----
-
-IMPORTANT: When you need to use a tool, respond ONLY with:
-TOOL_CALL: <name>
-arguments: {"arg1": "val1", ...}
-```
-
-2. **Generation:** The LLM responds with text containing `TOOL_CALL:` when it wants to use a tool
-3. **Parsing:** The proxy uses a regex to match `*_CALL: name\narguments: <JSON>` patterns
-4. **JSON Extraction:** Uses a **balanced-brace parser** to extract JSON (handles nested braces and escaped strings)
-5. **Conversion:** The parsed tool call is converted to OpenAI `tool_calls` format with `finish_reason: "tool_calls"`
-6. **Execution:** The client (Hermes) receives the tool call, executes the tool, and sends the result back
-
-### 5.2 TOOL_CALL Format
-
-```
-TOOL_CALL: terminal
-arguments: {"command": "hostname -I"}
-```
-
-Or with the `TOOL` prefix variant (DeepSeek sometimes uses this):
-```
-TOOL_CALL: terminal
-arguments: {"command": "nmap -sn 10.8.0.0/24"}
-```
-
-### 5.3 Balanced-Brace Parser
-
-The parser traverses character by character tracking brace depth:
-- Skips escaped characters inside strings
-- Ignores braces inside strings
-- Returns `null` if JSON is malformed or braces don't balance
-- Works with commands containing braces like `awk '{print $1}'`
-
-### 5.4 Limitations
-
-- **Unreliable generation** — DeepSeek Web sometimes forgets the format, adds extra text, or returns malformed JSON
-- **No native tool support** — unlike the official API which has structured tool calls
-- **Session drops** — empty responses at ~17-34 messages require session reset
-
----
-
-## 6. Session Lifecycle & Auto-Recovery
-
-### 6.1 Auto-Reset Triggers
+### 4.4 Recovery
 
 | Condition | Action |
-|---|---|
-| Message count >= 100 | Auto-reset DeepSeek session, keep history buffer |
-| Session age > 2 hours | Auto-reset (DeepSeek web session TTL) |
-| HTTP 400/404/500 response | Reset and retry once |
-| Empty content response | Compact context, reset session, retry up to `DEEPSEEK_MAX_RETRIES` (default 2) |
-| Context/content too long | Pre-compact to `DEEPSEEK_MAX_PROMPT_CHARS`, then retry with a smaller budget |
+| --- | --- |
+| Completion HTTP 400/404/500 | New chat with the full prompt, once |
+| "Too many messages" / HTTP 429 / 401 / 403 | Account cooldown; replay on another ready account, otherwise 429/401/403 to the client |
+| Empty answer | Fresh chat, retried up to `DEEPSEEK_MAX_RETRIES` (default 2) |
+| Content too long | Fresh chat with a smaller prompt budget on each retry |
+| `INCOMPLETE` / `length` | Up to 2 automatic continuations |
+| Broken tool markup | One retry with a strict instruction, otherwise 502 `malformed_tool_call` |
+| No data for `DEEPSEEK_STREAM_IDLE_TIMEOUT_MS` | 504 `request_timeout` |
 
-### 6.2 History Buffer
+---
 
-When a session is reset, the proxy preserves the **last 15 exchanges** (capped at 10,000 chars). It injects this recovery context only when the client did not already send multi-turn history:
+## 5. Models
+
+DeepSeek merged the web modes "Instant", "Expert" and "Vision" into one unified
+mode (DeepSeek-V4.1-Flash) on 2026-09-10 and retired V4 Pro on 2026-09-14. All
+aliases therefore send the same `model_type` and differ only in the DeepThink
+and Search toggles:
+
+| Alias | DeepThink | Search | Notes |
+| --- | --- | --- | --- |
+| `deepseek-chat`, `deepseek-default`, `deepseek-v4-flash`, `deepseek-v4.1-flash` | – | – | |
+| `deepseek-v3` | – | – | deprecated alias |
+| `deepseek-reasoner`, `deepseek-r1` | ✓ | – | `r1` deprecated alias |
+| `deepseek-chat-search`, `deepseek-default-search` | – | ✓ | |
+| `deepseek-reasoner-search`, `deepseek-r1-search` | ✓ | ✓ | |
+| `deepseek-expert`, `deepseek-v4-pro` | ✓ | – | deprecated: Expert/V4 Pro no longer exist |
+| `deepseek-expert-search` | ✓ | ✓ | deprecated |
+| `deepseek-vision` | | | unsupported: the proxy does not upload images |
+
+Unknown model names get `400 invalid_model`.
+
+---
+
+## 6. Tool calling
+
+DeepSeek Web has no native tool calls, so the proxy adds a tool manual to the
+system prompt and parses the answer. The requested format is:
 
 ```
-[Previous conversation]
-User: what is my IP?
-Assistant: Your IP is 161.97.175.214
-
-User: check openvpn accounts
-Assistant: TOOL_CALL: terminal
-arguments: {"command": "cat /etc/openvpn/server.conf"}
-
-[Continue from here]
-
-<new user prompt>
+{"tool_call":{"name":"read_file","arguments":{"path":"/tmp/a"}}}
 ```
 
-### 6.3 Session Recovery
+Also accepted: `TOOL_CALL: name` + `arguments: {...}`, fenced ```` ```json ````
+blocks with a `tool_call`/`tool_calls`/`function_call` envelope,
+`<tool_call>{...}</tool_call>`, and DeepSeek DSML
+(`<｜DSML｜tool_calls>…`, including the doubled-bar web variant). Bare
+`{"name":...,"arguments":...}` examples are never executed, only tools listed in
+the request are accepted, and one tool call is returned per turn.
 
-If DeepSeek's web session expires (HTTP 400/404/500):
-1. Current session ID is cleared
-2. New session is created via `/api/v0/chat_session/create`
-3. Same PoW challenge is reused (to avoid re-solving)
-4. Request is retried with `parent_message_id: null`
-5. History buffer is injected as context
+The parser repairs unescaped backslashes (Windows paths) and raw newlines inside
+JSON strings. Code fences tagged with another language are ignored. Earlier
+tool calls are replayed to DeepSeek in the same JSON envelope and tool results
+as `[Tool Result: <name>]`.
 
 ---
 
 ## 7. Configuration
 
-### 7.1 Proxy Configuration (in deepseek-api-server.js)
+All settings are environment variables; `.env` in the project directory is
+loaded automatically (see `.env.example` for the full list).
 
-```javascript
-const MAX_HISTORY_LENGTH = 15;    // Keep last 15 exchanges
-const MAX_HISTORY_CHARS = 10000;  // Max chars for history buffer
-const MAX_MESSAGE_DEPTH = 100;    // Auto-reset after 100 messages
-const MAX_UPSTREAM_PROMPT_CHARS = 80000; // Configurable via DEEPSEEK_MAX_PROMPT_CHARS
-const SESSION_TTL_MS = 2 * 60 * 60 * 1000;  // 2 hours
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `HOST` / `PORT` | `127.0.0.1` / `9655` | Listen address |
+| `PROXY_API_KEY` / `PROXY_API_KEY_FILE` | – | Bearer key for clients |
+| `REQUIRE_PROXY_API_KEY` | `0` | Refuse to start without a key |
+| `PROXY_CORS_ORIGINS` | – | Extra allowed browser origins |
+| `DEEPSEEK_AUTH_PATH` / `DEEPSEEK_AUTH_DIR` | `./deepseek-auth.json` | Auth file(s); comma list or directory for an account pool |
+| `DEEPSEEK_ACCOUNT_COOLDOWN_MS` | `600000` | Cooldown after 401/403/429 |
+| `DEEPSEEK_RATE_LIMIT_COOLDOWN_MS` | `60000` | Cooldown after "Too many messages" |
+| `DEEPSEEK_MAX_PROMPT_CHARS` | `80000` | Max prompt for a fresh chat |
+| `DEEPSEEK_MAX_SESSION_CHARS` | `3 × max prompt` | Max accumulated chat size |
+| `DEEPSEEK_MAX_RETRIES` | `2` | Empty/overflow retries (0–10) |
+| `DEEPSEEK_MODEL_TYPE` | `default` | `model_type` sent upstream |
+| `DEEPSEEK_CLIENT_VERSION` | `2.0.0` | Emulated web client version headers |
+| `DEEPSEEK_FETCH_TIMEOUT_MS` | `60000` | Connect/response-header timeout |
+| `DEEPSEEK_STREAM_IDLE_TIMEOUT_MS` | `60000` | Max silence inside an answer stream |
+| `DEEPSEEK_STREAM_MAX_MS` | `600000` | Max duration of one answer stream |
+| `DEEPSEEK_REQUEST_DEADLINE_MS` | `120000` | Budget for retry/continuation loops |
+| `DEEPSEEK_MAX_CONCURRENT` | `24` | In-flight completions before 503 |
+| `NON_INTERACTIVE` / `SKIP_ACCOUNT_MENU` | `0` | Start without the menu |
 
-const DS_CONFIG = {
-  token: "...",                     // DeepSeek auth token
-  hif_dliq: "...",                  // Custom header
-  hif_leim: "...",                  // Custom header
-  cookie: "ds_session_id=...; smidV2=...",  // Browser cookies
-  wasmUrl: "https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.<hash>.wasm",
-};
-```
+Auth file format (`npm run auth` / `npm run auth:import`, keep it `0600`):
 
-### 7.2 Hermes Agent Configuration
-
-```yaml
-model:
-  default: deepseek-web-v3
-  provider: custom
-  base_url: http://127.0.0.1:9654/v1
-  model: deepseek-web-v3
-providers: {}
-fallback_providers: []
-```
-
-### 7.3 Environment Variables Required
-
-- **DeepSeek token** — from browser's `Authorization` header on chat.deepseek.com
-- **x-hif-dliq** — custom header from browser
-- **x-hif-leim** — custom header from browser  
-- **ds_session_id** — from browser cookie
-- **smidV2** — from browser cookie
-
----
-
-## 8. Running the Proxy
-
-```bash
-# Start
-node /root/.hermes/profiles/security-guy/scripts/deepseek-api-server.js
-
-# Output
-[DS-API] Server on http://0.0.0.0:9654 (multi-agent sessions enabled)
-[DS-API] POST /v1/chat/completions (stream=true|false)
-[DS-API] GET  /v1/sessions — list active agent sessions
-[DS-API] POST /reset-session?agent=<id> — reset agent's session
-[DS-API] POST /reset-session?agent=all — reset ALL sessions
-
-# Test
-curl -s http://127.0.0.1:9654/health
-curl -s http://127.0.0.1:9654/v1/models
-curl -s http://127.0.0.1:9654/v1/sessions
-
-# Chat
-curl -s http://127.0.0.1:9654/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"hello"}],"stream":false}'
-```
-
----
-
-## 9. Error Codes
-
-| HTTP Code | Type | Meaning |
-|---|---|---|
-| 200 | OK | Response successful |
-| 404 | Not found | Invalid endpoint |
-| 500 | server_error | Internal proxy error (exception) |
-| 502 | empty_response | DeepSeek returned empty content |
-
-Error response format:
 ```json
 {
-  "error": {
-    "message": "DeepSeek returned empty content",
-    "type": "empty_response",
-    "agent": "security-guy",
-    "session_id": "uuid",
-    "message_count": 17,
-    "history_length": 5
-  }
+  "token": "<DeepSeek userToken>",
+  "cookie": "<all deepseek.com cookies>",
+  "hif_dliq": "<optional>",
+  "hif_leim": "<optional>",
+  "wasmUrl": "https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.<hash>.wasm"
 }
 ```
 
 ---
 
-## 10. Known Limitations
+## 8. Errors
 
-| Issue | Cause | Impact |
-|---|---|---|
-| Empty responses at msg 17-34 | DeepSeek web session instability | Conversation interrupted, retry needed |
-| No native tool calling | DeepSeek Web API doesn't support it | LLM may generate malformed tool calls |
-| Response time 3-17s | PoW + network to DeepSeek | Slower than official API |
-| Session TTL ~2h | DeepSeek web browser timeout | Periodic session resets |
-| Credentials expire | Browser tokens/cookies change | Proxy needs re-auth |
-| Same DeepSeek account | All agents share one web login | Rate limiting across all sessions |
+```json
+{"error": {"message": "...", "type": "...", "agent": "...", "failed_session_id": "...", "retry_attempts": 2}}
+```
 
----
-
-## 11. Comparison: Web API vs Official API
-
-| Feature | Web API (Proxy) | Official API |
-|---|---|---|
-| **Cost** | Free | Paid (per-token) |
-| **Model** | DeepSeek V3 | DeepSeek V4 Flash / V3 |
-| **Tool calling** | Hacky (text injection) | Native (structured) |
-| **Streaming** | Yes | Yes |
-| **Reliability** | Medium (session drops) | High (SLA) |
-| **Speed** | 3-17s per call | 1-5s per call |
-| **Auth** | Cookie/token | API key |
-| **PoW** | Required every call | None |
-| **API key needed** | No | Yes |
+| Status | Type | Meaning |
+| --- | --- | --- |
+| 400 | `invalid_request_error` | Body is not JSON or `messages` is empty |
+| 400 | `invalid_model` / `unsupported_model` | Unknown or unsupported alias |
+| 400 | `context_length_exceeded` | DeepSeek rejected the prompt as too long after retries |
+| 401 | `authentication_error` | Missing/wrong proxy key, or DeepSeek rejected the login |
+| 403 | `cors_error` | Browser origin not allowed |
+| 404 | – | Unknown endpoint |
+| 413 | `payload_too_large` | Body over 10 MB |
+| 429 | `rate_limit_error` / `rate_limit` | DeepSeek throttling or all accounts cooling down (`Retry-After` set) |
+| 502 | `empty_response` / `malformed_tool_call` / `upstream_http_error` | DeepSeek returned nothing usable |
+| 503 | `overloaded` / `no_auth` | Too many requests in flight, or no auth configured |
+| 504 | `request_timeout` | DeepSeek stalled or the request deadline passed |
 
 ---
 
-## 12. File Locations
+## 9. Limitations
 
-| File | Path |
-|---|---|
-| Proxy server | `/root/.hermes/profiles/security-guy/scripts/deepseek-api-server.js` |
-| Security Guy SOUL | `/root/.hermes/profiles/security-guy/SOUL.md` |
-| Security Guy config | `/root/.hermes/profiles/security-guy/config.yaml` |
-| Gateway logs | `/root/.hermes/profiles/security-guy/logs/gateway.log` |
-| Agent logs | `/root/.hermes/profiles/security-guy/logs/agent.log` |
-| Error logs | `/root/.hermes/profiles/security-guy/logs/errors.log` |
+- Depends on the private DeepSeek Web contract; DeepSeek can change it at any time.
+- Tool calling is prompt-emulated: one call per turn, the model can still ignore the format.
+- Images and files are not uploaded.
+- Usage numbers are estimates.
+- All agents on one account share its rate limits; use an account pool for parallel agents.
