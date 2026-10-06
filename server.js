@@ -256,6 +256,7 @@ function markContextCompacted(res) {
 const sessions = new Map();  // keyed by agent ID (from `user` field)
 const MAX_HISTORY_LENGTH = 15;
 const MAX_HISTORY_CHARS = 10000;
+const MAX_HISTORY_ENTRY_CHARS = 2000;  // per stored assistant answer
 const MAX_MESSAGE_DEPTH = 100;  // auto-reset after this many messages
 const SESSION_TTL_MS = 2 * 60 * 60 * 1000;  // 2 hours
 
@@ -1872,6 +1873,9 @@ function createStreamWriter(res, apiMode, { model = 'deepseek-chat', promptToken
         get streamedContent() { return state.content; },
         source(kind) {
             const sourceId = ++state.sources;
+            // Whitespace held back from an earlier (empty, retried) call
+            // must not be prepended to this call's answer.
+            if (kind === 'content' && !state.content) state.pendingWhitespace = '';
             let consumed = 0;
             let carry = '';
             return (cumulative) => {
@@ -1956,7 +1960,12 @@ function createStreamWriter(res, apiMode, { model = 'deepseek-chat', promptToken
             if (apiMode === 'anthropic') {
                 sse('message_stop', { type: 'message_stop' });
             } else if (apiMode === 'responses') {
-                sse('response.completed', { type: 'response.completed', response: toResponsesResponse(openaiResp, itemIds) });
+                // Describe exactly the items that were streamed.
+                const streamed = toolCalls ? openaiResp : {
+                    ...openaiResp,
+                    choices: [{ ...choice, message: { ...msg, reasoning_content: state.reasoning || undefined, content: state.content } }],
+                };
+                sse('response.completed', { type: 'response.completed', response: toResponsesResponse(streamed, itemIds) });
                 res.write('data: [DONE]\n\n');
             } else {
                 res.write('data: [DONE]\n\n');
@@ -2001,7 +2010,10 @@ function storeHistory(session, prompt, content, toolCall) {
         : content;
     // Save last 500 chars of the prompt for history context
     const shortPrompt = prompt.length > 500 ? '...' + prompt.substring(prompt.length - 500) : prompt;
-    session.history.push({ user: shortPrompt, assistant: assistantResponse });
+    // One huge answer must not crowd every earlier turn out of the bounded
+    // recovery history (or get the whole history dropped as too long).
+    const shortAnswer = truncatePromptMiddle(assistantResponse, MAX_HISTORY_ENTRY_CHARS, 0.6);
+    session.history.push({ user: shortPrompt, assistant: shortAnswer });
     while (session.history.length > MAX_HISTORY_LENGTH) session.history.shift();
     let historyChars = session.history.reduce((sum, e) => sum + e.user.length + e.assistant.length, 0);
     while (historyChars > MAX_HISTORY_CHARS && session.history.length > 1) {
@@ -2893,6 +2905,8 @@ const server = http.createServer(async (req, res) => {
                     // (finish_reason 'length') instead of failing the request.
                     if (requestAbort.signal.aborted) throw error;
                     console.log(`${agentTag} Continuation failed (${error.message}); returning the partial answer`);
+                    // The call may have left an empty replacement chat behind.
+                    resetRemoteSession(session);
                     break;
                 }
                 const { account: contAccount } = continuationCall;
@@ -2908,7 +2922,9 @@ const server = http.createServer(async (req, res) => {
                 }
                 let contResult;
                 try {
-                    contResult = await readDeepSeekResponse(continuationCall, liveProgress());
+                    // Not streamed live: the continuation is only kept if it
+                    // passes the checks below; finish() sends the kept part.
+                    contResult = await readDeepSeekResponse(continuationCall);
                 } catch (error) {
                     if (requestAbort.signal.aborted) throw error;
                     console.log(`${agentTag} Continuation stream failed (${error.message}); returning the partial answer`);

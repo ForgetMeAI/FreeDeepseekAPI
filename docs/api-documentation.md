@@ -282,7 +282,8 @@ characters. The full prompt sent to a fresh chat is bounded by
 `DEEPSEEK_MAX_PROMPT_CHARS` (default 80 000): the start of the system prompt,
 the tool manual, the start of the task and the latest turns are kept; the
 middle is replaced by `[Earlier context compacted by FreeDeepseekAPI]` and the
-response carries `X-FreeDeepseek-Context-Compacted: true`.
+response carries `X-FreeDeepseek-Context-Compacted: true` (on streamed responses
+only when the compaction happened before the first event was sent).
 
 ### 4.3 Concurrency
 

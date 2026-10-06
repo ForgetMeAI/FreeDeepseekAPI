@@ -508,3 +508,57 @@ test('a failure after streaming started is reported inside the stream', async ()
   const limited = await timedStream('/v1/chat/completions', { model: 'deepseek-chat', stream: true, user: 'stream-429', messages: [{ role: 'user', content: 'hi' }] });
   assert.equal(limited.status, 429);
 });
+
+function streamedOpenAIText(raw) {
+  return raw.split('\n\n').filter(p => p.startsWith('data: {')).map(p => JSON.parse(p.slice(6)))
+    .map(c => c.choices?.[0]?.delta?.content || '').join('');
+}
+
+test('whitespace from an empty first attempt is not duplicated into the streamed retry', async () => {
+  mock.state.respond = (body, auth, n) => (n === 1 ? { text: '\n' } : { text: '\nHello world' });
+  const result = await timedStream('/v1/chat/completions', { model: 'deepseek-chat', stream: true, user: 'ws-retry', messages: [{ role: 'user', content: 'hi' }] });
+  assert.equal(result.status, 200);
+  assert.equal(streamedOpenAIText(result.raw), '\nHello world');
+});
+
+test('a rejected continuation is never streamed to the client', async () => {
+  mock.state.respond = (body, auth, n) => (n === 1
+    ? { text: 'Part one. ', finalStatus: 'INCOMPLETE' }
+    : { text: 'I am an AI assistant and cannot continue.' });
+  const result = await timedStream('/v1/chat/completions', { model: 'deepseek-chat', stream: true, user: 'cont-reject', messages: [{ role: 'user', content: 'long story' }] });
+  assert.equal(result.status, 200);
+  assert.equal(streamedOpenAIText(result.raw), 'Part one. ');
+  const last = result.raw.split('\n\n').filter(p => p.startsWith('data: {')).map(p => JSON.parse(p.slice(6))).at(-1);
+  assert.equal(last.choices[0].finish_reason, 'length');
+});
+
+test('a failed continuation that opened a new chat does not strand the session', async () => {
+  // A huge first answer pushes the chat over DEEPSEEK_MAX_SESSION_CHARS, so the
+  // continuation starts a new chat, whose completion then fails.
+  mock.state.respond = (body, auth, n) => {
+    if (n === 1) return { text: 'x'.repeat(250000), finalStatus: 'INCOMPLETE' };
+    if (n === 2) return { status: 502, errorBody: '{"msg":"bad gateway"}' };
+    return { text: 'secret is kiwi' };
+  };
+  const first = await chat({ model: 'deepseek-chat', user: 'cont-fail', messages: [{ role: 'user', content: 'The secret word is kiwi. Write a lot.' }] });
+  assert.equal(first.status, 200, first.text.slice(0, 200));
+  assert.equal(first.json.choices[0].finish_reason, 'length');
+  const next = await chat({ model: 'deepseek-chat', user: 'cont-fail', messages: [{ role: 'user', content: 'What is the secret word?' }] });
+  assert.equal(next.status, 200, next.text);
+  const prompt = mock.state.completions.at(-1).body.prompt;
+  assert.match(prompt, /\[Previous conversation\]/);
+  assert.match(prompt, /secret word is kiwi/);
+});
+
+test('Responses response.completed lists exactly the streamed items', async () => {
+  mock.state.respond = (body, auth, n) => (n === 1 ? { thinking: 'first thoughts', text: '' } : { text: 'Answer' });
+  const result = await timedStream('/v1/responses', { model: 'deepseek-reasoner', stream: true, user: 'resp-items', input: 'hi' });
+  assert.equal(result.status, 200);
+  const events = result.events.filter(e => e.part.includes('data: {')).map(e => JSON.parse(e.part.slice(e.part.indexOf('data: ') + 6)));
+  const added = events.filter(e => e.type === 'response.output_item.added').map(e => e.item.type);
+  const completed = events.find(e => e.type === 'response.completed').response;
+  assert.deepEqual(added, ['reasoning', 'message']);
+  assert.deepEqual(completed.output.map(o => o.type), added);
+  assert.equal(completed.output[0].summary[0].text, 'first thoughts');
+  assert.equal(completed.output_text, 'Answer');
+});
