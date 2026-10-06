@@ -40,21 +40,39 @@ const DS_FETCH_TIMEOUT_MS = envNumber('DEEPSEEK_FETCH_TIMEOUT_MS', 60000, 1000);
 // than a minute, so the stream is bounded by inactivity instead of total time.
 const DS_STREAM_IDLE_TIMEOUT_MS = envNumber('DEEPSEEK_STREAM_IDLE_TIMEOUT_MS', DS_FETCH_TIMEOUT_MS, 1000);
 const DS_STREAM_MAX_MS = envNumber('DEEPSEEK_STREAM_MAX_MS', 10 * 60 * 1000, 1000);
-function dsFetch(url, options = {}, timeoutMs = DS_FETCH_TIMEOUT_MS) {
-    return fetch(url, { ...options, signal: options.signal || AbortSignal.timeout(timeoutMs) });
-}
-
 function timeoutError(message) {
     const error = new Error(message);
     error.name = 'TimeoutError';
     return error;
 }
 
+// Makes `controller` follow an outer signal (the inbound request being
+// cancelled). Works on Node 18, which lacks AbortSignal.any.
+function followSignal(controller, signal) {
+    if (!signal) return;
+    if (signal.aborted) controller.abort(signal.reason);
+    else signal.addEventListener('abort', () => controller.abort(signal.reason), { once: true });
+}
+
+function throwIfAborted(signal) {
+    if (signal?.aborted) throw signal.reason || new Error('request aborted');
+}
+
+// Short JSON request (PoW, session create): bounded by DS_FETCH_TIMEOUT_MS
+// including the body, and cancelled together with the inbound request.
+function dsFetch(url, options = {}, timeoutMs = DS_FETCH_TIMEOUT_MS) {
+    const controller = new AbortController();
+    followSignal(controller, options.signal);
+    followSignal(controller, AbortSignal.timeout(timeoutMs));
+    return fetch(url, { ...options, signal: controller.signal });
+}
+
 // Starts a streaming completion request. The returned controller lets the SSE
-// reader enforce an idle timeout and lets the handler cancel the upstream
-// generation when the client disconnects.
+// reader enforce an idle timeout; options.signal (the inbound request) cancels
+// the upstream generation when the client disconnects.
 async function dsFetchStream(url, options = {}) {
     const controller = new AbortController();
+    followSignal(controller, options.signal);
     const connectTimer = setTimeout(() => controller.abort(timeoutError(`DeepSeek did not respond within ${DS_FETCH_TIMEOUT_MS}ms`)), DS_FETCH_TIMEOUT_MS);
     try {
         const resp = await fetch(url, { ...options, signal: controller.signal });
@@ -62,6 +80,20 @@ async function dsFetchStream(url, options = {}) {
         return resp;
     } finally {
         clearTimeout(connectTimer);
+    }
+}
+
+// Reads a (non-streaming) error body without trusting the upstream to finish
+// it: a stalled body must not pin the request, its session lock and its
+// concurrency slot forever.
+async function readUpstreamText(resp, timeoutMs = DS_FETCH_TIMEOUT_MS) {
+    const timer = setTimeout(() => resp.abortController?.abort(timeoutError(`DeepSeek error body not received within ${timeoutMs}ms`)), timeoutMs);
+    try {
+        return await resp.text();
+    } catch (error) {
+        return '';
+    } finally {
+        clearTimeout(timer);
     }
 }
 
@@ -590,9 +622,9 @@ function isSupportedModel(model) { return resolveModelConfig(model).supported ==
 
 // A PoW answer is bound to one completion request, so every completion
 // (including the one after a session recreate) solves a fresh challenge.
-async function createPowHeader(account) {
+async function createPowHeader(account, signal) {
     const cr = await dsFetch(dsUrl('/api/v0/chat/create_pow_challenge'), {
-        method: 'POST', headers: account.headers,
+        method: 'POST', headers: account.headers, signal,
         body: JSON.stringify({ target_path: '/api/v0/chat/completion' })
     });
     const chalText = await cr.text();
@@ -617,9 +649,9 @@ async function createPowHeader(account) {
     })).toString('base64');
 }
 
-async function createRemoteChat(session, account, agentTag, label = 'session create') {
+async function createRemoteChat(session, account, agentTag, label = 'session create', signal) {
     const sr = await dsFetch(dsUrl('/api/v0/chat_session/create'), {
-        method: 'POST', headers: account.headers, body: '{}'
+        method: 'POST', headers: account.headers, body: '{}', signal,
     });
     const { json: sessionData, text: sessionText } = await readDeepSeekJsonResponse(sr, label, account);
     const createdSessionId = sessionData?.data?.biz_data?.chat_session?.id || sessionData?.data?.biz_data?.id;
@@ -639,8 +671,9 @@ async function createRemoteChat(session, account, agentTag, label = 'session cre
     console.log(`${agentTag} Created new session: ${session.id}`);
 }
 
-async function postCompletion(session, account, modelCfg, promptText) {
-    const powB64 = await createPowHeader(account);
+async function postCompletion(session, account, modelCfg, promptText, signal) {
+    const powB64 = await createPowHeader(account, signal);
+    throwIfAborted(signal);
     const payload = {
         chat_session_id: session.id,
         parent_message_id: session.parentMessageId,
@@ -653,10 +686,20 @@ async function postCompletion(session, account, modelCfg, promptText) {
         method: 'POST',
         headers: { ...account.headers, 'X-DS-PoW-Response': powB64 },
         body: JSON.stringify(payload),
+        signal,
     });
 }
 
-async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', freshSessionPrompt = prompt, session = getOrCreateAgentSession(agentId)) {
+// DeepSeek answers "too many messages" with HTTP 400 (not 429). Recreating the
+// chat would only burn another request: cool this account down briefly so the
+// caller can fail over or return 429. Auth failures keep their own handling.
+function throwIfRateLimited(account, status, errText, retryAfter) {
+    if ([401, 403, 429].includes(Number(status)) || !isRateLimitError(errText)) return;
+    markAccountFailure(account, 429, 'rate limited', retryAfter, RATE_LIMIT_COOLDOWN_MS);
+    throw createUpstreamHttpError(429, errText, retryAfter || String(Math.ceil(RATE_LIMIT_COOLDOWN_MS / 1000)));
+}
+
+async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', freshSessionPrompt = prompt, session = getOrCreateAgentSession(agentId), signal = null) {
     const modelCfg = resolveModelConfig(model);
     const hadRemoteSession = Boolean(session.id);
     const account = selectAccountForSession(session);
@@ -680,39 +723,36 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
     }
 
     if (!session.id) {
-        await createRemoteChat(session, account, agentTag);
+        await createRemoteChat(session, account, agentTag, 'session create', signal);
     } else {
         console.log(`${agentTag} Reusing session: ${session.id} (parent: ${session.parentMessageId}, msg#${session.messageCount})`);
     }
 
-    const resp = await postCompletion(session, account, modelCfg, effectivePrompt);
+    const resp = await postCompletion(session, account, modelCfg, effectivePrompt, signal);
 
     if (resp.status !== 200) {
         // Pass Retry-After so a 429 honors the server-requested cooldown (#16).
         const retryAfter = resp.headers.get('retry-after');
         markAccountFailure(account, resp.status, 'completion', retryAfter);
-        const errText = await resp.text();
+        const errText = await readUpstreamText(resp);
+        throwIfAborted(signal);
         console.log(`${agentTag} Session error (${resp.status}): ${errText.substring(0, 100)}`);
-        // DeepSeek reports "too many messages" as HTTP 400. Recreating the chat
-        // would only burn another request: cool this account down briefly so
-        // the caller can fail over or return 429.
-        if (resp.status !== 429 && isRateLimitError(errText)) {
-            markAccountFailure(account, 429, 'rate limited', retryAfter, RATE_LIMIT_COOLDOWN_MS);
-            throw createUpstreamHttpError(429, errText, retryAfter || String(Math.ceil(RATE_LIMIT_COOLDOWN_MS / 1000)));
-        }
+        throwIfRateLimited(account, resp.status, errText, retryAfter);
         // The remote chat may have expired or overflowed: start a new one with
         // the full prompt once. Auth and rate-limit statuses are surfaced as is.
         if (resp.status === 400 || resp.status === 404 || resp.status === 500) {
             console.log(`${agentTag} Session ${session.id} expired. Creating new session...`);
             resetRemoteSession(session);
-            await createRemoteChat(session, account, agentTag, 'session recreate');
+            await createRemoteChat(session, account, agentTag, 'session recreate', signal);
             effectivePrompt = freshSessionPrompt;
-            const resp2 = await postCompletion(session, account, modelCfg, effectivePrompt);
+            const resp2 = await postCompletion(session, account, modelCfg, effectivePrompt, signal);
             if (!resp2.ok) {
                 const retryAfter2 = resp2.headers.get('retry-after');
                 markAccountFailure(account, resp2.status, 'completion after session recreate', retryAfter2);
-                const errText2 = await resp2.text();
+                const errText2 = await readUpstreamText(resp2);
                 resetRemoteSession(session);
+                throwIfAborted(signal);
+                throwIfRateLimited(account, resp2.status, errText2, retryAfter2);
                 throw createUpstreamHttpError(resp2.status, errText2, retryAfter2);
             }
             session.remoteChars += effectivePrompt.length;
@@ -847,7 +887,10 @@ function extractBalancedJsonAt(text, startIndex) {
     return null;
 }
 
-function extractBalancedJsonObjects(text, maxObjects = MAX_TOOL_JSON_CANDIDATES) {
+// Top-level balanced objects in one linear pass. `accept` filters which
+// objects count towards maxObjects, so a long answer full of code braces
+// cannot exhaust the budget before the real candidate.
+function extractBalancedJsonObjects(text, maxObjects = MAX_TOOL_JSON_CANDIDATES, accept = null) {
     const objects = [];
     let start = -1;
     let depth = 0;
@@ -872,8 +915,11 @@ function extractBalancedJsonObjects(text, maxObjects = MAX_TOOL_JSON_CANDIDATES)
         if (ch === '}') {
             depth--;
             if (depth === 0) {
-                objects.push(text.substring(start, i + 1));
-                if (objects.length >= maxObjects) return objects;
+                const object = text.substring(start, i + 1);
+                if (!accept || accept(object)) {
+                    objects.push(object);
+                    if (objects.length >= maxObjects) return objects;
+                }
                 start = -1;
             }
         }
@@ -886,8 +932,9 @@ const TOOL_ENVELOPE_KEY_RE = /["'](?:tool_call|tool_calls|function_call)["']\s*:
 
 function repairJsonStringBody(body) {
     // One invalid escape (\g, \d, \U ...) means the model wrote raw text such
-    // as a Windows path; then every backslash in this string is literal, so
-    // "C:\new\tmp" keeps its backslashes instead of becoming a newline + tab.
+    // as a Windows path; then single backslashes in this string are literal,
+    // so "C:\new\tmp" keeps them instead of becoming a newline + tab. The
+    // unambiguous escapes \\, \" and \uXXXX keep their JSON meaning.
     let rawBackslashes = false;
     for (let k = 0; k < body.length; k++) {
         if (body[k] !== '\\') continue;
@@ -898,7 +945,7 @@ function repairJsonStringBody(body) {
     for (let k = 0; k < body.length; k++) {
         const c = body[k];
         if (c === '\\') {
-            if (rawBackslashes && body[k + 1] !== '"') {
+            if (rawBackslashes && !/^(?:["\\]|u[0-9a-fA-F]{4})/.test(body.substring(k + 1, k + 6))) {
                 result += '\\\\';
             } else {
                 result += c + (body[k + 1] ?? '');
@@ -1251,6 +1298,16 @@ function looksLikeToolCallMarkup(text) {
     return /TOOL_CALL:\s*[\w-]+|<\s*tool_call\b|[|｜]+\s*DSML\s*[|｜]+|[<＜]\s*\/?\s*(?:DSML)?(?:[\w.-]+:)?(?:tool[\s_-]*calls|function[\s_-]*calls|invoke)\b|["'](?:tool_call|tool_calls|function_call)["']\s*:/i.test(String(text || ''));
 }
 
+const CODE_FENCE_RE = /```([\w+.-]*)[^\S\r\n]*\r?\n?([\s\S]*?)```/;
+
+function isJsonFenceLanguage(language) {
+    return !language || /^(?:json[c5]?|tool_?calls?|tool)$/i.test(language);
+}
+
+function stripForeignCodeFences(text) {
+    return text.replace(new RegExp(CODE_FENCE_RE.source, 'g'), (whole, language) => (isJsonFenceLanguage(language) ? whole : '\n'));
+}
+
 function parseToolCall(text) {
     if (!text || typeof text !== 'string') return null;
     if (text.length > MAX_TOOL_MARKUP_CHARS) {
@@ -1265,8 +1322,13 @@ function parseToolCall(text) {
         return null;
     }
 
+    // Code blocks in another language (```csharp, ```javascript ...) are
+    // source code. Tool-call examples inside them must never execute, so all
+    // later searches run on the text without them.
+    const scanText = stripForeignCodeFences(text);
+
     // XML-ish wrappers used by some agent prompts.
-    const xmlMatch = text.match(/<tool_call[^>]*>([\s\S]*?)<\/tool_call>/i);
+    const xmlMatch = scanText.match(/<tool_call[^>]*>([\s\S]*?)<\/tool_call>/i);
     if (xmlMatch) {
         const inner = xmlMatch[1].trim();
         let tc = parseJsonToolCandidate(inner, 'xml', { allowBare: true });
@@ -1279,13 +1341,11 @@ function parseToolCall(text) {
         if (tc) return tc;
     }
 
-    // Fenced JSON blocks. Fences tagged with another language (```csharp,
-    // ```python ...) are source code, never tool requests.
-    const fenceRe = /```([\w+.-]*)[^\S\r\n]*\r?\n?([\s\S]*?)```/g;
+    // Fenced JSON blocks (untagged or tagged json).
+    const fenceRe = new RegExp(CODE_FENCE_RE.source, 'g');
     let fence;
     while ((fence = fenceRe.exec(text)) !== null) {
-        const language = fence[1].toLowerCase();
-        if (language && !/^(?:json[c5]?|tool_?calls?|tool)$/.test(language)) continue;
+        if (!isJsonFenceLanguage(fence[1])) continue;
         const body = fence[2].trim();
         if (!body.startsWith('{')) continue;
         const tc = parseJsonToolCandidate(body, 'fenced');
@@ -1293,10 +1353,10 @@ function parseToolCall(text) {
     }
 
     // Legacy TOOL_CALL: name + first balanced JSON object after it.
-    const match = text.match(/TOOL_CALL:\s*([\w-]+)\s*/i);
+    const match = scanText.match(/TOOL_CALL:\s*([\w-]+)\s*/i);
     if (match) {
         const name = match[1];
-        const afterMatch = text.substring(match.index + match[0].length);
+        const afterMatch = scanText.substring(match.index + match[0].length);
         const braceIdx = afterMatch.indexOf('{');
         if (braceIdx !== -1) {
             const rawJson = extractBalancedJsonAt(afterMatch, braceIdx);
@@ -1319,22 +1379,10 @@ function parseToolCall(text) {
         }
     }
 
-    // Explicit envelopes anywhere in the text, even after long code blocks
-    // whose braces would exhaust the generic candidate budget below.
-    const envelopeRe = /\{\s*["']?(?:tool_call|tool_calls|function_call)["']?\s*:/g;
-    let envelope;
-    let envelopeCandidates = 0;
-    while ((envelope = envelopeRe.exec(text)) !== null && envelopeCandidates++ < MAX_TOOL_JSON_CANDIDATES) {
-        const rawJson = extractBalancedJsonAt(text, envelope.index);
-        if (!rawJson) continue;
-        const tc = parseJsonToolCandidate(rawJson, 'inline');
-        if (tc) return tc;
-        envelopeRe.lastIndex = envelope.index + rawJson.length;
-    }
-
     // Scan each top-level balanced object once (linear time). Only explicit
-    // tool-call envelopes are executable; bare {name, arguments} examples are not.
-    for (const rawJson of extractBalancedJsonObjects(text)) {
+    // top-level tool-call envelopes are executable; bare {name, arguments}
+    // examples and envelopes nested inside other JSON are not.
+    for (const rawJson of extractBalancedJsonObjects(scanText, MAX_TOOL_JSON_CANDIDATES, object => TOOL_ENVELOPE_KEY_RE.test(object))) {
         const tc = parseJsonToolCandidate(rawJson, 'inline');
         if (tc) return tc;
     }
@@ -1589,6 +1637,13 @@ function toAnthropicResponse(openaiResp) {
     return response;
 }
 
+// Splits text into stream deltas by code point. Cutting by UTF-16 units would
+// split an emoji into lone surrogates, which strict UTF-8 clients (Python
+// httpx, Telegram gateways) reject.
+function chunkText(text, size) {
+    return String(text || '').match(new RegExp(`[\\s\\S]{1,${size}}`, 'gu')) || [];
+}
+
 function writeSse(res, event, data) {
     if (event) res.write(`event: ${event}\n`);
     res.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -1621,9 +1676,8 @@ function sendAnthropicStream(res, openaiResp) {
         }
         const offset = msg.reasoning_content ? 1 : 0;
         writeSse(res, 'content_block_start', { type: 'content_block_start', index: offset, content_block: { type: 'text', text: '' } });
-        const text = msg.content || '';
-        for (let i = 0; i < text.length; i += 80) {
-            writeSse(res, 'content_block_delta', { type: 'content_block_delta', index: offset, delta: { type: 'text_delta', text: text.substring(i, i + 80) } });
+        for (const piece of chunkText(msg.content, 80)) {
+            writeSse(res, 'content_block_delta', { type: 'content_block_delta', index: offset, delta: { type: 'text_delta', text: piece } });
         }
         writeSse(res, 'content_block_stop', { type: 'content_block_stop', index: offset });
         writeSse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: message.stop_reason, stop_sequence: null }, usage: message.usage });
@@ -1695,8 +1749,8 @@ function sendResponsesStream(res, openaiResp) {
         const item = { id: 'msg_' + Date.now(), type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text, annotations: [] }] };
         writeSse(res, 'response.output_item.added', { type: 'response.output_item.added', output_index: outputIndex, item: { ...item, status: 'in_progress', content: [] } });
         writeSse(res, 'response.content_part.added', { type: 'response.content_part.added', output_index: outputIndex, content_index: 0, item_id: item.id, part: { type: 'output_text', text: '', annotations: [] } });
-        for (let i = 0; i < text.length; i += 80) {
-            writeSse(res, 'response.output_text.delta', { type: 'response.output_text.delta', output_index: outputIndex, content_index: 0, item_id: item.id, delta: text.substring(i, i + 80) });
+        for (const piece of chunkText(text, 80)) {
+            writeSse(res, 'response.output_text.delta', { type: 'response.output_text.delta', output_index: outputIndex, content_index: 0, item_id: item.id, delta: piece });
         }
         writeSse(res, 'response.output_text.done', { type: 'response.output_text.done', output_index: outputIndex, content_index: 0, item_id: item.id, text });
         writeSse(res, 'response.content_part.done', { type: 'response.content_part.done', output_index: outputIndex, content_index: 0, item_id: item.id, part: item.content[0] });
@@ -1740,8 +1794,8 @@ function sendOpenAIStream(res, openaiResp) {
     // The first chunk announces the role, as OpenAI streams do.
     writeChunk({ role: 'assistant', content: hasToolCalls ? null : '' });
     if (!hasToolCalls && msg.reasoning_content) {
-        for (let i = 0; i < msg.reasoning_content.length; i += 50) {
-            writeChunk({ reasoning_content: msg.reasoning_content.substring(i, i + 50) });
+        for (const piece of chunkText(msg.reasoning_content, 50)) {
+            writeChunk({ reasoning_content: piece });
         }
     }
     if (hasToolCalls) {
@@ -1750,9 +1804,8 @@ function sendOpenAIStream(res, openaiResp) {
         writeChunk({ tool_calls: msg.tool_calls.map((tc, index) => ({ index, ...tc })) });
         writeChunk({}, 'tool_calls');
     } else {
-        const content = msg.content || '';
-        for (let i = 0; i < content.length; i += 50) {
-            writeChunk({ content: content.substring(i, i + 50) });
+        for (const piece of chunkText(msg.content, 50)) {
+            writeChunk({ content: piece });
         }
         writeChunk({}, choice.finish_reason === 'length' ? 'length' : 'stop');
     }
@@ -1826,9 +1879,11 @@ function truncatePromptMiddle(text, maxChars, headRatio = 0.35) {
     return value.substring(0, headChars) + PROMPT_COMPACTION_MARKER + value.substring(value.length - tailChars);
 }
 
+// A client sends its own history when it replays earlier assistant turns.
+// Requests with only new input (one user message, or just a tool result for
+// a previous answer) rely on the proxy's remote chat and local history.
 function hasExplicitConversationHistory(messages) {
-    const turns = (messages || []).filter(msg => msg && msg.role !== 'system');
-    return turns.length > 1 || turns.some(msg => msg.role === 'assistant' || msg.role === 'tool');
+    return (messages || []).some(msg => msg && msg.role === 'assistant');
 }
 
 function buildRecoveryHistoryPrefix(history) {
@@ -2041,8 +2096,15 @@ function planSessionTurn(session, messages, contextKey) {
     const conversation = (messages || []).filter(msg => msg && !isSystemRole(msg.role));
     const keys = conversation.map(conversationMessageKey);
     if (!session?.id) return { mode: 'full', reason: null, keys };
-    if (session.contextKey !== contextKey) return { mode: 'full', reason: 'system prompt or tools changed', keys };
     const sent = Array.isArray(session.sentMessageKeys) ? session.sentMessageKeys : [];
+    // Clients without explicit history send only their new input (a user
+    // message, or a tool result for the previous answer) and rely on the
+    // remote chat to remember earlier turns. A changed system prompt (e.g. a
+    // timestamp) is sent along instead of discarding that memory.
+    if (!conversation.some(msg => msg.role === 'assistant')) {
+        return { mode: 'delta', messages: conversation, keys, includeSystem: session.contextKey !== contextKey };
+    }
+    if (session.contextKey !== contextKey) return { mode: 'full', reason: 'system prompt or tools changed', keys };
     if (sent.length > 0 && sent.length < keys.length && sent.every((key, index) => keys[index] === key)) {
         // The client echoes the assistant turn DeepSeek just produced; the
         // remote chat already contains it.
@@ -2052,18 +2114,17 @@ function planSessionTurn(session, messages, contextKey) {
         if (delta.some(msg => msg.role !== 'assistant')) return { mode: 'delta', messages: delta, keys };
         return { mode: 'full', reason: 'no new input after the last answer', keys };
     }
-    // Clients without explicit history send one user message per turn and
-    // rely on the remote chat to remember earlier turns.
-    if (conversation.length === 1 && conversation[0].role === 'user') {
-        return { mode: 'delta', messages: conversation, keys };
-    }
     return { mode: 'full', reason: 'conversation history diverged', keys };
 }
 
-function buildDeltaPrompt(deltaMessages, allMessages, toolReminder, maxChars = MAX_UPSTREAM_PROMPT_CHARS) {
+function buildDeltaPrompt(deltaMessages, allMessages, toolReminder, maxChars = MAX_UPSTREAM_PROMPT_CHARS, systemPrompt = '') {
     const body = formatConversation(deltaMessages, buildToolNameIndex(allMessages));
     const suffix = toolReminder ? `\n\n${toolReminder}` : '';
     const budget = Math.max(0, maxChars - suffix.length);
+    if (systemPrompt) {
+        const bounded = buildBoundedPrompt(systemPrompt, '', body, budget);
+        return { prompt: bounded.prompt + suffix, compacted: bounded.compacted };
+    }
     const bounded = truncatePromptMiddle(body, budget, 0.25);
     return { prompt: bounded + suffix, compacted: bounded.length < body.length };
 }
@@ -2216,18 +2277,22 @@ const server = http.createServer(async (req, res) => {
         const body = Buffer.concat(bodyChunks).toString('utf8');
         inFlight++;
         let clientGone = false;
-        let upstreamResponse = null;
+        // Cancels every upstream call of this request (PoW, chat creation,
+        // the answer stream) once nobody is waiting for the result.
+        const requestAbort = new AbortController();
         res.on('close', () => {
             if (res.writableFinished) return;
             clientGone = true;
-            // Stop the DeepSeek generation nobody is waiting for.
-            upstreamResponse?.abortController?.abort(new Error('client disconnected'));
+            requestAbort.abort(new Error('client disconnected'));
         });
         const requestStartedAt = Date.now();
         const deadlineHit = () => Date.now() - requestStartedAt > REQUEST_DEADLINE_MS;
         let activeSession = null;
         let activeAgentId = null;
         let lockedSession = null;
+        // Set once DeepSeek accepted a completion in this request; only then
+        // can the remote chat contain turns the client does not know about.
+        let remoteTouched = false;
         try {
             let rawParams;
             try { rawParams = JSON.parse(body || '{}'); }
@@ -2324,7 +2389,7 @@ const server = http.createServer(async (req, res) => {
             let fullPrompt;
             let promptCompacted;
             if (plan.mode === 'delta') {
-                const delta = buildDeltaPrompt(plan.messages, messages, toolReminder);
+                const delta = buildDeltaPrompt(plan.messages, messages, toolReminder, MAX_UPSTREAM_PROMPT_CHARS, plan.includeSystem ? systemPrompt : '');
                 fullPrompt = delta.prompt;
                 promptCompacted = delta.compacted;
                 console.log(`${agentTag} Sending ${plan.messages.length} new message(s) to the existing DeepSeek chat (${fullPrompt.length} chars${delta.compacted ? ', compacted' : ''})`);
@@ -2347,15 +2412,16 @@ const server = http.createServer(async (req, res) => {
             // always starts a fresh chat, so it gets the self-contained prompt.
             const callDeepSeek = async (promptText, freshPrompt = promptText) => {
                 for (let attempt = 0; ; attempt++) {
+                    throwIfAborted(requestAbort.signal);
                     try {
-                        const call = await askDeepSeekStream(promptText, agentId, requestedModel, freshPrompt, session);
-                        upstreamResponse = call.resp;
+                        const call = await askDeepSeekStream(promptText, agentId, requestedModel, freshPrompt, session, requestAbort.signal);
+                        remoteTouched = true;
                         lastAccount = call.account;
                         return call;
                     } catch (error) {
                         const failedAccountId = session.accountId;
                         if (!isAccountLevelError(error) || attempt + 1 >= accounts.length
-                            || !hasOtherReadyAccount(failedAccountId) || clientGone || deadlineHit()) {
+                            || !hasOtherReadyAccount(failedAccountId) || requestAbort.signal.aborted || deadlineHit()) {
                             throw error;
                         }
                         console.log(`${agentTag} Account ${failedAccountId} failed (HTTP ${error.status}); retrying on another account.`);
@@ -2508,7 +2574,11 @@ const server = http.createServer(async (req, res) => {
             while (!fullContent || fullContent.trim().length === 0) {
                 // Stop early if the client hung up or we've blown the request budget —
                 // no point burning more PoW solves + account quota for a dead socket.
-                if (clientGone) { console.log(`${agentTag} client disconnected; abandoning empty-retry loop`); return; }
+                if (clientGone) {
+                    console.log(`${agentTag} client disconnected; abandoning empty-retry loop`);
+                    resetRemoteSession(session);
+                    return;
+                }
                 if (deadlineHit()) { console.log(`${agentTag} request deadline hit; stopping empty-retry loop`); break; }
                 const contextTooLong = isContextTooLongError(modelError);
                 if (!contextTooLong && isRateLimitError(modelError)) {
@@ -2694,6 +2764,13 @@ const server = http.createServer(async (req, res) => {
                 }
             }
 
+            if (clientGone) {
+                // The answer will never reach the client, so the remote chat
+                // now holds a turn the client does not know about.
+                resetRemoteSession(session);
+                console.log(`${agentTag} client disconnected before the answer was sent; discarding it`);
+                return;
+            }
             if (!ephemeral) storeHistory(agentSession, prompt, fullContent, toolCall);
             // Remember what the remote chat now holds, so the next request of
             // this conversation sends only its new messages.
@@ -2710,8 +2787,10 @@ const server = http.createServer(async (req, res) => {
             console.log(`${agentTag} ${stream ? 'Streamed' : 'Response'} ${apiMode} (tool=${!!toolCall}, ${Date.now() - startTime}ms, ${fullContent.length} chars)`);
         } catch (e) {
             console.log('[DS-API] Error:', e.message);
-            // Whatever the remote chat holds now is unknown to the client.
-            const failure = activeSession && activeSession.id ? resetRemoteSession(activeSession) : null;
+            // If DeepSeek accepted a completion, the remote chat may now hold a
+            // turn the client never saw. Errors before that (PoW, chat
+            // creation, throttling) leave the chat intact for the next request.
+            const failure = remoteTouched && activeSession && activeSession.id ? resetRemoteSession(activeSession) : null;
             if (clientGone) return;
             if (res.headersSent) {
                 if (!res.writableEnded) res.end();

@@ -45,6 +45,13 @@ function startMockDeepSeek() {
       const record = { body, auth, pow: req.headers['x-ds-pow-response'] };
       state.completions.push(record);
       const plan = await state.respond(body, auth, state.completions.length) || {};
+      if (plan.status && plan.status !== 200 && plan.stallBody) {
+        res.writeHead(plan.status, { 'Content-Type': 'application/json' });
+        res.write('{"code":');
+        state.openStreams.add(res);
+        res.on('close', () => state.openStreams.delete(res));
+        return; // never finish the error body
+      }
       if (plan.status && plan.status !== 200) {
         res.writeHead(plan.status, { 'Content-Type': 'application/json' });
         res.end(plan.errorBody || JSON.stringify({ code: plan.status, msg: 'error' }));
@@ -336,4 +343,64 @@ test('streamed tool calls carry an index and plain answers keep emoji', async ()
   assert.equal(toolDelta.function.name, 'read_file');
   assert.equal(events.at(-1).choices[0].finish_reason, 'tool_calls');
   assert.match(streamed.text, /data: \[DONE\]\n\n$/);
+});
+
+test('a stalled upstream error body times out and releases the agent session', async () => {
+  mock.state.respond = () => ({ status: 500, stallBody: true });
+  const started = Date.now();
+  const res = await chat({ model: 'deepseek-chat', user: 'stalled-error', messages: [{ role: 'user', content: 'x' }] });
+  assert.ok(res.status >= 500, res.text);
+  assert.ok(Date.now() - started < 5000);
+  assert.equal(internals.sessions.get('stalled-error').busy, false);
+});
+
+test('a throttled turn keeps the remote chat for the next request', async () => {
+  const first = await chat({ model: 'deepseek-chat', user: 'keep-chat', messages: [{ role: 'user', content: 'My name is Ann' }] });
+  assert.equal(first.status, 200, first.text);
+  const chatId = mock.state.completions.at(-1).body.chat_session_id;
+  mock.state.respond = () => ({ status: 400, errorBody: JSON.stringify({ msg: 'Too many messages in a short period' }) });
+  const throttled = await chat({ model: 'deepseek-chat', user: 'keep-chat', messages: [{ role: 'user', content: 'hi again' }] });
+  assert.equal(throttled.status, 429, throttled.text);
+  internals.accounts[0].cooldownUntil = 0;
+  mock.state.respond = () => ({ text: 'Ann' });
+  const next = await chat({ model: 'deepseek-chat', user: 'keep-chat', messages: [{ role: 'user', content: 'What is my name?' }] });
+  assert.equal(next.status, 200, next.text);
+  assert.equal(mock.state.completions.at(-1).body.chat_session_id, chatId);
+});
+
+test('latest-only clients keep their chat for tool results and changing system prompts', async () => {
+  mock.state.respond = (body, auth, n) => (n === 1
+    ? { text: '{"tool_call":{"name":"read_file","arguments":{"path":"/a"}}}' }
+    : { text: 'done' });
+  const first = await chat({ model: 'deepseek-chat', user: 'latest-only', tools: [READ_FILE_TOOL], messages: [{ role: 'system', content: 'time 10:00' }, { role: 'user', content: 'read /a' }] });
+  const call = first.json.choices[0].message.tool_calls[0];
+  // Only the tool result, as Responses clients with previous_response_id send it.
+  const second = await chat({ model: 'deepseek-chat', user: 'latest-only', tools: [READ_FILE_TOOL], messages: [{ role: 'system', content: 'time 10:01' }, { role: 'tool', tool_call_id: call.id, content: 'A CONTENT' }] });
+  assert.equal(second.status, 200, second.text);
+  const [a, b] = mock.state.completions.map(c => c.body);
+  assert.equal(b.chat_session_id, a.chat_session_id);
+  assert.match(b.prompt, /time 10:01/);
+  assert.match(b.prompt, /\[Tool Result\]\nA CONTENT/);
+});
+
+test('a client that disconnects mid-request stops further upstream calls', async () => {
+  let calls = 0;
+  mock.state.respond = async () => {
+    calls++;
+    await sleep(300);
+    return { text: '' }; // empty answers would normally trigger retries
+  };
+  const controller = new AbortController();
+  const pending = fetch(`${proxyUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: 'deepseek-chat', user: 'gone', messages: [{ role: 'user', content: 'x' }] }),
+    signal: controller.signal,
+  }).catch(() => null);
+  await sleep(100);
+  controller.abort();
+  await pending;
+  await sleep(1500);
+  assert.equal(calls, 1);
+  assert.equal(internals.sessions.get('gone').busy, false);
 });

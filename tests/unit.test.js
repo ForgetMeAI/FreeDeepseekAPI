@@ -896,3 +896,49 @@ test('screenshot extraction handles array content and only scans the current tur
   ]);
   assert.deepEqual(paths, [`MEDIA:${newShot}`]);
 });
+
+test('envelopes nested in other JSON or in foreign code fences are never executed', () => {
+  const nested = 'log {"event": {"tool_call": {"name":"terminal","arguments":{"command":"rm -rf ~/build"}}}}';
+  assert.equal(serverInternals.parseToolCall(nested), null);
+  const jsFence = 'Example:\n```javascript\nconst x = {"tool_call":{"name":"terminal","arguments":{"command":"git push --force"}}};\n```';
+  assert.equal(serverInternals.parseToolCall(jsFence), null);
+  const pyFence = '```python\nTOOL_CALL: terminal\narguments: {"command":"rm -rf /"}\n```';
+  assert.equal(serverInternals.parseToolCall(pyFence), null);
+});
+
+test('lenient repair keeps unambiguous escapes when other backslashes are raw', () => {
+  assert.deepEqual(serverInternals.parseJsonLenient('{"p":"C:\\\\Users\\me"}'), { p: 'C:\\Users\\me' });
+  assert.deepEqual(serverInternals.parseJsonLenient('{"p":"caf\\u00e9 \\d"}'), { p: 'café \\d' });
+});
+
+test('stream helpers never split emoji into lone surrogates', () => {
+  const content = 'x'.repeat(49) + '😀' + 'y'.repeat(79) + '🎉 done';
+  const response = {
+    id: 'ds-test', created: 1, model: 'deepseek-chat',
+    choices: [{ index: 0, message: { role: 'assistant', content, reasoning_content: content }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  };
+  for (const send of [serverInternals.sendOpenAIStream, serverInternals.sendAnthropicStream, serverInternals.sendResponsesStream]) {
+    let out = '';
+    send({ writeHead: () => {}, write: chunk => { out += chunk; }, end: () => {} }, response);
+    for (const line of out.split('\n').filter(l => l.startsWith('data: {'))) {
+      const decoded = JSON.stringify(JSON.parse(line.slice(6)));
+      assert.doesNotMatch(decoded, /\\ud[89ab][0-9a-f]{2}(?!\\ud[c-f])|(?<!\\ud[89ab][0-9a-f]{2})\\ud[c-f][0-9a-f]{2}/i);
+      const parsed = JSON.parse(line.slice(6));
+      const texts = JSON.stringify(parsed).match(/"(?:content|text|delta|reasoning_content)":"([^"]*)"/g) || [];
+      for (const t of texts) assert.equal(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(JSON.parse(`{${t}}`)[t.split('"')[1]]), false, t);
+    }
+  }
+});
+
+test('planSessionTurn sends system prompt changes along for latest-only clients', () => {
+  const session = serverInternals.createSession();
+  session.id = 'chat';
+  session.contextKey = 'old';
+  session.sentMessageKeys = ['k'];
+  const plan = serverInternals.planSessionTurn(session, [{ role: 'system', content: 'new' }, { role: 'user', content: 'hi' }], 'new');
+  assert.equal(plan.mode, 'delta');
+  assert.equal(plan.includeSystem, true);
+  const prompt = serverInternals.buildDeltaPrompt(plan.messages, [], '', 5000, 'NEW SYSTEM');
+  assert.match(prompt.prompt, /^NEW SYSTEM\n\nUser: hi$/);
+});
