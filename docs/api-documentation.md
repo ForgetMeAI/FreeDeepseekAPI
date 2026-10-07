@@ -321,9 +321,26 @@ and Search toggles:
 | `deepseek-reasoner-search`, `deepseek-r1-search` | ✓ | ✓ | |
 | `deepseek-expert`, `deepseek-v4-pro` | ✓ | – | deprecated: Expert/V4 Pro no longer exist |
 | `deepseek-expert-search` | ✓ | ✓ | deprecated |
-| `deepseek-vision` | | | unsupported: the proxy does not upload images |
+| `deepseek-vision` | – | – | needs `DEEPSEEK_IMAGE_UPLOAD=1` (see Images) |
 
 Unknown model names get `400 invalid_model`.
+
+### Images (experimental, `DEEPSEEK_IMAGE_UPLOAD=1`)
+
+Inline images (OpenAI `image_url` / Responses `input_image` data URLs,
+Anthropic base64 `image` blocks, also inside `tool_result`) are uploaded with
+the chat's account:
+
+1. PoW challenge for `target_path: /api/v0/file/upload_file`;
+2. `POST /api/v0/file/upload_file` (multipart field `file`, header
+   `X-DS-PoW-Response`) → `data.biz_data.id`;
+3. `GET /api/v0/file/fetch_files?file_ids=<id>` until the file status is
+   `SUCCESS` (failure statuses end the request with `502 image_upload_failed`);
+4. the completion carries the ids in `ref_file_ids`.
+
+A reused chat receives only the images of the new messages; a new chat the
+most recent `DEEPSEEK_MAX_IMAGES`. Remote `https://` image URLs are never
+fetched. In prompts each image appears as `[Image <hash> attached]`.
 
 ---
 
@@ -375,6 +392,9 @@ loaded automatically (see `.env.example` for the full list).
 | `DEEPSEEK_STREAM_KEEPALIVE_MS` | `10000` | Silence before a `: keep-alive` comment on streamed responses |
 | `DEEPSEEK_REQUEST_DEADLINE_MS` | `120000` | Budget for retry/continuation loops |
 | `DEEPSEEK_MAX_CONCURRENT` | `24` | In-flight completions before 503 |
+| `DEEPSEEK_IMAGE_UPLOAD` | `0` | Upload inline images to DeepSeek (experimental) |
+| `DEEPSEEK_MAX_IMAGES` / `DEEPSEEK_MAX_IMAGE_BYTES` | `4` / 8 MB | Image limits per new chat / per image |
+| `DEEPSEEK_FILE_TIMEOUT_MS` / `DEEPSEEK_FILE_POLL_MS` | `60000` / `1000` | Wait for DeepSeek to process an image |
 | `NON_INTERACTIVE` / `SKIP_ACCOUNT_MENU` | `0` | Start without the menu |
 
 Auth file format (`npm run auth` / `npm run auth:import`, keep it `0600`):
@@ -418,6 +438,6 @@ Auth file format (`npm run auth` / `npm run auth:import`, keep it `0600`):
 
 - Depends on the private DeepSeek Web contract; DeepSeek can change it at any time.
 - Tool calling is prompt-emulated: one call per turn, the model can still ignore the format.
-- Images and files are not uploaded.
+- Image upload is experimental and off by default; other files are not uploaded.
 - Usage numbers are estimates.
 - All agents on one account share its rate limits; use an account pool for parallel agents.

@@ -293,6 +293,16 @@ const MAX_SESSION_CONTEXT_CHARS = Math.max(
 // ("too many messages"); HTTP 401/403/429 keep DEEPSEEK_ACCOUNT_COOLDOWN_MS.
 const RATE_LIMIT_COOLDOWN_MS = envNumber('DEEPSEEK_RATE_LIMIT_COOLDOWN_MS', 60 * 1000, 1000);
 const DS_CLIENT_VERSION = process.env.DEEPSEEK_CLIENT_VERSION || '2.0.0';
+// Image understanding: DeepSeek Web reads images uploaded through its file
+// API and referenced by ref_file_ids. Opt-in until verified against the live
+// Web API; without it images become short text markers.
+const IMAGE_UPLOAD_ENABLED = isTruthy(process.env.DEEPSEEK_IMAGE_UPLOAD || '');
+const MAX_IMAGES_PER_REQUEST = Math.floor(envNumber('DEEPSEEK_MAX_IMAGES', 4, 1));
+const MAX_IMAGE_BYTES = Math.floor(envNumber('DEEPSEEK_MAX_IMAGE_BYTES', 8 * 1024 * 1024, 1024));
+const DS_FILE_TIMEOUT_MS = envNumber('DEEPSEEK_FILE_TIMEOUT_MS', 60000, 1000);
+const DS_FILE_POLL_MS = envNumber('DEEPSEEK_FILE_POLL_MS', 1000, 50);
+const COMPLETION_PATH = '/api/v0/chat/completion';
+const FILE_UPLOAD_PATH = '/api/v0/file/upload_file';
 function buildBaseHeaders(config = DS_CONFIG) {
     return {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
@@ -562,8 +572,10 @@ const MODEL_CONFIGS = {
     'deepseek-vision': {
         ...unifiedModel({ legacy: 'Vision mode was merged into the unified mode' }),
         capabilities: { reasoning: false, web_search: false, files: true, vision: true },
-        supported: false,
-        unavailable_reason: 'DeepSeek Web now understands images in its unified mode, but this proxy does not upload images yet. Use deepseek-chat for text.',
+        supported: IMAGE_UPLOAD_ENABLED,
+        unavailable_reason: IMAGE_UPLOAD_ENABLED
+            ? undefined
+            : 'Image upload is disabled. Set DEEPSEEK_IMAGE_UPLOAD=1 to send images to the DeepSeek Web unified mode.',
     },
 };
 
@@ -643,10 +655,10 @@ function isSupportedModel(model) { return resolveModelConfig(model).supported ==
 
 // A PoW answer is bound to one completion request, so every completion
 // (including the one after a session recreate) solves a fresh challenge.
-async function createPowHeader(account, signal) {
+async function createPowHeader(account, signal, targetPath = COMPLETION_PATH) {
     const cr = await dsFetch(dsUrl('/api/v0/chat/create_pow_challenge'), {
         method: 'POST', headers: account.headers, signal,
-        body: JSON.stringify({ target_path: '/api/v0/chat/completion' })
+        body: JSON.stringify({ target_path: targetPath })
     });
     const chalText = await cr.text();
     if (!cr.ok) {
@@ -666,8 +678,84 @@ async function createPowHeader(account, signal) {
     return Buffer.from(JSON.stringify({
         algorithm: challenge.algorithm, challenge: challenge.challenge,
         salt: challenge.salt, answer: answer,
-        signature: challenge.signature, target_path: '/api/v0/chat/completion'
+        signature: challenge.signature, target_path: targetPath
     })).toString('base64');
+}
+
+function sleepWithSignal(ms, signal) {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(resolve, ms);
+        signal?.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason || new Error('request aborted')); }, { once: true });
+    });
+}
+
+// Status of one uploaded file in a fetch_files response. Read defensively:
+// the Web API has returned both lists and id-keyed maps.
+function extractUploadedFileStatus(json, fileId) {
+    const biz = json?.data?.biz_data;
+    const list = Array.isArray(biz?.files) ? biz.files
+        : Array.isArray(biz) ? biz
+        : (biz && typeof biz === 'object' && biz[fileId]) ? [biz[fileId]]
+        : (biz && (biz.id || biz.file_id)) ? [biz] : [];
+    const entry = list.find(file => file && (file.id === fileId || file.file_id === fileId)) || (list.length === 1 ? list[0] : null);
+    return { status: String(entry?.status || '').toUpperCase(), error: entry?.error_msg || entry?.error || null };
+}
+
+const FILE_READY_STATUS = /^(?:SUCCESS|PARSED|DONE|COMPLETED?|FINISHED|READY)$/;
+const FILE_FAILED_STATUS = /FAIL|ERROR|REJECT|UNSUPPORT|INVALID|EMPTY/;
+
+// Uploads one image with the account that owns the chat, then waits until
+// DeepSeek has processed it. Returns the file id for ref_file_ids.
+async function uploadImageToDeepSeek(account, image, signal) {
+    const powB64 = await createPowHeader(account, signal, FILE_UPLOAD_PATH);
+    const form = new FormData();
+    form.append('file', new Blob([image.data], { type: image.mime }), image.filename);
+    const headers = { ...account.headers, 'X-DS-PoW-Response': powB64, 'x-file-size': String(image.data.length) };
+    delete headers['Content-Type'];  // fetch sets the multipart boundary
+    const resp = await dsFetch(dsUrl(FILE_UPLOAD_PATH), { method: 'POST', headers, body: form, signal }, DS_FILE_TIMEOUT_MS);
+    const { json, text } = await readDeepSeekJsonResponse(resp, 'file upload', account);
+    if (!resp.ok) throw createUpstreamHttpError(resp.status, text, resp.headers.get('retry-after'));
+    const biz = json?.data?.biz_data;
+    const fileId = biz?.id || biz?.file_id || biz?.file?.id;
+    if (!fileId) throw new Error(`DeepSeek file upload returned no file id. First chars: ${String(text || '').substring(0, 160)}`);
+
+    let { status } = { status: String(biz?.status || '').toUpperCase() };
+    const deadline = Date.now() + DS_FILE_TIMEOUT_MS;
+    const statusHeaders = { ...account.headers };
+    delete statusHeaders['Content-Type'];
+    while (!FILE_READY_STATUS.test(status)) {
+        if (FILE_FAILED_STATUS.test(status)) throw new Error(`DeepSeek could not process the image (status ${status})`);
+        if (Date.now() > deadline) throw timeoutError(`DeepSeek did not finish processing the image within ${DS_FILE_TIMEOUT_MS}ms`);
+        await sleepWithSignal(DS_FILE_POLL_MS, signal);
+        const pr = await dsFetch(dsUrl(`/api/v0/file/fetch_files?file_ids=${encodeURIComponent(fileId)}`), { method: 'GET', headers: statusHeaders, signal });
+        const polled = await readDeepSeekJsonResponse(pr, 'file status', account);
+        if (!pr.ok) throw createUpstreamHttpError(pr.status, polled.text);
+        const state = extractUploadedFileStatus(polled.json, fileId);
+        status = state.status;
+        if (state.error && FILE_FAILED_STATUS.test(status)) throw new Error(`DeepSeek could not process the image: ${state.error}`);
+    }
+    return fileId;
+}
+
+// Uploads the images of a request once per account (files belong to the
+// account that uploaded them).
+async function uploadImagesForAccount(account, images, cache, signal, agentTag) {
+    if (!images || images.length === 0) return [];
+    const cacheKey = `${account.id}:${images.map(image => image.hash).join(',')}`;
+    if (cache?.has(cacheKey)) return cache.get(cacheKey);
+    const ids = [];
+    try {
+        for (const image of images) ids.push(await uploadImageToDeepSeek(account, image, signal));
+    } catch (error) {
+        if (signal?.aborted || isAccountLevelError(error)) throw error;
+        const failure = new Error(`DeepSeek image upload failed: ${error.message}`);
+        failure.status = 502;
+        failure.type = 'image_upload_failed';
+        throw failure;
+    }
+    console.log(`${agentTag} Uploaded ${ids.length} image(s) to DeepSeek`);
+    cache?.set(cacheKey, ids);
+    return ids;
 }
 
 async function createRemoteChat(session, account, agentTag, label = 'session create', signal) {
@@ -692,13 +780,13 @@ async function createRemoteChat(session, account, agentTag, label = 'session cre
     console.log(`${agentTag} Created new session: ${session.id}`);
 }
 
-async function postCompletion(session, account, modelCfg, promptText, signal) {
+async function postCompletion(session, account, modelCfg, promptText, signal, refFileIds = []) {
     const powB64 = await createPowHeader(account, signal);
     throwIfAborted(signal);
     const payload = {
         chat_session_id: session.id,
         parent_message_id: session.parentMessageId,
-        prompt: promptText, ref_file_ids: [],
+        prompt: promptText, ref_file_ids: refFileIds,
         thinking_enabled: modelCfg.thinking_enabled, search_enabled: modelCfg.search_enabled,
         action: null, preempt: false,
     };
@@ -720,7 +808,9 @@ function throwIfRateLimited(account, status, errText, retryAfter) {
     throw createUpstreamHttpError(429, errText, retryAfter || String(Math.ceil(RATE_LIMIT_COOLDOWN_MS / 1000)));
 }
 
-async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', freshSessionPrompt = prompt, session = getOrCreateAgentSession(agentId), signal = null) {
+// attachments: { delta, full, cache } — images to reference in a reused chat
+// (delta) or a new chat (full), and per-account uploaded file ids.
+async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', freshSessionPrompt = prompt, session = getOrCreateAgentSession(agentId), signal = null, attachments = null) {
     const modelCfg = resolveModelConfig(model);
     const hadRemoteSession = Boolean(session.id);
     const account = selectAccountForSession(session);
@@ -749,7 +839,9 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
         console.log(`${agentTag} Reusing session: ${session.id} (parent: ${session.parentMessageId}, msg#${session.messageCount})`);
     }
 
-    const resp = await postCompletion(session, account, modelCfg, effectivePrompt, signal);
+    const images = attachments ? (startsFreshChat ? attachments.full : attachments.delta) : [];
+    const refFileIds = await uploadImagesForAccount(account, images, attachments?.cache, signal, agentTag);
+    const resp = await postCompletion(session, account, modelCfg, effectivePrompt, signal, refFileIds);
 
     if (resp.status !== 200) {
         // Pass Retry-After so a 429 honors the server-requested cooldown (#16).
@@ -766,7 +858,10 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
             resetRemoteSession(session);
             await createRemoteChat(session, account, agentTag, 'session recreate', signal);
             effectivePrompt = freshSessionPrompt;
-            const resp2 = await postCompletion(session, account, modelCfg, effectivePrompt, signal);
+            const fullRefFileIds = attachments
+                ? await uploadImagesForAccount(account, attachments.full, attachments.cache, signal, agentTag)
+                : [];
+            const resp2 = await postCompletion(session, account, modelCfg, effectivePrompt, signal, fullRefFileIds);
             if (!resp2.ok) {
                 const retryAfter2 = resp2.headers.get('retry-after');
                 markAccountFailure(account, resp2.status, 'completion after session recreate', retryAfter2);
@@ -1511,6 +1606,71 @@ function describeAttachment(kind, reference) {
     return `[${kind}: ${value}]`;
 }
 
+const decodedImageCache = new WeakMap();
+
+// Inline image of a content part (OpenAI image_url / Responses input_image
+// data URLs, Anthropic base64 sources) as { mime, data, hash, filename }, or
+// null for remote URLs and anything that is not a usable image.
+function decodeImagePart(part) {
+    if (!part || typeof part !== 'object') return null;
+    if (decodedImageCache.has(part)) return decodedImageCache.get(part);
+    let mime = '';
+    let base64 = '';
+    if (part.type === 'image' && part.source?.type === 'base64') {
+        mime = String(part.source.media_type || '');
+        base64 = String(part.source.data || '');
+    } else if (part.type === 'image_url' || part.type === 'input_image') {
+        const url = part.image_url?.url ?? part.image_url ?? part.url;
+        const match = typeof url === 'string' ? url.match(/^data:([\w.+-]+\/[\w.+-]+)?((?:;[^;,]*)*),([\s\S]*)$/) : null;
+        if (match && /;base64/i.test(match[2])) {
+            mime = match[1] || 'image/png';
+            base64 = match[3];
+        }
+    }
+    let image = null;
+    if (/^image\//i.test(mime) && base64) {
+        const data = Buffer.from(base64.replace(/\s+/g, ''), 'base64');
+        if (data.length > 0 && data.length <= MAX_IMAGE_BYTES) {
+            const hash = crypto.createHash('sha256').update(data).digest('hex').substring(0, 12);
+            const extension = (mime.split('/')[1] || 'png').replace(/[^\w]/g, '').substring(0, 8) || 'png';
+            image = { mime, data, hash, filename: `image-${hash}.${extension}` };
+        }
+    }
+    decodedImageCache.set(part, image);
+    return image;
+}
+
+function describeImagePart(part) {
+    const image = decodeImagePart(part);
+    // The marker depends only on the image itself, so message fingerprints
+    // stay stable across turns.
+    if (image) return IMAGE_UPLOAD_ENABLED ? `[Image ${image.hash} attached]` : '[Image attached; not visible through this proxy]';
+    return describeAttachment('Image', part.image_url?.url ?? part.image_url ?? part.url ?? part.source?.url ?? part.source?.data);
+}
+
+// Inline images of the given messages in order (including images inside
+// Anthropic tool results), de-duplicated, keeping the most recent `limit`.
+function collectImages(messages, limit = MAX_IMAGES_PER_REQUEST) {
+    const images = [];
+    const seen = new Set();
+    const visit = (content) => {
+        if (!Array.isArray(content)) return;
+        for (const part of content) {
+            if (!part || typeof part !== 'object') continue;
+            if (part.type === 'tool_result') { visit(part.content); continue; }
+            const image = decodeImagePart(part);
+            if (image && !seen.has(image.hash)) {
+                seen.add(image.hash);
+                images.push(image);
+            }
+        }
+    };
+    for (const msg of messages || []) {
+        if (msg && !isSystemRole(msg.role)) visit(msg.content);
+    }
+    return images.slice(-limit);
+}
+
 function normalizeMessageContent(content) {
     if (content === null || content === undefined) return '';
     if (typeof content === 'string') return content;
@@ -1524,7 +1684,7 @@ function normalizeMessageContent(content) {
             // carry signatures/encrypted payloads, not conversation text.
             if (part.type === 'thinking' || part.type === 'redacted_thinking' || part.type === 'reasoning') return '';
             if (part.type === 'image_url' || part.type === 'input_image' || part.type === 'image') {
-                return describeAttachment('Image', part.image_url?.url ?? part.image_url ?? part.url ?? part.source?.url ?? part.source?.data);
+                return describeImagePart(part);
             }
             if (part.type === 'file' || part.type === 'input_file' || part.type === 'document') {
                 return describeAttachment('File', part.file?.filename ?? part.filename ?? part.title ?? part.file_url ?? part.source?.url ?? part.source?.data);
@@ -1564,10 +1724,11 @@ function normalizeResponsesInput(input) {
     const messages = [];
     for (const item of input) {
         if (!item || typeof item !== 'object') continue;
+        // Content parts stay raw (images included); formatting normalizes them.
         if (item.type === 'message') {
-            messages.push({ role: item.role || 'user', content: normalizeMessageContent(item.content) });
+            messages.push({ role: item.role || 'user', content: item.content });
         } else if (item.role) {
-            messages.push({ role: item.role, content: normalizeMessageContent(item.content) });
+            messages.push({ role: item.role, content: item.content });
         } else if (item.type === 'function_call') {
             // The assistant's earlier tool request. Without it the following
             // function_call_output has no visible cause in the prompt.
@@ -1577,7 +1738,7 @@ function normalizeResponsesInput(input) {
                 function: { name: item.name, arguments: typeof item.arguments === 'string' ? item.arguments : JSON.stringify(item.arguments || {}) },
             }] });
         } else if (item.type === 'function_call_output') {
-            messages.push({ role: 'tool', tool_call_id: item.call_id, content: normalizeMessageContent(item.output) });
+            messages.push({ role: 'tool', tool_call_id: item.call_id, content: item.output });
         } else if (item.type === 'input_text') {
             messages.push({ role: 'user', content: item.text || '' });
         }
@@ -1599,11 +1760,11 @@ function normalizeApiParams(params, apiMode) {
                 }
             } else if (msg.role === 'user' && Array.isArray(msg.content) && msg.content.some(part => part && part.type === 'tool_result')) {
                 for (const part of msg.content) {
-                    if (part && part.type === 'tool_result') messages.push({ role: 'tool', tool_call_id: part.tool_use_id, content: normalizeMessageContent(part.content) });
-                    else messages.push({ role: 'user', content: normalizeMessageContent(part) });
+                    if (part && part.type === 'tool_result') messages.push({ role: 'tool', tool_call_id: part.tool_use_id, content: part.content });
+                    else messages.push({ role: 'user', content: [part] });
                 }
             } else {
-                messages.push({ role: msg.role || 'user', content: normalizeMessageContent(msg.content) });
+                messages.push({ role: msg.role || 'user', content: msg.content });
             }
         }
         return {
@@ -2637,15 +2798,23 @@ const server = http.createServer(async (req, res) => {
             }
             if (promptCompacted) markContextCompacted(res);
 
+            // Images: the new messages' images go into a reused chat, the
+            // conversation's most recent images into a new chat.
+            const attachments = IMAGE_UPLOAD_ENABLED ? {
+                delta: plan.mode === 'delta' ? collectImages(plan.messages) : [],
+                full: collectImages(messages),
+                cache: new Map(),
+            } : null;
+
             let lastAccount = null;
             // Calls DeepSeek, replaying the request on another account when the
             // current one is rejected (401/403) or throttled (429). A replay
             // always starts a fresh chat, so it gets the self-contained prompt.
-            const callDeepSeek = async (promptText, freshPrompt = promptText) => {
+            const callDeepSeek = async (promptText, freshPrompt = promptText, callAttachments = attachments) => {
                 for (let attempt = 0; ; attempt++) {
                     throwIfAborted(requestAbort.signal);
                     try {
-                        const call = await askDeepSeekStream(promptText, agentId, requestedModel, freshPrompt, session, requestAbort.signal);
+                        const call = await askDeepSeekStream(promptText, agentId, requestedModel, freshPrompt, session, requestAbort.signal, callAttachments);
                         remoteTouched = true;
                         lastAccount = call.account;
                         return call;
@@ -2905,7 +3074,8 @@ const server = http.createServer(async (req, res) => {
                 );
                 let continuationCall;
                 try {
-                    continuationCall = await callDeepSeek('continue', continuationRecoveryPrompt);
+                    // The reused chat already has this turn's images.
+                    continuationCall = await callDeepSeek('continue', continuationRecoveryPrompt, attachments && { ...attachments, delta: [] });
                 } catch (error) {
                     // The answer so far is still useful: return it as truncated
                     // (finish_reason 'length') instead of failing the request.

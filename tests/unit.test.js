@@ -982,3 +982,18 @@ test('an account cooldown without a ready alternative keeps the sticky chat', (t
   assert.equal(session.id, 'kept-chat');
   assert.equal(session.accountId, 'only');
 });
+
+test('systemd unit runs unprivileged, non-interactive and fail-closed', () => {
+  const unit = fs.readFileSync(path.join(ROOT, 'deploy', 'free-deepseek-api.service'), 'utf8');
+  assert.match(unit, /^User=freedeepseek$/m);
+  assert.doesNotMatch(unit, /^User=root$/m);
+  assert.match(unit, /^Environment=NON_INTERACTIVE=1$/m);
+  assert.match(unit, /^Environment=HOST=127\.0\.0\.1$/m);
+  assert.match(unit, /^Environment=REQUIRE_PROXY_API_KEY=1$/m);
+  assert.match(unit, /^Environment=PROXY_API_KEY_FILE=\/etc\/free-deepseek-api\/proxy-api-key$/m);
+  assert.match(unit, /^NoNewPrivileges=true$/m);
+  assert.match(unit, /^ProtectSystem=strict$/m);
+  assert.match(unit, /^Restart=on-failure$/m);
+  // Node's JIT needs writable+executable memory.
+  assert.doesNotMatch(unit, /^MemoryDenyWriteExecute=true$/m);
+});

@@ -38,6 +38,7 @@ ForgetMeAI: https://t.me/forgetmeai
 - [Windows запуск](#-windows-запуск)
 - [Linux / Chromium запуск](#-linux--chromium-запуск)
 - [VPS / headless запуск](#-vps--headless-запуск)
+- [Постоянный сервис на VPS (systemd)](#-постоянный-сервис-на-vps-systemd)
 - [Rootless Podman](#-rootless-podman)
 - [Diagnostics / doctor](#-diagnostics--doctor)
 - [Session reuse и сброс чатов](#-session-reuse-и-сброс-чатов)
@@ -225,6 +226,45 @@ DEEPSEEK_TOKEN="<token>" npm run auth:import -- --input ./cookies.json
 ```
 
 > Важно: `deepseek-auth.json` — это доступ к вашему DeepSeek Web login. Не коммитьте, не публикуйте, храните с правами `0600`.
+
+---
+
+## 🛠 Постоянный сервис на VPS (systemd)
+
+Вариант без контейнера: proxy работает как системный сервис под отдельным
+пользователем, перезапускается при сбоях и стартует вместе с сервером. Нужен
+Node.js 18+ (`node` в `/usr/bin` или `/usr/local/bin`).
+
+```bash
+# 1. Пользователь и код
+sudo useradd --system --home /opt/FreeDeepseekAPI --shell /usr/sbin/nologin freedeepseek
+sudo git clone https://github.com/ForgetMeAI/FreeDeepseekAPI /opt/FreeDeepseekAPI
+
+# 2. Секреты: auth-файл из `npm run auth` на домашнем ПК и ключ для клиентов
+sudo install -d -m 0750 -o root -g freedeepseek /etc/free-deepseek-api
+sudo install -m 0600 -o freedeepseek -g freedeepseek ./deepseek-auth.json /etc/free-deepseek-api/deepseek-auth.json
+openssl rand -hex 32 | sudo install -m 0600 -o freedeepseek -g freedeepseek /dev/stdin /etc/free-deepseek-api/proxy-api-key
+
+# 3. Сервис
+sudo cp /opt/FreeDeepseekAPI/deploy/free-deepseek-api.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now free-deepseek-api
+
+# 4. Проверка
+curl -fsS http://127.0.0.1:9655/readyz
+sudo -u freedeepseek env DEEPSEEK_AUTH_PATH=/etc/free-deepseek-api/deepseek-auth.json node /opt/FreeDeepseekAPI/scripts/doctor.js
+journalctl -u free-deepseek-api -f
+```
+
+- Сервис слушает только `127.0.0.1:9655` и требует ключ
+  (`Authorization: Bearer <ключ>` или `x-api-key`). Ключ лежит в
+  `/etc/free-deepseek-api/proxy-api-key`.
+- Доступ снаружи — через reverse proxy с HTTPS (nginx/Caddy) или SSH-туннель.
+  Если нужно слушать сеть напрямую, задайте `HOST=0.0.0.0` в
+  `/etc/free-deepseek-api/env` (туда же — любые `DEEPSEEK_*` настройки).
+- Обновление: `cd /opt/FreeDeepseekAPI && sudo git pull && sudo systemctl restart free-deepseek-api`.
+- Новый логин DeepSeek: замените `/etc/free-deepseek-api/deepseek-auth.json` и
+  перезапустите сервис.
 
 ---
 
@@ -605,10 +645,32 @@ FreeDeepseekAPI принимает:
 | `deepseek-v4-pro` | да | нет | устаревший: V4 Pro отключён, отвечает V4.1-Flash |
 | `deepseek-expert-search` | да | да | устаревший alias, теперь работает |
 
-`deepseek-vision` по-прежнему недоступен: веб-чат понимает картинки в едином
-режиме, но proxy пока не загружает изображения в DeepSeek. Картинки из
-запросов заменяются коротким маркером `[Image attached; not visible through
-this proxy]` вместо вставки base64 в промпт.
+### Картинки (экспериментально)
+
+Веб-чат понимает изображения в едином режиме. Proxy умеет загружать их в
+DeepSeek так же, как это делает веб-клиент (`/api/v0/file/upload_file` с PoW,
+ожидание обработки, `ref_file_ids` в completion). Пока это не проверено на
+живом DeepSeek, функция выключена по умолчанию:
+
+```bash
+DEEPSEEK_IMAGE_UPLOAD=1 npm start
+```
+
+- принимаются встроенные картинки: OpenAI `image_url` / Responses
+  `input_image` с `data:image/...;base64,...` и Anthropic `image` с
+  `source.type: "base64"` (в том числе внутри `tool_result`);
+- ссылки `https://...` не скачиваются (защита от SSRF) — модель видит только
+  адрес;
+- в уже открытый чат загружаются только картинки новых сообщений, в новый чат —
+  последние `DEEPSEEK_MAX_IMAGES` (4) картинок разговора; размер одной картинки
+  — до `DEEPSEEK_MAX_IMAGE_BYTES` (8 МБ);
+- если DeepSeek не смог обработать картинку, запрос завершается ошибкой `502
+  image_upload_failed`, а не тихим ответом «вслепую»;
+- с включённым флагом `deepseek-vision` появляется в `/v1/models` (это тот же
+  единый режим).
+
+Без флага картинки заменяются коротким маркером `[Image attached; not visible
+through this proxy]` вместо вставки base64 в промпт.
 
 Полный маппинг:
 
