@@ -294,9 +294,14 @@ const MAX_SESSION_CONTEXT_CHARS = Math.max(
 const RATE_LIMIT_COOLDOWN_MS = envNumber('DEEPSEEK_RATE_LIMIT_COOLDOWN_MS', 60 * 1000, 1000);
 const DS_CLIENT_VERSION = process.env.DEEPSEEK_CLIENT_VERSION || '2.0.0';
 // Image understanding: DeepSeek Web reads images uploaded through its file
-// API and referenced by ref_file_ids. Opt-in until verified against the live
-// Web API; without it images become short text markers.
-const IMAGE_UPLOAD_ENABLED = isTruthy(process.env.DEEPSEEK_IMAGE_UPLOAD || '');
+// API and referenced by ref_file_ids. Live image upload/status/reference flow
+// was verified on 2026-10-07. Keep the opt-out explicit for deployments that
+// need to prevent upstream image uploads.
+function imageUploadEnabled(env = process.env) {
+    const value = env.DEEPSEEK_IMAGE_UPLOAD;
+    return value === undefined ? true : isTruthy(String(value));
+}
+const IMAGE_UPLOAD_ENABLED = imageUploadEnabled();
 const MAX_IMAGES_PER_REQUEST = Math.floor(envNumber('DEEPSEEK_MAX_IMAGES', 4, 1));
 // A 10 MB request body carries at most ~7.5 MB of base64-decoded images.
 const MAX_IMAGE_BYTES = Math.floor(envNumber('DEEPSEEK_MAX_IMAGE_BYTES', 7 * 1024 * 1024, 1024));
@@ -720,6 +725,22 @@ function extractUploadedFileStatus(json, fileId) {
     return { status: String(entry?.status || '').toUpperCase(), error: entry?.error_msg || entry?.error || null };
 }
 
+// DeepSeek can report throttling inside an HTTP 200 business-error envelope.
+// Read a message only when the numeric biz_code says the envelope is an error;
+// normal successful response content is never inspected for rate-limit text.
+function throwIfImageBusinessRateLimited(account, resp, json) {
+    const bizCode = json?.data?.biz_code;
+    if (!Number.isSafeInteger(bizCode) || bizCode === 0) return;
+    const bizData = json?.data?.biz_data;
+    const message = [
+        json?.data?.biz_msg, json?.data?.biz_message, json?.data?.message, json?.data?.msg,
+        bizData?.biz_msg, bizData?.biz_message, bizData?.message, bizData?.msg, bizData?.error_msg,
+    ].find(value => typeof value === 'string' && value.length <= 2048);
+    if (!message || !isRateLimitError(message)) return;
+    // Do not expose upstream envelope text in a proxy error or log.
+    throwIfRateLimited(account, resp.status, `Too many messages (DeepSeek business code ${bizCode})`, resp.headers.get('retry-after'));
+}
+
 const FILE_READY_STATUS = /^(?:SUCCESS|PARSED|DONE|COMPLETED?|FINISHED|READY)$/;
 const FILE_FAILED_STATUS = /FAIL|ERROR|REJECT|UNSUPPORT|INVALID|EMPTY/;
 
@@ -733,7 +754,11 @@ async function uploadImageToDeepSeek(account, image, signal, deadlineAt = Infini
     delete headers['Content-Type'];  // fetch sets the multipart boundary
     const resp = await dsFetch(dsUrl(FILE_UPLOAD_PATH), { method: 'POST', headers, body: form, signal }, DS_FILE_TIMEOUT_MS);
     const { json, text } = await readDeepSeekJsonResponse(resp, 'file upload', account);
-    if (!resp.ok) throw createUpstreamHttpError(resp.status, text, resp.headers.get('retry-after'));
+    if (!resp.ok) {
+        throwIfRateLimited(account, resp.status, text, resp.headers.get('retry-after'));
+        throw createUpstreamHttpError(resp.status, text, resp.headers.get('retry-after'));
+    }
+    throwIfImageBusinessRateLimited(account, resp, json);
     const biz = json?.data?.biz_data;
     const fileId = biz?.id || biz?.file_id || biz?.file?.id;
     if (!fileId) throw new Error(`DeepSeek file upload returned no file id. First chars: ${String(text || '').substring(0, 160)}`);
@@ -748,7 +773,11 @@ async function uploadImageToDeepSeek(account, image, signal, deadlineAt = Infini
         await sleepWithSignal(DS_FILE_POLL_MS, signal);
         const pr = await dsFetch(dsUrl(`/api/v0/file/fetch_files?file_ids=${encodeURIComponent(fileId)}`), { method: 'GET', headers: statusHeaders, signal });
         const polled = await readDeepSeekJsonResponse(pr, 'file status', account);
-        if (!pr.ok) throw createUpstreamHttpError(pr.status, polled.text);
+        if (!pr.ok) {
+            throwIfRateLimited(account, pr.status, polled.text, pr.headers.get('retry-after'));
+            throw createUpstreamHttpError(pr.status, polled.text, pr.headers.get('retry-after'));
+        }
+        throwIfImageBusinessRateLimited(account, pr, polled.json);
         const state = extractUploadedFileStatus(polled.json, fileId);
         status = state.status;
         if (state.error && FILE_FAILED_STATUS.test(status)) throw new Error(`DeepSeek could not process the image: ${state.error}`);
@@ -3423,6 +3452,7 @@ module.exports = {
         collectImages,
         uploadedFileCache,
         isRateLimitError,
+        imageUploadEnabled,
         loadDotEnv,
         MODEL_CONFIGS,
         SUPPORTED_MODEL_IDS,

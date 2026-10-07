@@ -786,7 +786,9 @@ test('message normalization omits inline images and earlier reasoning blocks', (
   ]);
   assert.ok(text.length < 300, text);
   assert.match(text, /look/);
-  assert.match(text, /\[Image attached; not visible through this proxy\]/);
+  assert.match(text, serverInternals.imageUploadEnabled()
+    ? /\[Image [0-9a-f]{12} attached\]/
+    : /\[Image attached; not visible through this proxy\]/);
   assert.match(text, /\[Image: https:\/\/example\.com\/cat\.png\]/);
   assert.doesNotMatch(text, /secret|sig/);
 });
@@ -866,7 +868,31 @@ test('every supported model alias targets the unified DeepSeek Web mode (#31)', 
   assert.equal(serverInternals.resolveModelConfig('deepseek-v4-pro').thinking_enabled, true);
   assert.equal(serverInternals.resolveModelConfig('deepseek-v4-flash').thinking_enabled, false);
   assert.equal(serverInternals.resolveModelConfig('deepseek-expert-search').supported, true);
-  assert.equal(serverInternals.resolveModelConfig('deepseek-vision').supported, false);
+  assert.equal(serverInternals.resolveModelConfig('deepseek-vision').supported, serverInternals.imageUploadEnabled());
+});
+
+test('image uploads default on and retain the explicit zero opt-out', () => {
+  assert.equal(serverInternals.imageUploadEnabled({}), true);
+  assert.equal(serverInternals.imageUploadEnabled({ DEEPSEEK_IMAGE_UPLOAD: '1' }), true);
+  assert.equal(serverInternals.imageUploadEnabled({ DEEPSEEK_IMAGE_UPLOAD: '0' }), false);
+  assert.equal(serverInternals.imageUploadEnabled({ DEEPSEEK_IMAGE_UPLOAD: 'false' }), false, 'existing false-like opt-outs remain disabled');
+
+  // Check the flag at module initialization, including its actual model and
+  // message-normalization behavior, rather than only the parsing helper.
+  for (const enabled of [true, false]) {
+    const result = runNode(['-e', `
+      if (${enabled}) delete process.env.DEEPSEEK_IMAGE_UPLOAD;
+      else process.env.DEEPSEEK_IMAGE_UPLOAD = '0';
+      const api = require('./server.js').__test;
+      const text = api.normalizeMessageContent([{ type: 'image_url', image_url: { url: 'data:image/png;base64,QUJD' } }]);
+      console.log(JSON.stringify({ supported: api.resolveModelConfig('deepseek-vision').supported, text }));
+    `]);
+    assert.equal(result.status, 0, result.stderr);
+    const actual = JSON.parse(result.stdout);
+    assert.equal(actual.supported, enabled);
+    assert.match(actual.text, enabled ? /\[Image [0-9a-f]{12} attached\]/ : /not visible through this proxy/);
+    assert.doesNotMatch(actual.text, /base64|QUJD/);
+  }
 });
 
 test('rate-limit detector recognizes DeepSeek throttling messages', () => {

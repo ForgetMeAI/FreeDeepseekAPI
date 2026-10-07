@@ -10,7 +10,7 @@ const PNG_2 = Buffer.concat([PNG, Buffer.from('second image')]);
 const dataUrl = (buffer) => `data:image/png;base64,${buffer.toString('base64')}`;
 
 function startMock() {
-  const state = { pows: [], uploads: [], polls: 0, completions: [], fileStatus: () => 'SUCCESS', files: 0, chats: 0 };
+  const state = { pows: [], uploads: [], polls: 0, completions: [], fileStatus: () => 'SUCCESS', uploadReply: null, pollReply: null, files: 0, chats: 0 };
   const server = http.createServer((req, res) => {
     const chunks = [];
     req.on('data', chunk => chunks.push(chunk));
@@ -25,11 +25,13 @@ function startMock() {
       if (req.url === '/api/v0/file/upload_file') {
         const id = `file-${++state.files}`;
         state.uploads.push({ id, contentType: req.headers['content-type'], pow: req.headers['x-ds-pow-response'], body: raw });
+        if (state.uploadReply) return json(state.uploadReply.status, state.uploadReply.body);
         return json(200, { code: 0, data: { biz_code: 0, biz_data: { id, status: 'PENDING', file_name: 'image.png' } } });
       }
       if (req.url.startsWith('/api/v0/file/fetch_files')) {
         state.polls++;
         const id = new URL(req.url, 'http://x').searchParams.get('file_ids');
+        if (state.pollReply) return json(state.pollReply.status, state.pollReply.body);
         return json(200, { code: 0, data: { biz_code: 0, biz_data: { files: [{ id, status: state.fileStatus(id, state.polls) }] } } });
       }
       if (req.url === '/api/v0/chat/completion') {
@@ -78,7 +80,7 @@ test.beforeEach(() => {
   });
   internals.sessions.clear();
   internals.uploadedFileCache.clear();
-  Object.assign(mock.state, { pows: [], uploads: [], polls: 0, completions: [], files: 0, fileStatus: () => 'SUCCESS' });
+  Object.assign(mock.state, { pows: [], uploads: [], polls: 0, completions: [], files: 0, uploadReply: null, pollReply: null, fileStatus: () => 'SUCCESS' });
 });
 
 async function post(path, body) {
@@ -106,6 +108,57 @@ test('OpenAI image_url data URLs are uploaded and referenced by ref_file_ids', a
   assert.deepEqual(completion.ref_file_ids, ['file-1']);
   assert.match(completion.prompt, /\[Image [0-9a-f]{12} attached\]/);
   assert.doesNotMatch(completion.prompt, /base64/);
+});
+
+test('rate-limit messages in HTTP 200 business errors and HTTP 400 upload errors are classified', async t => {
+  const body = { model: 'deepseek-vision', user: 'vision-upload-rate-limit', messages: [
+    { role: 'user', content: [{ type: 'image_url', image_url: { url: dataUrl(PNG) } }] },
+  ] };
+
+  const resetCase = () => {
+    internals.accounts[0].cooldownUntil = 0;
+    internals.accounts[0].failures = 0;
+    internals.sessions.clear();
+    internals.uploadedFileCache.clear();
+    Object.assign(mock.state, { pows: [], uploads: [], polls: 0, completions: [], files: 0, uploadReply: null, pollReply: null });
+  };
+
+  await t.test('HTTP 200 nonzero biz_code on upload', async () => {
+    resetCase();
+    mock.state.uploadReply = {
+      status: 200,
+      body: { code: 0, data: { biz_code: 1234, biz_msg: 'Too many messages in a short period' } },
+    };
+    const res = await post('/v1/chat/completions', body);
+    assert.equal(res.status, 429, res.text);
+    assert.equal(res.json.error.type, 'rate_limit_error');
+    assert.equal(mock.state.completions.length, 0);
+  });
+
+  await t.test('HTTP 200 nonzero biz_code on file poll', async () => {
+    resetCase();
+    mock.state.pollReply = {
+      status: 200,
+      body: { code: 0, data: { biz_code: 1234, biz_msg: 'Too many messages in a short period' } },
+    };
+    const res = await post('/v1/chat/completions', body);
+    assert.equal(res.status, 429, res.text);
+    assert.equal(res.json.error.type, 'rate_limit_error');
+    assert.equal(mock.state.polls, 1);
+    assert.equal(mock.state.completions.length, 0);
+  });
+
+  await t.test('HTTP 400 upload error body', async () => {
+    resetCase();
+    mock.state.uploadReply = {
+      status: 400,
+      body: { error: { message: 'Too many messages in a short period' } },
+    };
+    const res = await post('/v1/chat/completions', body);
+    assert.equal(res.status, 429, res.text);
+    assert.equal(res.json.error.type, 'rate_limit_error');
+    assert.equal(mock.state.completions.length, 0);
+  });
 });
 
 test('Anthropic images: follow-up turns upload only new images', async () => {

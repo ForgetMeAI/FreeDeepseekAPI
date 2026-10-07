@@ -646,15 +646,19 @@ FreeDeepseekAPI принимает:
 | `deepseek-v4-pro` | да | нет | устаревший: V4 Pro отключён, отвечает V4.1-Flash |
 | `deepseek-expert-search` | да | да | устаревший alias, теперь работает |
 
-### Картинки (экспериментально)
+### Картинки (проверено на живом DeepSeek Web API)
 
-Веб-чат понимает изображения в едином режиме. Proxy умеет загружать их в
-DeepSeek так же, как это делает веб-клиент (`/api/v0/file/upload_file` с PoW,
-ожидание обработки, `ref_file_ids` в completion). Пока это не проверено на
-живом DeepSeek, функция выключена по умолчанию:
+На живом DeepSeek Web API 7 октября 2026 года проверена передача PNG/JPEG через
+`deepseek-vision`: multipart upload, обработка файла от `PENDING` через
+`PARSING` до `SUCCESS`, ссылка на file ID в completion и визуальный ответ с
+читаемым текстом, цветами и расположением элементов. Почти квадратные
+прямоугольники модель назвала квадратами, поэтому точность распознавания формы
+нужно проверять для конкретной задачи. Загрузка картинок
+включена по умолчанию. Чтобы запретить отправку изображений в DeepSeek, явно
+задайте `DEEPSEEK_IMAGE_UPLOAD=0`:
 
 ```bash
-DEEPSEEK_IMAGE_UPLOAD=1 npm start
+DEEPSEEK_IMAGE_UPLOAD=0 npm start
 ```
 
 - принимаются встроенные картинки: OpenAI `image_url` / Responses
@@ -670,11 +674,11 @@ DEEPSEEK_IMAGE_UPLOAD=1 npm start
   картинки повторно не загружаются (кэш на 30 минут);
 - если DeepSeek не смог обработать картинку, запрос завершается ошибкой `502
   image_upload_failed`, а не тихим ответом «вслепую»;
-- с включённым флагом `deepseek-vision` появляется в `/v1/models` (это тот же
-  единый режим).
+- при включённой загрузке `deepseek-vision` появляется в `/v1/models` (это тот
+  же единый режим).
 
-Без флага картинки заменяются коротким маркером `[Image attached; not visible
-through this proxy]` вместо вставки base64 в промпт.
+При `DEEPSEEK_IMAGE_UPLOAD=0` картинки заменяются коротким маркером `[Image
+attached; not visible through this proxy]`; их байты не загружаются в DeepSeek.
 
 Полный маппинг:
 

@@ -321,11 +321,20 @@ and Search toggles:
 | `deepseek-reasoner-search`, `deepseek-r1-search` | ✓ | ✓ | |
 | `deepseek-expert`, `deepseek-v4-pro` | ✓ | – | deprecated: Expert/V4 Pro no longer exist |
 | `deepseek-expert-search` | ✓ | ✓ | deprecated |
-| `deepseek-vision` | – | – | needs `DEEPSEEK_IMAGE_UPLOAD=1` (see Images) |
+| `deepseek-vision` | – | – | enabled by default; set `DEEPSEEK_IMAGE_UPLOAD=0` to disable |
 
 Unknown model names get `400 invalid_model`.
 
-### Images (experimental, `DEEPSEEK_IMAGE_UPLOAD=1`)
+### Images (live-verified; set `DEEPSEEK_IMAGE_UPLOAD=0` to disable)
+
+Live verification on 2026-10-07 confirmed inline PNG/JPEG upload, file status
+polling from `PENDING` through `PARSING` to `SUCCESS`, and `ref_file_ids` on
+completion. The synthetic image's text, colors, shapes, and arrangement were
+described, and a text-free image control was also checked. The model called
+near-square rectangles squares, so exact shape classification can still need
+manual review. Inline image upload is enabled by default. Setting
+`DEEPSEEK_IMAGE_UPLOAD=0` disables uploads and leaves the existing image marker
+in the prompt.
 
 Inline images (OpenAI `image_url` / Responses `input_image` data URLs,
 Anthropic base64 `image` blocks, also inside `tool_result`) are uploaded with
@@ -393,7 +402,7 @@ loaded automatically (see `.env.example` for the full list).
 | `DEEPSEEK_STREAM_KEEPALIVE_MS` | `10000` | Silence before a `: keep-alive` comment on streamed responses |
 | `DEEPSEEK_REQUEST_DEADLINE_MS` | `120000` | Budget for retry/continuation loops |
 | `DEEPSEEK_MAX_CONCURRENT` | `24` | In-flight completions before 503 |
-| `DEEPSEEK_IMAGE_UPLOAD` | `0` | Upload inline images to DeepSeek (experimental) |
+| `DEEPSEEK_IMAGE_UPLOAD` | `1` (unset enables; `0` disables) | Upload inline images to DeepSeek |
 | `DEEPSEEK_MAX_IMAGES` / `DEEPSEEK_MAX_IMAGE_BYTES` | `4` / 7 MB | Image limits per new chat / per image |
 | `DEEPSEEK_FILE_TIMEOUT_MS` / `DEEPSEEK_FILE_POLL_MS` | `60000` / `1000` | Wait for DeepSeek to process an image |
 | `NON_INTERACTIVE` / `SKIP_ACCOUNT_MENU` | `0` | Start without the menu |
@@ -439,6 +448,6 @@ Auth file format (`npm run auth` / `npm run auth:import`, keep it `0600`):
 
 - Depends on the private DeepSeek Web contract; DeepSeek can change it at any time.
 - Tool calling is prompt-emulated: one call per turn, the model can still ignore the format.
-- Image upload is experimental and off by default; other files are not uploaded.
+- Image upload is live-verified but relies on the private Web API contract, which DeepSeek can change; other files are not uploaded.
 - Usage numbers are estimates.
 - All agents on one account share its rate limits; use an account pool for parallel agents.

@@ -261,7 +261,7 @@ test('legacy Expert/V4 Pro aliases run on the unified Web model with DeepThink (
   const ids = models.data.map(m => m.id);
   assert.ok(ids.includes('deepseek-v4-flash'));
   assert.ok(ids.includes('deepseek-expert-search'));
-  assert.ok(!ids.includes('deepseek-vision'));
+  assert.equal(ids.includes('deepseek-vision'), internals.imageUploadEnabled());
 });
 
 test('long generations outlive the connect timeout, stalled streams time out', async () => {
