@@ -263,8 +263,9 @@ journalctl -u free-deepseek-api -f
   Если нужно слушать сеть напрямую, задайте `HOST=0.0.0.0` в
   `/etc/free-deepseek-api/env` (туда же — любые `DEEPSEEK_*` настройки).
 - Обновление: `cd /opt/FreeDeepseekAPI && sudo git pull && sudo systemctl restart free-deepseek-api`.
-- Новый логин DeepSeek: замените `/etc/free-deepseek-api/deepseek-auth.json` и
-  перезапустите сервис.
+- Новый логин DeepSeek: положите файл той же командой, чтобы сохранить
+  владельца и права, и перезапустите сервис:
+  `sudo install -m 0600 -o freedeepseek -g freedeepseek ./deepseek-auth.json /etc/free-deepseek-api/deepseek-auth.json && sudo systemctl restart free-deepseek-api`.
 
 ---
 
@@ -661,9 +662,12 @@ DEEPSEEK_IMAGE_UPLOAD=1 npm start
   `source.type: "base64"` (в том числе внутри `tool_result`);
 - ссылки `https://...` не скачиваются (защита от SSRF) — модель видит только
   адрес;
+- поддерживаются PNG, JPEG, WebP и GIF; другие форматы (например, SVG)
+  остаются текстовым маркером;
 - в уже открытый чат загружаются только картинки новых сообщений, в новый чат —
-  последние `DEEPSEEK_MAX_IMAGES` (4) картинок разговора; размер одной картинки
-  — до `DEEPSEEK_MAX_IMAGE_BYTES` (8 МБ);
+  последние `DEEPSEEK_MAX_IMAGES` (4) картинок разговора; одна картинка — до
+  `DEEPSEEK_MAX_IMAGE_BYTES` (7 МБ), весь запрос — до 10 МБ; уже загруженные
+  картинки повторно не загружаются (кэш на 30 минут);
 - если DeepSeek не смог обработать картинку, запрос завершается ошибкой `502
   image_upload_failed`, а не тихим ответом «вслепую»;
 - с включённым флагом `deepseek-vision` появляется в `/v1/models` (это тот же

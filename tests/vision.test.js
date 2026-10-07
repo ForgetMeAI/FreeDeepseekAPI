@@ -77,6 +77,7 @@ test.beforeEach(() => {
     headers: { Authorization: 'Bearer t', 'Content-Type': 'application/json' }, cooldownUntil: 0, failures: 0, lastUsedAt: 0,
   });
   internals.sessions.clear();
+  internals.uploadedFileCache.clear();
   Object.assign(mock.state, { pows: [], uploads: [], polls: 0, completions: [], files: 0, fileStatus: () => 'SUCCESS' });
 });
 
@@ -150,4 +151,27 @@ test('remote image URLs are not fetched, and deepseek-vision is listed', async (
 
   const models = await fetch(`${proxyUrl}/v1/models`).then(r => r.json());
   assert.ok(models.data.some(m => m.id === 'deepseek-vision'));
+});
+
+test('an image already uploaded for the account is reused by a new chat', async () => {
+  const content = [{ type: 'image_url', image_url: { url: dataUrl(PNG) } }, { type: 'text', text: 'What is this?' }];
+  const first = await post('/v1/chat/completions', { model: 'deepseek-chat', user: 'cache-a', messages: [{ role: 'user', content }] });
+  assert.equal(first.status, 200, first.text);
+  // Another conversation (new chat) with the same picture.
+  const second = await post('/v1/chat/completions', { model: 'deepseek-chat', user: 'cache-b', messages: [{ role: 'system', content: 'other' }, { role: 'user', content }] });
+  assert.equal(second.status, 200, second.text);
+  assert.equal(mock.state.uploads.length, 1);
+  assert.notEqual(mock.state.completions[0].chat_session_id, mock.state.completions[1].chat_session_id);
+  assert.deepEqual(mock.state.completions[1].ref_file_ids, ['file-1']);
+});
+
+test('image selection keeps the newest occurrence and skips unsupported formats', () => {
+  const part = (buffer, mime = 'image/png') => ({ type: 'image_url', image_url: { url: `data:${mime};base64,${buffer.toString('base64')}` } });
+  const images = [Buffer.from('A'), Buffer.from('B'), Buffer.from('C'), Buffer.from('D'), Buffer.from('E')];
+  const messages = [
+    { role: 'user', content: images.map(buffer => part(buffer)) },
+    { role: 'user', content: [part(images[0]), part(Buffer.from('<svg/>'), 'image/svg+xml')] },
+  ];
+  const picked = internals.collectImages(messages, 4).map(image => image.data.toString());
+  assert.deepEqual(picked, ['C', 'D', 'E', 'A']);
 });

@@ -298,7 +298,8 @@ const DS_CLIENT_VERSION = process.env.DEEPSEEK_CLIENT_VERSION || '2.0.0';
 // Web API; without it images become short text markers.
 const IMAGE_UPLOAD_ENABLED = isTruthy(process.env.DEEPSEEK_IMAGE_UPLOAD || '');
 const MAX_IMAGES_PER_REQUEST = Math.floor(envNumber('DEEPSEEK_MAX_IMAGES', 4, 1));
-const MAX_IMAGE_BYTES = Math.floor(envNumber('DEEPSEEK_MAX_IMAGE_BYTES', 8 * 1024 * 1024, 1024));
+// A 10 MB request body carries at most ~7.5 MB of base64-decoded images.
+const MAX_IMAGE_BYTES = Math.floor(envNumber('DEEPSEEK_MAX_IMAGE_BYTES', 7 * 1024 * 1024, 1024));
 const DS_FILE_TIMEOUT_MS = envNumber('DEEPSEEK_FILE_TIMEOUT_MS', 60000, 1000);
 const DS_FILE_POLL_MS = envNumber('DEEPSEEK_FILE_POLL_MS', 1000, 50);
 const COMPLETION_PATH = '/api/v0/chat/completion';
@@ -684,9 +685,27 @@ async function createPowHeader(account, signal, targetPath = COMPLETION_PATH) {
 
 function sleepWithSignal(ms, signal) {
     return new Promise((resolve, reject) => {
-        const timer = setTimeout(resolve, ms);
-        signal?.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason || new Error('request aborted')); }, { once: true });
+        const onAbort = () => { clearTimeout(timer); reject(signal.reason || new Error('request aborted')); };
+        const timer = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve(); }, ms);
+        signal?.addEventListener('abort', onAbort, { once: true });
     });
+}
+
+// Uploaded file ids per `account:imageHash`, shared across requests: a turn
+// that starts a new chat must not upload the same images again.
+const UPLOADED_FILE_TTL_MS = 30 * 60 * 1000;
+const UPLOADED_FILE_CACHE_MAX = 256;
+const uploadedFileCache = new Map();
+function getCachedUpload(key) {
+    const entry = uploadedFileCache.get(key);
+    if (!entry) return null;
+    if (Date.now() - entry.at > UPLOADED_FILE_TTL_MS) { uploadedFileCache.delete(key); return null; }
+    return entry.id;
+}
+function setCachedUpload(key, id) {
+    uploadedFileCache.delete(key);
+    uploadedFileCache.set(key, { id, at: Date.now() });
+    while (uploadedFileCache.size > UPLOADED_FILE_CACHE_MAX) uploadedFileCache.delete(uploadedFileCache.keys().next().value);
 }
 
 // Status of one uploaded file in a fetch_files response. Read defensively:
@@ -706,7 +725,7 @@ const FILE_FAILED_STATUS = /FAIL|ERROR|REJECT|UNSUPPORT|INVALID|EMPTY/;
 
 // Uploads one image with the account that owns the chat, then waits until
 // DeepSeek has processed it. Returns the file id for ref_file_ids.
-async function uploadImageToDeepSeek(account, image, signal) {
+async function uploadImageToDeepSeek(account, image, signal, deadlineAt = Infinity) {
     const powB64 = await createPowHeader(account, signal, FILE_UPLOAD_PATH);
     const form = new FormData();
     form.append('file', new Blob([image.data], { type: image.mime }), image.filename);
@@ -720,12 +739,12 @@ async function uploadImageToDeepSeek(account, image, signal) {
     if (!fileId) throw new Error(`DeepSeek file upload returned no file id. First chars: ${String(text || '').substring(0, 160)}`);
 
     let { status } = { status: String(biz?.status || '').toUpperCase() };
-    const deadline = Date.now() + DS_FILE_TIMEOUT_MS;
+    const deadline = Math.min(Date.now() + DS_FILE_TIMEOUT_MS, deadlineAt);
     const statusHeaders = { ...account.headers };
     delete statusHeaders['Content-Type'];
     while (!FILE_READY_STATUS.test(status)) {
         if (FILE_FAILED_STATUS.test(status)) throw new Error(`DeepSeek could not process the image (status ${status})`);
-        if (Date.now() > deadline) throw timeoutError(`DeepSeek did not finish processing the image within ${DS_FILE_TIMEOUT_MS}ms`);
+        if (Date.now() > deadline) throw timeoutError('DeepSeek did not finish processing the image in time');
         await sleepWithSignal(DS_FILE_POLL_MS, signal);
         const pr = await dsFetch(dsUrl(`/api/v0/file/fetch_files?file_ids=${encodeURIComponent(fileId)}`), { method: 'GET', headers: statusHeaders, signal });
         const polled = await readDeepSeekJsonResponse(pr, 'file status', account);
@@ -739,22 +758,31 @@ async function uploadImageToDeepSeek(account, image, signal) {
 
 // Uploads the images of a request once per account (files belong to the
 // account that uploaded them).
-async function uploadImagesForAccount(account, images, cache, signal, agentTag) {
+async function uploadImagesForAccount(account, images, signal, agentTag, deadlineAt = Infinity) {
     if (!images || images.length === 0) return [];
-    const cacheKey = `${account.id}:${images.map(image => image.hash).join(',')}`;
-    if (cache?.has(cacheKey)) return cache.get(cacheKey);
     const ids = [];
+    let uploaded = 0;
     try {
-        for (const image of images) ids.push(await uploadImageToDeepSeek(account, image, signal));
+        for (const image of images) {
+            const key = `${account.id}:${image.hash}`;
+            let id = getCachedUpload(key);
+            if (!id) {
+                // Uploads count against the request's overall deadline.
+                if (Date.now() > deadlineAt) throw timeoutError('Request deadline reached while uploading images');
+                id = await uploadImageToDeepSeek(account, image, signal, deadlineAt);
+                setCachedUpload(key, id);
+                uploaded++;
+            }
+            ids.push(id);
+        }
     } catch (error) {
-        if (signal?.aborted || isAccountLevelError(error)) throw error;
+        if (signal?.aborted || isAccountLevelError(error) || isTimeoutError(error)) throw error;
         const failure = new Error(`DeepSeek image upload failed: ${error.message}`);
         failure.status = 502;
         failure.type = 'image_upload_failed';
         throw failure;
     }
-    console.log(`${agentTag} Uploaded ${ids.length} image(s) to DeepSeek`);
-    cache?.set(cacheKey, ids);
+    if (uploaded) console.log(`${agentTag} Uploaded ${uploaded} image(s) to DeepSeek`);
     return ids;
 }
 
@@ -808,8 +836,8 @@ function throwIfRateLimited(account, status, errText, retryAfter) {
     throw createUpstreamHttpError(429, errText, retryAfter || String(Math.ceil(RATE_LIMIT_COOLDOWN_MS / 1000)));
 }
 
-// attachments: { delta, full, cache } — images to reference in a reused chat
-// (delta) or a new chat (full), and per-account uploaded file ids.
+// attachments: { delta, full, deadlineAt } — images to reference in a reused
+// chat (delta) or a new chat (full), and when uploading must give up.
 async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', freshSessionPrompt = prompt, session = getOrCreateAgentSession(agentId), signal = null, attachments = null) {
     const modelCfg = resolveModelConfig(model);
     const hadRemoteSession = Boolean(session.id);
@@ -833,14 +861,16 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
         console.log(`${agentTag} Session ${rollover.failedSessionId} reset before upstream call (${rollover.reason}).`);
     }
 
+    // Upload images first: a failed upload must not leave an empty chat.
+    const images = attachments ? (startsFreshChat ? attachments.full : attachments.delta) : [];
+    const refFileIds = await uploadImagesForAccount(account, images, signal, agentTag, attachments?.deadlineAt);
+
     if (!session.id) {
         await createRemoteChat(session, account, agentTag, 'session create', signal);
     } else {
         console.log(`${agentTag} Reusing session: ${session.id} (parent: ${session.parentMessageId}, msg#${session.messageCount})`);
     }
 
-    const images = attachments ? (startsFreshChat ? attachments.full : attachments.delta) : [];
-    const refFileIds = await uploadImagesForAccount(account, images, attachments?.cache, signal, agentTag);
     const resp = await postCompletion(session, account, modelCfg, effectivePrompt, signal, refFileIds);
 
     if (resp.status !== 200) {
@@ -859,7 +889,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
             await createRemoteChat(session, account, agentTag, 'session recreate', signal);
             effectivePrompt = freshSessionPrompt;
             const fullRefFileIds = attachments
-                ? await uploadImagesForAccount(account, attachments.full, attachments.cache, signal, agentTag)
+                ? await uploadImagesForAccount(account, attachments.full, signal, agentTag, attachments.deadlineAt)
                 : [];
             const resp2 = await postCompletion(session, account, modelCfg, effectivePrompt, signal, fullRefFileIds);
             if (!resp2.ok) {
@@ -1628,7 +1658,9 @@ function decodeImagePart(part) {
         }
     }
     let image = null;
-    if (/^image\//i.test(mime) && base64) {
+    // Formats DeepSeek's image understanding accepts; anything else (SVG, ...)
+    // stays a text marker instead of failing the whole request.
+    if (/^image\/(?:png|jpe?g|webp|gif)$/i.test(mime) && base64) {
         const data = Buffer.from(base64.replace(/\s+/g, ''), 'base64');
         if (data.length > 0 && data.length <= MAX_IMAGE_BYTES) {
             const hash = crypto.createHash('sha256').update(data).digest('hex').substring(0, 12);
@@ -1640,7 +1672,15 @@ function decodeImagePart(part) {
     return image;
 }
 
+function hasInlineImageData(part) {
+    if (part.type === 'image') return part.source?.type === 'base64';
+    const url = part.image_url?.url ?? part.image_url ?? part.url;
+    return typeof url === 'string' && /^data:/i.test(url);
+}
+
 function describeImagePart(part) {
+    // Without upload there is nothing to decode: inline data becomes a marker.
+    if (!IMAGE_UPLOAD_ENABLED && hasInlineImageData(part)) return '[Image attached; not visible through this proxy]';
     const image = decodeImagePart(part);
     // The marker depends only on the image itself, so message fingerprints
     // stay stable across turns.
@@ -1659,10 +1699,11 @@ function collectImages(messages, limit = MAX_IMAGES_PER_REQUEST) {
             if (!part || typeof part !== 'object') continue;
             if (part.type === 'tool_result') { visit(part.content); continue; }
             const image = decodeImagePart(part);
-            if (image && !seen.has(image.hash)) {
-                seen.add(image.hash);
-                images.push(image);
-            }
+            if (!image) continue;
+            // A repeated image counts at its newest position.
+            if (seen.has(image.hash)) images.splice(images.findIndex(item => item.hash === image.hash), 1);
+            seen.add(image.hash);
+            images.push(image);
         }
     };
     for (const msg of messages || []) {
@@ -2803,7 +2844,7 @@ const server = http.createServer(async (req, res) => {
             const attachments = IMAGE_UPLOAD_ENABLED ? {
                 delta: plan.mode === 'delta' ? collectImages(plan.messages) : [],
                 full: collectImages(messages),
-                cache: new Map(),
+                deadlineAt: requestStartedAt + REQUEST_DEADLINE_MS,
             } : null;
 
             let lastAccount = null;
@@ -3379,6 +3420,8 @@ module.exports = {
         normalizeMessageContent,
         normalizeApiParams,
         extractScreenshotPaths,
+        collectImages,
+        uploadedFileCache,
         isRateLimitError,
         loadDotEnv,
         MODEL_CONFIGS,

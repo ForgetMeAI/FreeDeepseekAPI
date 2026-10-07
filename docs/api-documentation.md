@@ -339,8 +339,9 @@ the chat's account:
 4. the completion carries the ids in `ref_file_ids`.
 
 A reused chat receives only the images of the new messages; a new chat the
-most recent `DEEPSEEK_MAX_IMAGES`. Remote `https://` image URLs are never
-fetched. In prompts each image appears as `[Image <hash> attached]`.
+most recent `DEEPSEEK_MAX_IMAGES`. Only PNG, JPEG, WebP and GIF are uploaded;
+uploaded file ids are reused per account for 30 minutes; uploads count against
+`DEEPSEEK_REQUEST_DEADLINE_MS`. Remote `https://` image URLs are never fetched. In prompts each image appears as `[Image <hash> attached]`.
 
 ---
 
@@ -393,7 +394,7 @@ loaded automatically (see `.env.example` for the full list).
 | `DEEPSEEK_REQUEST_DEADLINE_MS` | `120000` | Budget for retry/continuation loops |
 | `DEEPSEEK_MAX_CONCURRENT` | `24` | In-flight completions before 503 |
 | `DEEPSEEK_IMAGE_UPLOAD` | `0` | Upload inline images to DeepSeek (experimental) |
-| `DEEPSEEK_MAX_IMAGES` / `DEEPSEEK_MAX_IMAGE_BYTES` | `4` / 8 MB | Image limits per new chat / per image |
+| `DEEPSEEK_MAX_IMAGES` / `DEEPSEEK_MAX_IMAGE_BYTES` | `4` / 7 MB | Image limits per new chat / per image |
 | `DEEPSEEK_FILE_TIMEOUT_MS` / `DEEPSEEK_FILE_POLL_MS` | `60000` / `1000` | Wait for DeepSeek to process an image |
 | `NON_INTERACTIVE` / `SKIP_ACCOUNT_MENU` | `0` | Start without the menu |
 
