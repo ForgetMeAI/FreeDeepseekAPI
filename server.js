@@ -2768,12 +2768,13 @@ const server = http.createServer(async (req, res) => {
                 res.end(JSON.stringify({ error: { message: `${requestedModel} is not currently supported through this DeepSeek Web API path`, type: 'unsupported_model', model: requestedModel, real_model: cfg.real_model, reason: cfg.unavailable_reason, capabilities: cfg.capabilities, supported_models: SUPPORTED_MODEL_IDS } }));
                 return;
             }
-            // Use remote IP for session isolation (local gets 'dev-agent', external per-IP)
-            const remoteAddr = req.socket.remoteAddress || 'unknown';
-            const requestedSession = req.headers['x-agent-session'] || params.session || params.user;
-            const agentId = requestedSession
-                ? String(requestedSession)
-                : ((remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1') ? 'dev-agent' : remoteAddr);
+            // Require explicit agent session via X-Session-Id header
+            const requestedSession = req.headers['x-session-id'] || req.headers['X-Session-Id'];
+            if (!requestedSession || String(requestedSession).trim() === '') {
+                sendJsonError(res, 400, 'Missing required header: X-Session-Id. Please provide a unique session identifier in the X-Session-Id header to isolate your session.', 'missing_required_header');
+                return;
+            }
+            const agentId = String(requestedSession).trim();
             const agentTag = `[${agentId}]`;
             activeAgentId = agentId;
 
@@ -2842,9 +2843,11 @@ const server = http.createServer(async (req, res) => {
 
             // Clients that send only their latest message rely on local
             // recovery history whenever a new remote chat has to be started.
+            // For ephemeral sessions (concurrent requests to a busy agent session),
+            // do not pull history from the primary agent session to avoid cross-dialogue leakage.
             const recoveryHistoryPrefix = hasExplicitConversationHistory(messages)
                 ? ''
-                : buildRecoveryHistoryPrefix(agentSession.history);
+                : (ephemeral ? '' : buildRecoveryHistoryPrefix(agentSession.history));
             const freshPromptBuild = buildBoundedPrompt(systemPrompt, recoveryHistoryPrefix, prompt);
             const contextKey = hashText(systemPrompt);
             const plan = planSessionTurn(session, messages, contextKey);
