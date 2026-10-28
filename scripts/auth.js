@@ -39,6 +39,11 @@ function runDirectAuth() {
   const script = path.join(__dirname, 'deepseek_chrome_auth.js');
   return spawnSync(process.execPath, [script], { stdio: 'inherit', env: process.env }).status === 0;
 }
+// Returns the script's exit code so --console callers can tell outcomes apart.
+function runConsoleAuth(args = []) {
+  const script = path.join(__dirname, 'deepseek_console_auth.js');
+  return spawnSync(process.execPath, [script, ...args], { stdio: 'inherit', env: process.env }).status ?? 1;
+}
 function runImportAuth() {
   const script = path.join(__dirname, 'auth_import.js');
   return spawnSync(process.execPath, [script], { stdio: 'inherit', env: process.env }).status === 0;
@@ -54,6 +59,8 @@ function printHelp() {
   divider();
   console.log('Опции:');
   console.log('  --login     Открыть Chrome и обновить auth');
+  console.log('  --console   Войти по email/телефону и паролю в консоли, без Chrome');
+  console.log('              (остальные опции — как у npm run auth:console -- --help)');
   console.log('  --import    Импортировать готовый deepseek-auth.json / browser cookies');
   console.log('  --status    Показать статус auth');
   console.log('  --remove    Удалить локальный deepseek-auth.json');
@@ -68,21 +75,29 @@ async function menu() {
     status();
     divider();
     console.log('Меню:');
-    console.log('1 - Авторизоваться / обновить DeepSeek login');
-    console.log('2 - Импортировать auth-файл / cookies');
-    console.log('3 - Показать статус');
-    console.log('4 - Удалить локальный auth файл');
-    console.log('5 - Выход');
-    const choice = (await prompt('Ваш выбор (Enter = 5): ')) || '5';
+    console.log('1 - Авторизоваться / обновить DeepSeek login (Chrome)');
+    console.log('2 - Войти по логину и паролю в консоли (без Chrome)');
+    console.log('3 - Импортировать auth-файл / cookies');
+    console.log('4 - Показать статус');
+    console.log('5 - Удалить локальный auth файл');
+    console.log('6 - Выход');
+    const choice = (await prompt('Ваш выбор (Enter = 6): ')) || '6';
     if (choice === '1') runDirectAuth();
-    else if (choice === '2') runImportAuth();
-    else if (choice === '3') { status(); await prompt('\nНажмите Enter, чтобы вернуться в меню...'); }
-    else if (choice === '4') removeLocalAuth();
-    else if (choice === '5') break;
+    else if (choice === '2') runConsoleAuth();
+    else if (choice === '3') runImportAuth();
+    else if (choice === '4') { status(); await prompt('\nНажмите Enter, чтобы вернуться в меню...'); }
+    else if (choice === '5') removeLocalAuth();
+    else if (choice === '6') break;
   }
 }
 (async () => {
-  const args = new Set(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  const args = new Set(argv);
+  // Before --login: here it means Chrome, for the console script it is the account.
+  if (args.has('--console') || args.has('--login-console')) {
+    process.exitCode = runConsoleAuth(argv.filter(a => a !== '--console' && a !== '--login-console'));
+    return;
+  }
   if (args.has('--help') || args.has('-h')) return printHelp();
   if (args.has('--login') || args.has('--add') || args.has('--relogin')) return void runDirectAuth();
   if (args.has('--import')) return void runImportAuth();

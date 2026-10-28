@@ -274,7 +274,7 @@ class CDP {
     constructor(wsUrl) {
         if (typeof WebSocket === 'undefined') {
             throw new Error(
-                `npm run auth needs Node.js 22+ (built-in WebSocket); this is Node ${process.versions.node}. Upgrade Node or use npm run auth:import.`,
+                `npm run auth needs Node.js 22+ (built-in WebSocket); this is Node ${process.versions.node}. Upgrade Node, log in without Chrome via npm run auth:console, or use npm run auth:import.`,
             );
         }
         this.ws = new WebSocket(wsUrl);
@@ -431,7 +431,9 @@ How to fix:
     CHROME_PATH=$(which chromium) npm run auth
     # Ubuntu example: sudo apt install chromium-browser || sudo apt install chromium
 
-If Chrome is installed elsewhere, set CHROME_PATH to the real executable path.`;
+If Chrome is installed elsewhere, set CHROME_PATH to the real executable path.
+No browser on this machine (VPS, container)? Log in with email/phone and
+password instead: npm run auth:console`;
 }
 
 async function main() {
@@ -439,7 +441,7 @@ async function main() {
         throw new Error(chromeInstallHelp(chromePath));
     if (typeof WebSocket === 'undefined') {
         throw new Error(
-            `npm run auth needs Node.js 22+ (built-in WebSocket); this is Node ${process.versions.node}. Upgrade Node or use npm run auth:import.`,
+            `npm run auth needs Node.js 22+ (built-in WebSocket); this is Node ${process.versions.node}. Upgrade Node, log in without Chrome via npm run auth:console, or use npm run auth:import.`,
         );
     }
 
