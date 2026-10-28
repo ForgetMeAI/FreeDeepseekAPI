@@ -43,7 +43,7 @@ ForgetMeAI: https://t.me/forgetmeai
 - [Diagnostics / doctor](#-diagnostics--doctor)
 - [Session reuse и сброс чатов](#-session-reuse-и-сброс-чатов)
 - [Multi-account pool](#-multi-account-pool)
-- [Идеи для консольной авторизации](#-идеи-для-консольной-авторизации)
+- [Консольная авторизация](#-консольная-авторизация)
 - [Проверка работы](#-проверка-работы)
 - [Примеры запросов](#-примеры-запросов)
   - [Chat Completions](#chat-completions)
@@ -82,7 +82,7 @@ ForgetMeAI: https://t.me/forgetmeai
 - **Model capabilities:** `GET /v1/model-capabilities` с alias → real web mode
 - **Agent sessions:** отдельная DeepSeek-сессия на `user` / agent id
 - **Session recovery:** авто-сброс устаревших chains/sessions
-- **Zero dependencies:** Node.js 18+ для proxy (для `npm run auth` нужен Node.js 22+), без npm-зависимостей
+- **Zero dependencies:** Node.js 18+ для proxy и `npm run auth:console` (для входа через Chrome нужен Node.js 22+), без npm-зависимостей
 
 ---
 
@@ -102,9 +102,13 @@ npm start
 3. отправьте короткое сообщение вроде `ok`;
 4. вернитесь в терминал и нажмите Enter.
 
-> `npm run auth` использует встроенный в Node.js WebSocket, поэтому ему нужен
-> Node.js 22+. Сам proxy работает на Node.js 18+; на старом Node импортируйте
-> готовый `deepseek-auth.json` через `npm run auth:import`.
+Без Chrome (VPS, контейнер, старый Node) войдите по email/телефону и паролю
+прямо в терминале: пункт `2` или `npm run auth:console`, подробнее —
+[Консольная авторизация](#-консольная-авторизация).
+
+> Вход через Chrome использует встроенный в Node.js WebSocket, поэтому ему нужен
+> Node.js 22+. Сам proxy и `npm run auth:console` работают на Node.js 18+; ещё
+> можно импортировать готовый `deepseek-auth.json` через `npm run auth:import`.
 
 `npm start` показывает меню запуска:
 
@@ -191,7 +195,16 @@ CHROME_PATH=$(which google-chrome) npm run auth
 
 ## 🖥 VPS / headless запуск
 
-Самый надёжный flow без Chrome на сервере:
+Проще всего войти прямо на сервере, без Chrome:
+
+```bash
+cd /opt/FreeDeepseekAPI
+npm run auth:console
+NON_INTERACTIVE=1 npm start
+```
+
+Если DeepSeek не пускает вход с адреса сервера или просит капчу, снимите сессию
+в браузере на домашнем ПК и перенесите её:
 
 1. На домашнем ПК, где есть GUI/Chrome:
 
@@ -459,18 +472,46 @@ DEEPSEEK_ACCOUNT_COOLDOWN_MS=600000 npm start
 
 ---
 
-## 🔑 Идеи для консольной авторизации
+## 🔑 Консольная авторизация
 
-Парольный flow из PR #3 можно делать, но безопаснее не хранить пароль и не делать это дефолтом. Нормальная реализация:
+Вход по email/телефону и паролю прямо в терминале, без Chrome: скрипт идёт в тот
+же HTTP login DeepSeek Web, что и сайт, проверяет сессию и сохраняет обычный
+`deepseek-auth.json`. Работает на Node.js 18+.
 
-1. `npm run auth:console` спрашивает email/телефон и пароль через hidden prompt.
-2. Пароль держится только в памяти процесса, не пишется в файлы/logs/history.
-3. Скрипт повторяет Web login flow через `fetch`/CDP: получает captcha/verify challenge, отдаёт человеку ссылку/код, ждёт подтверждение.
-4. После успешного login сохраняется только `deepseek-auth.json` стандартного формата.
-5. Если DeepSeek просит captcha/2FA — скрипт честно говорит “открой ссылку, пройди проверку, нажми Enter”, а не пытается обходить защиту.
-6. Для VPS лучше режим `auth:console --no-save-password --output deepseek-auth.json`.
+```bash
+npm run auth:console
+# то же из меню: npm run auth → пункт 2, или npm run auth -- --console
+npm run auth:console -- --login you@example.com --output ./accounts/main.json
+```
 
-Минимальный безопасный MVP: console auth только интерактивный, без env-пароля. Допустимый automation-вариант: `DEEPSEEK_EMAIL=... npm run auth:console`, но пароль всё равно вводится hidden prompt.
+- Пароль вводится скрыто (ничего не печатается) и живёт только в памяти процесса:
+  не пишется в файлы, логи и историю. `--password` и `DEEPSEEK_PASSWORD` скрипт
+  не принимает — аргументы и окружение видны в истории shell и списке процессов.
+- Файл пишется только после успешного входа и живой проверки сессии (PoW
+  challenge, как в `npm run doctor`), с правами `0600`. Если вход не удался,
+  прежний `deepseek-auth.json` не меняется.
+- Куда писать — как у `npm run auth`: `--output`, иначе `DEEPSEEK_AUTH_DIR`,
+  первый путь из `DEEPSEEK_AUTH_PATH`, иначе `./deepseek-auth.json`. Логин можно
+  задать в `DEEPSEEK_LOGIN`.
+- Капчу, 2FA и блокировки DeepSeek скрипт не обходит: он честно пишет, что вход
+  не прошёл, и предлагает войти через браузер (`npm run auth`) или перенести
+  готовый файл (`npm run auth:import`). Попытка входа одна, без повторов.
+
+Запуск из другой программы (панель управления, скрипт деплоя): пароль — первой
+строкой stdin, итог — одной строкой JSON в stdout, сообщения — в stderr.
+
+```bash
+printf '%s\n' "$PASSWORD" | npm run --silent auth:console -- --login you@example.com --json
+# {"ok":true,"output":"/opt/FreeDeepseekAPI/deepseek-auth.json","token_chars":64,"cookies":3}
+# {"ok":false,"reason":"login_rejected","error":"DeepSeek отклонил вход ..."}
+```
+
+Коды выхода: `0` — сохранено, `2` — вход не удался (файл не тронут), `1` — сбой
+записи или скрипта, `130` — отменено. `reason`: `bad_input`, `login_rejected`,
+`blocked`, `session_check_failed`, `network`, `write_failed`, `error`,
+`cancelled`. Работает ли уже сохранённая сессия — `npm run doctor` (код `0`/`2`).
+Запущенный proxy читает auth-файлы при старте, поэтому после нового входа его
+нужно перезапустить.
 
 ---
 
@@ -731,7 +772,7 @@ npm run auth
 npm start
 ```
 
-Если DeepSeek начал отвечать `401`, `403` или просит новый PoW/session — повторите `npm run auth` и обновите сохранённую browser-сессию.
+Если DeepSeek начал отвечать `401`, `403` или просит новый PoW/session — повторите `npm run auth` (или `npm run auth:console` без Chrome) и перезапустите proxy.
 
 Локальные файлы авторизации не должны попадать в GitHub:
 

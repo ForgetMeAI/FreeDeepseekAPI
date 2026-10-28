@@ -36,7 +36,7 @@ function checkAuthFile(file) {
   }
   return { file, ok: issues.length === 0, issues, auth };
 }
-async function liveCheck(auth) {
+async function liveCheck(auth, env = process.env) {
   const headers = {
     'User-Agent': 'Mozilla/5.0 Chrome/149.0.0.0 Safari/537.36',
     'x-client-platform': 'web',
@@ -54,7 +54,7 @@ async function liveCheck(auth) {
   };
   const checks = [];
   try {
-    const base = String(process.env.DEEPSEEK_BASE_URL || 'https://chat.deepseek.com').replace(/\/+$/, '');
+    const base = String(env.DEEPSEEK_BASE_URL || 'https://chat.deepseek.com').replace(/\/+$/, '');
     const r = await fetch(`${base}/api/v0/chat/create_pow_challenge`, {
       method: 'POST', headers, body: JSON.stringify({ target_path: '/api/v0/chat/completion' })
     });
@@ -100,4 +100,4 @@ async function main(args = process.argv.slice(2)) {
 if (require.main === module) {
   main().then(code => process.exit(code)).catch(e => { console.error('[doctor] ERROR:', e.message); process.exit(1); });
 }
-module.exports = { checkAuthFile, authPaths };
+module.exports = { checkAuthFile, authPaths, liveCheck };
