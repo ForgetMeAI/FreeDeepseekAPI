@@ -443,6 +443,21 @@ function hasOtherReadyAccount(accountId, now = Date.now()) {
 function isAccountLevelError(error) {
     return [401, 403, 429].includes(Number(error?.status));
 }
+// DeepSeek reports an expired/revoked login as HTTP 200 with a JSON body like
+// {"code":40003,"msg":"INVALID_TOKEN"}. The code alone is not enough: 40003 is
+// also used for "Too many messages", so match the message text.
+function isInvalidTokenBody(json) {
+    const msg = String(json?.msg || json?.message || '');
+    return /invalid[_ ]?token|authorization failed/i.test(msg);
+}
+// Treat an invalid token as HTTP 401: the account goes into cooldown and the
+// request is replayed on another account.
+function invalidTokenError(account, label, text) {
+    markAccountFailure(account, 401, `${label}: invalid token`);
+    const error = createUpstreamHttpError(401, text);
+    error.message = `DeepSeek login of ${account?.id || 'account'} is invalid/expired (${label}). Re-login with npm run auth.`;
+    return error;
+}
 async function readDeepSeekJsonResponse(resp, label, account) {
     const text = await resp.text();
     let json = null;
@@ -453,6 +468,7 @@ async function readDeepSeekJsonResponse(resp, label, account) {
             throw new Error(`DeepSeek returned non-JSON ${label} response (HTTP ${resp.status}). Run npm run doctor. First chars: ${text.substring(0, 120)}`);
         }
     }
+    if (resp.ok && isInvalidTokenBody(json)) throw invalidTokenError(account, label, text);
     if (!resp.ok) markAccountFailure(account, resp.status, label);
     return { json, text };
 }
@@ -676,6 +692,7 @@ async function createPowHeader(account, signal, targetPath = COMPLETION_PATH) {
     let chalJson;
     try { chalJson = JSON.parse(chalText); }
     catch (e) { throw new Error(`DeepSeek returned non-JSON PoW response. Run npm run doctor. First chars: ${chalText.substring(0, 120)}`); }
+    if (isInvalidTokenBody(chalJson)) throw invalidTokenError(account, 'pow challenge', chalText);
     const challenge = chalJson?.data?.biz_data?.challenge;
     if (!challenge) {
         throw new Error('DeepSeek PoW response has no data.biz_data.challenge. Auth may be expired, captcha may be required, or DeepSeek changed Web API. Run npm run doctor, then npm run auth.');
