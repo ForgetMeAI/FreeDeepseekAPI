@@ -15,6 +15,7 @@ function startMockDeepSeek() {
     openStreams: new Set(),
     respond: () => ({ text: 'OK' }),
     powFailures: 0,
+    invalidTokenAuth: null,
   };
   const writeJson = (res, status, payload) => {
     res.writeHead(status, { 'Content-Type': 'application/json' });
@@ -27,6 +28,12 @@ function startMockDeepSeek() {
       const raw = Buffer.concat(chunks).toString('utf8');
       const body = raw ? JSON.parse(raw) : {};
       const auth = req.headers.authorization;
+      if (state.invalidTokenAuth && auth === state.invalidTokenAuth
+          && ['/api/v0/chat/create_pow_challenge', '/api/v0/chat_session/create'].includes(req.url)) {
+        // DeepSeek reports an expired login as HTTP 200 with an error body.
+        writeJson(res, 200, { code: 40003, msg: 'INVALID_TOKEN', data: null });
+        return;
+      }
       if (req.url === '/api/v0/chat/create_pow_challenge') {
         if (state.powFailures > 0) {
           state.powFailures--;
@@ -147,6 +154,7 @@ test.beforeEach(() => {
   internals.sessions.clear();
   mock.state.completions.length = 0;
   mock.state.respond = () => ({ text: 'OK' });
+  mock.state.invalidTokenAuth = null;
 });
 
 async function chat(body, headers = {}) {
@@ -323,6 +331,37 @@ test('a throttled account fails over to the next ready account', async () => {
   const limited = await chat({ model: 'deepseek-chat', user: 'failover-2', messages: [{ role: 'user', content: 'hello' }] });
   assert.equal(limited.status, 429, limited.text);
   assert.ok(limited.headers.get('retry-after'));
+});
+
+test('an account with an expired login (HTTP 200 INVALID_TOKEN) fails over to the next account', async () => {
+  internals.accounts.push({
+    id: 'account_2',
+    file: 'mock-2.json',
+    config: { token: 'two', cookie: 'c2', wasmUrl: 'mock' },
+    headers: { Authorization: 'Bearer two', 'Content-Type': 'application/json' },
+    cooldownUntil: 0,
+    failures: 0,
+    lastUsedAt: 0,
+  });
+  mock.state.invalidTokenAuth = 'Bearer one';
+  mock.state.respond = () => ({ text: 'served by two' });
+  const res = await chat({ model: 'deepseek-chat', user: 'expired-login', messages: [{ role: 'user', content: 'hello' }] });
+  assert.equal(res.status, 200, res.text);
+  assert.equal(res.json.choices[0].message.content, 'served by two');
+  assert.ok(internals.accounts[0].cooldownUntil > Date.now(), 'expired account should be in cooldown');
+  assert.ok(mock.state.completions.every(c => c.auth === 'Bearer two'));
+
+  // A new session skips the cooled-down account entirely.
+  const next = await chat({ model: 'deepseek-chat', user: 'expired-login-2', messages: [{ role: 'user', content: 'hi' }] });
+  assert.equal(next.status, 200, next.text);
+  assert.equal(mock.state.completions.at(-1).auth, 'Bearer two');
+});
+
+test('an expired login with no other account returns 401 instead of a generic error', async () => {
+  mock.state.invalidTokenAuth = 'Bearer one';
+  const res = await chat({ model: 'deepseek-chat', user: 'expired-only', messages: [{ role: 'user', content: 'hello' }] });
+  assert.equal(res.status, 401, res.text);
+  assert.ok(internals.accounts[0].cooldownUntil > Date.now());
 });
 
 test('in-stream context-too-long errors are retried with a fresh chat', async () => {
